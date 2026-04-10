@@ -59,3 +59,25 @@ export function getPlanLimits(planKey: string): { conversations: number; minutes
   return PLAN_LIMITS[normalizedKey as keyof typeof PLAN_LIMITS] || null;
 }
 
+/**
+ * Limits as stored on Plan.features (and used by usageTracker / profile checks).
+ * When planId is missing or features are incomplete, falls back to PLAN_LIMITS via org.plan slug (default free).
+ */
+export function getEffectiveFeatureLimits(
+  org: { plan?: string } | null | undefined,
+  planDoc: any | null | undefined
+): { chatConversations: number; callMinutes: number; automations: number } {
+  const slug = (org?.plan || 'free').toString().toLowerCase().trim();
+  const lim = getPlanLimits(slug) || getPlanLimits('free')!;
+  const f = planDoc?.features;
+
+  const pick = (v: unknown, fallback: number) =>
+    typeof v === 'number' ? v : fallback;
+
+  return {
+    chatConversations: pick(f?.chatConversations, lim.conversations),
+    callMinutes: pick(f?.callMinutes, lim.minutes),
+    automations: pick(f?.automations, lim.automations)
+  };
+}
+

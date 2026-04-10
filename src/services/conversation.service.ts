@@ -6,6 +6,7 @@ import { AppError } from '../middleware/error.middleware';
 import socialIntegrationService from './socialIntegration.service';
 import { trackUsage } from '../middleware/profileTracking.middleware';
 import { usageService } from './usage.service';
+import { profileService } from './profile.service';
 
 export class ConversationService {
   // Get all conversations with filters and pagination
@@ -1269,6 +1270,17 @@ export class ConversationService {
       // CRITICAL: Validate organizationId is valid
       if (!mongoose.Types.ObjectId.isValid(organizationId)) {
         throw new AppError(500, 'INVALID_ORGANIZATION_ID', `Invalid organization ID format: ${organizationId}`);
+      }
+
+      const incomingMsgCount = Array.isArray(data.messages) ? data.messages.length : 0;
+      const creditAmount = Math.max(1, incomingMsgCount);
+      const hasChatCredit = await profileService.checkCredits(organizationId, 'chat', creditAmount, { userId });
+      if (!hasChatCredit) {
+        throw new AppError(
+          403,
+          'PLAN_LIMIT_EXCEEDED',
+          'You have reached your plan limit for conversations. Please upgrade your plan to continue.'
+        );
       }
 
       console.log('[Widget Conversation] Saving conversation with strict isolation:', {

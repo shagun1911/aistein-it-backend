@@ -4,6 +4,7 @@ import Conversation from '../../models/Conversation';
 import Automation from '../../models/Automation';
 import Campaign from '../../models/Campaign';
 import { logger } from '../../utils/logger.util';
+import { getEffectiveFeatureLimits } from '../../config/planLimits';
 
 /**
  * SINGLE SOURCE OF TRUTH FOR USAGE TRACKING
@@ -289,7 +290,7 @@ export class UsageTrackerService {
   /**
    * Check if organization has exceeded plan limits
    */
-  async checkLimits(organizationId: string, plan: any): Promise<{
+  async checkLimits(organizationId: string, plan: any, org?: { plan?: string } | null): Promise<{
     exceeded: boolean;
     limits: {
       callMinutes: { used: number; limit: number; exceeded: boolean };
@@ -301,21 +302,23 @@ export class UsageTrackerService {
       // Use cache for limit checks too, but maybe shorter? (currently uses default 60s)
       const usage = await this.getOrganizationUsage(organizationId);
 
+      const features = getEffectiveFeatureLimits(org ?? { plan: plan?.slug }, plan);
+
       const limits = {
         callMinutes: {
           used: usage.callMinutes,
-          limit: plan.features?.callMinutes || 0,
-          exceeded: plan.features?.callMinutes !== -1 && usage.callMinutes >= plan.features?.callMinutes
+          limit: features.callMinutes,
+          exceeded: features.callMinutes !== -1 && usage.callMinutes >= features.callMinutes
         },
         chatMessages: {
           used: usage.chatMessages,
-          limit: plan.features?.chatConversations || 0,
-          exceeded: plan.features?.chatConversations !== -1 && usage.chatMessages >= plan.features?.chatConversations
+          limit: features.chatConversations,
+          exceeded: features.chatConversations !== -1 && usage.chatMessages >= features.chatConversations
         },
         automations: {
           used: usage.automations,
-          limit: plan.features?.automations || 0,
-          exceeded: plan.features?.automations !== -1 && usage.automations >= plan.features?.automations
+          limit: features.automations,
+          exceeded: features.automations !== -1 && usage.automations >= features.automations
         }
       };
 
@@ -340,12 +343,12 @@ export class UsageTrackerService {
       const Organization = mongoose.model('Organization');
       const org: any = await Organization.findById(organizationId).populate('planId').lean();
 
-      if (!org || !org.planId) {
+      if (!org) {
         return { locked: false, reason: null };
       }
 
       const plan = org.planId;
-      const { exceeded, limits } = await this.checkLimits(organizationId, plan);
+      const { exceeded, limits } = await this.checkLimits(organizationId, plan, org);
 
       if (exceeded) {
         let reason = 'Plan limits exceeded';

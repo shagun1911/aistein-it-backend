@@ -833,6 +833,19 @@ export class MetaWebhookController {
 
       console.log(`[WhatsApp Webhook] ✅ Found integration with userId: ${integration.userId.toString()}`);
 
+      {
+        const { profileService } = await import('../services/profile.service');
+        const orgIdStr = integration.organizationId?.toString();
+        const ownerUserId = integration.userId?.toString();
+        if (orgIdStr && ownerUserId) {
+          const hasChatCredit = await profileService.checkCredits(orgIdStr, 'chat', 1, { userId: ownerUserId });
+          if (!hasChatCredit) {
+            console.warn('[WhatsApp Webhook] Plan chat limit exceeded; skipping message handling');
+            return;
+          }
+        }
+      }
+
       // Find or create customer
       let customer = await Customer.findOne({
         phone: from,
@@ -2087,6 +2100,17 @@ export class MetaWebhookController {
         if (user && user.organizationId) {
           customerOrgId = user.organizationId.toString();
           console.log(`[Instagram Webhook] Using actual organizationId for conversation: ${customerOrgId}`);
+        }
+      }
+
+      {
+        const { profileService } = await import('../services/profile.service');
+        const hasChatCredit = await profileService.checkCredits(customerOrgId.toString(), 'chat', 1, {
+          userId: userId
+        });
+        if (!hasChatCredit) {
+          console.warn('[Instagram Webhook] Plan chat limit exceeded; skipping message handling');
+          return;
         }
       }
 

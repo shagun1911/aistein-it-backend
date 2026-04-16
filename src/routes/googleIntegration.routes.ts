@@ -15,6 +15,7 @@ router.delete('/google/disconnect', authenticate, googleIntegrationController.di
 router.post('/google/sheets/export-contacts', authenticate, googleIntegrationController.exportContacts);
 router.post('/google/sheets/import-contacts', authenticate, googleIntegrationController.importContacts);
 router.get('/google/sheets/list', authenticate, googleIntegrationController.listSpreadsheets);
+router.get('/google/sheets/headers', authenticate, googleIntegrationController.getSheetHeaders);
 
 // Google Drive
 router.get('/google/drive/files', authenticate, googleIntegrationController.listDriveFiles);

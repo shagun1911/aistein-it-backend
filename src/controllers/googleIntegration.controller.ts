@@ -359,6 +359,29 @@ export class GoogleIntegrationController {
     }
   };
 
+  /** Query: spreadsheetId (required), sheetName (optional, default Sheet1) — returns first row as column labels */
+  getSheetHeaders = async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const spreadsheetId = (req.query.spreadsheetId as string)?.trim();
+      const sheetName = ((req.query.sheetName as string) || 'Sheet1').trim() || 'Sheet1';
+
+      if (!spreadsheetId) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'spreadsheetId is required');
+      }
+
+      const headers = await googleSheetsService.getHeaderRow(
+        req.user._id.toString(),
+        req.user.organizationId.toString(),
+        spreadsheetId,
+        sheetName
+      );
+
+      res.json(successResponse({ headers }));
+    } catch (error) {
+      next(error);
+    }
+  };
+
   // === DRIVE ENDPOINTS ===
 
   listDriveFiles = async (req: AuthRequest, res: Response, next: NextFunction) => {

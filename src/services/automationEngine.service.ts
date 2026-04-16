@@ -1496,13 +1496,23 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
 
           const sheetMeta = await sheets.spreadsheets.get({ spreadsheetId });
-          const sheetName = sheetMeta.data.sheets?.[0]?.properties?.title || 'Sheet1';
+          const fallbackTab = sheetMeta.data.sheets?.[0]?.properties?.title || 'Sheet1';
+          const configured =
+            typeof (config as any).sheetName === 'string' && String((config as any).sheetName).trim() !== ''
+              ? String((config as any).sheetName).trim()
+              : fallbackTab;
+          const escapeSheetTitleForA1 = (title: string): string => {
+            const t = title.trim() || 'Sheet1';
+            if (/^[A-Za-z0-9_]+$/.test(t)) return t;
+            return `'${t.replace(/'/g, "''")}'`;
+          };
+          const sheetRangePrefix = `${escapeSheetTitleForA1(configured)}!A1`;
 
           const resolvedValues = await Promise.all(values.map(v => this.resolveTemplate(String(v), context)));
 
           await sheets.spreadsheets.values.append({
             spreadsheetId,
-            range: `${sheetName}!A1`,
+            range: sheetRangePrefix,
             valueInputOption: 'USER_ENTERED',
             insertDataOption: 'INSERT_ROWS',
             requestBody: { values: [resolvedValues] }

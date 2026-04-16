@@ -225,6 +225,56 @@ export class GoogleSheetsService {
   }
 
   /**
+   * Read the first row of a tab as column labels (for automation mapping UI).
+   * sheetName is the tab title as shown in Google Sheets (e.g. "Sheet1", "Leads").
+   */
+  async getHeaderRow(
+    userId: string,
+    organizationId: string,
+    spreadsheetId: string,
+    sheetName: string = 'Sheet1'
+  ): Promise<string[]> {
+    try {
+      const integration = await GoogleIntegration.findOne({
+        userId,
+        organizationId,
+        status: 'active',
+        'services.sheets': true
+      });
+
+      if (!integration) {
+        throw new AppError(404, 'NOT_FOUND', 'Google Sheets integration not found');
+      }
+
+      const oauth2Client = this.getOAuth2Client(integration.accessToken, integration.refreshToken);
+      const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+
+      const trimmed = (sheetName || 'Sheet1').trim() || 'Sheet1';
+      const range = `${this.escapeSheetTitleForA1(trimmed)}!1:1`;
+
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range
+      });
+
+      const row = response.data.values?.[0] || [];
+      return row.map((cell: unknown) => (cell === null || cell === undefined ? '' : String(cell)));
+    } catch (error: any) {
+      console.error('Google Sheets getHeaderRow error:', error);
+      const msg = error?.response?.data?.error?.message || error?.message || 'Failed to read sheet headers';
+      throw new AppError(500, 'INTEGRATION_ERROR', msg);
+    }
+  }
+
+  /** A1 range sheet title: quote if non-alphanumeric (Google Sheets rules). */
+  private escapeSheetTitleForA1(title: string): string {
+    if (/^[A-Za-z0-9_]+$/.test(title)) {
+      return title;
+    }
+    return `'${title.replace(/'/g, "''")}'`;
+  }
+
+  /**
    * Append a row to a Google Sheet
    */
   async appendRow(

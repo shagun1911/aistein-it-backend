@@ -608,7 +608,15 @@ export class ChatbotController {
       console.log('[Widget Chat] Params:', JSON.stringify(req.params, null, 2));
       
       const { widgetId } = req.params;
-      const { query, threadId, knowledgeBaseId } = req.body;
+      const { query, threadId, knowledgeBaseId, visitorName: rawVisitorName } = req.body;
+
+      let visitorName: string | undefined;
+      if (rawVisitorName != null && typeof rawVisitorName === 'string') {
+        const trimmed = rawVisitorName.trim();
+        if (trimmed.length > 0) {
+          visitorName = trimmed.slice(0, 80);
+        }
+      }
 
       // CRITICAL: Validate widgetId is present and not undefined
       if (widgetId === undefined || widgetId === null || widgetId === 'undefined' || widgetId === '') {
@@ -859,6 +867,10 @@ export class ChatbotController {
       } else {
         systemPrompt += '\n5. Focus on providing accurate answers from the knowledge base.\n';
         console.log('[Widget Chat] Enhanced system prompt with KB-first instructions');
+      }
+
+      if (visitorName) {
+        systemPrompt += `\n\nCONTEXT: The visitor's name is "${visitorName}". Address them by name when it feels natural.`;
       }
 
       // ========== PHASE 5: API KEY RESOLUTION (STRICT - MUST BELONG TO USER) ==========

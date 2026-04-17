@@ -1366,6 +1366,27 @@ export class ConversationService {
       conversation.updatedAt = new Date();
       await conversation.save();
 
+      // Notify dashboard (Conversations list) to refetch
+      try {
+        const { emitToOrganization } = await import('../config/socket');
+        const last = data.messages[data.messages.length - 1];
+        emitToOrganization(
+          organizationId,
+          'new-message',
+          {
+            conversationId: conversation._id.toString(),
+            message: {
+              conversationId: conversation._id.toString(),
+              text: last?.content || '',
+              sender: last?.role === 'user' ? 'customer' : 'ai',
+              timestamp: last?.timestamp || new Date(),
+            },
+          }
+        );
+      } catch (socketError: any) {
+        console.warn('[Widget Conversation] Socket emit skipped:', socketError?.message);
+      }
+
       console.log('[Widget Conversation] ✅ Conversation saved successfully');
       return conversation;
     } catch (error: any) {

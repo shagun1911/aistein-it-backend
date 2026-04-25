@@ -526,6 +526,73 @@ export class BatchCallingController {
   }
 
   /**
+   * Resume batch job
+   * POST /api/v1/batch-calling/:jobId/resume
+   */
+  async resumeBatchJob(req: AuthRequest, res: Response, next: NextFunction) {
+    try {
+      const { jobId } = req.params;
+
+      if (!jobId) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'MISSING_JOB_ID',
+            message: 'Job ID is required'
+          }
+        });
+      }
+
+      const BatchCall = (await import('../models/BatchCall')).default;
+      const organizationId = req.user?.organizationId || req.user?._id;
+      if (!organizationId) {
+        return res.status(401).json({
+          success: false,
+          error: "Unauthorized",
+          detail: "Organization ID or User ID not found"
+        });
+      }
+
+      const batchCall = await BatchCall.findOne({
+        batch_call_id: jobId,
+        organizationId: organizationId instanceof mongoose.Types.ObjectId
+          ? organizationId
+          : new mongoose.Types.ObjectId(organizationId.toString())
+      }).lean();
+
+      if (!batchCall) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: 'BATCH_CALL_NOT_FOUND',
+            message: 'Batch call not found or does not belong to your organization'
+          }
+        });
+      }
+
+      const result = await batchCallingService.resumeBatchJob(jobId);
+
+      try {
+        await BatchCall.updateOne(
+          { batch_call_id: jobId },
+          {
+            $set: {
+              status: 'in_progress',
+              last_updated_at_unix: Math.floor(Date.now() / 1000)
+            }
+          }
+        );
+      } catch (dbError: any) {
+        console.warn('[Batch Calling Controller] ⚠️ Failed to update resumed batch status in database:', dbError.message);
+      }
+
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
    * Get all batch calls for the user's organization
    * GET /api/v1/batch-calling
    * Syncs status from Python API for each batch call
@@ -803,6 +870,515 @@ export class BatchCallingController {
       const result = await batchCallingService.getBatchJobResults(jobId, includeTranscript);
 
       res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Get complete per-contact batch details
+   * GET /api/v1/batch-calling/:jobId/details
+   */
+  async getBatchJobDetails(req: AuthRequest, res: Response, next: NextFunction) {
+    try {
+      const { jobId } = req.params;
+      if (!jobId) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'MISSING_JOB_ID',
+            message: 'Job ID is required'
+          }
+        });
+      }
+
+      const organizationId = req.user?.organizationId || req.user?._id;
+      if (!organizationId) {
+        return res.status(401).json({
+          success: false,
+          error: "Unauthorized",
+          detail: "Organization ID or User ID not found"
+        });
+      }
+
+      const BatchCall = (await import('../models/BatchCall')).default;
+      const Conversation = (await import('../models/Conversation')).default;
+      const Message = (await import('../models/Message')).default;
+      const Customer = (await import('../models/Customer')).default;
+
+      const orgObjectId = organizationId instanceof mongoose.Types.ObjectId
+        ? organizationId
+        : new mongoose.Types.ObjectId(organizationId.toString());
+
+      const batchCall = await BatchCall.findOne({
+        batch_call_id: jobId,
+        organizationId: orgObjectId
+      }).lean();
+
+      if (!batchCall) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: 'BATCH_CALL_NOT_FOUND',
+            message: 'Batch call not found or does not belong to your organization'
+          }
+        });
+      }
+
+      const [
+        statusResult,
+        callsResult,
+        resultsResult,
+        failedCallsResult,
+        busyCallsResult,
+        noAnswerCallsResult,
+        voicemailCallsResult
+      ] = await Promise.all([
+        batchCallingService.getBatchJobStatus(jobId).catch(() => null),
+        batchCallingService.getBatchJobCalls(jobId, { page_size: 100 }).catch(() => ({ calls: [] })),
+        batchCallingService.getBatchJobResults(jobId, true).catch(() => null),
+        batchCallingService.getBatchJobCalls(jobId, { status: 'failed', page_size: 100 }).catch(() => ({ calls: [] })),
+        batchCallingService.getBatchJobCalls(jobId, { status: 'busy', page_size: 100 }).catch(() => ({ calls: [] })),
+        batchCallingService.getBatchJobCalls(jobId, { status: 'no_answer', page_size: 100 }).catch(() => ({ calls: [] })),
+        batchCallingService.getBatchJobCalls(jobId, { status: 'voicemail', page_size: 100 }).catch(() => ({ calls: [] }))
+      ]);
+
+      const extractArray = (input: any): any[] => {
+        if (Array.isArray(input)) return input;
+        if (!input || typeof input !== 'object') return [];
+        const candidates = [
+          input.recipients,
+          input.results,
+          input.calls,
+          input.items,
+          input.data?.results,
+          input.data?.calls,
+          input.data?.items
+        ];
+        for (const c of candidates) {
+          if (Array.isArray(c)) return c;
+        }
+        return [];
+      };
+
+      const normalizeCallStatus = (rawStatus: string, reason: string): string => {
+        const status = (rawStatus || '').toLowerCase().trim();
+        const failureReason = (reason || '').toLowerCase();
+
+        if (status.includes('busy') || status === 'rejected_busy') return 'busy';
+        if (status.includes('voicemail') || status.includes('voice_mail')) return 'voicemail';
+        if (status.includes('no_answer') || status.includes('no-answer')) return 'no_answer';
+        if (status.includes('reject') || status.includes('decline')) return 'failed';
+
+        // SIP 486 / busy line should be surfaced clearly in UI.
+        if (
+          failureReason.includes('busy here') ||
+          failureReason.includes('line busy') ||
+          failureReason.includes('user busy') ||
+          failureReason.includes('sip status: 486') ||
+          failureReason.includes('sip 486')
+        ) {
+          return 'busy';
+        }
+
+        if (
+          failureReason.includes('voicemail') ||
+          failureReason.includes('voice mail') ||
+          failureReason.includes('answered by voicemail')
+        ) {
+          return 'voicemail';
+        }
+
+        if (
+          failureReason.includes('no answer') ||
+          failureReason.includes('did not answer') ||
+          failureReason.includes('timeout')
+        ) {
+          return 'no_answer';
+        }
+
+        if (
+          failureReason.includes('failed') ||
+          failureReason.includes('error') ||
+          failureReason.includes('rejected') ||
+          failureReason.includes('declined') ||
+          failureReason.includes('invalid number')
+        ) {
+          return 'failed';
+        }
+
+        return status || 'pending';
+      };
+
+      const pickBestReason = (...rows: any[]): string => {
+        const keys = [
+          'failure_reason',
+          'error_reason',
+          'error_message',
+          'error',
+          'reason',
+          'disposition',
+          'termination_reason',
+          'sip_response_reason',
+          'sip_status_reason',
+          'status_reason',
+          'hangup_cause',
+          'call_end_reason'
+        ];
+        for (const row of rows) {
+          if (!row || typeof row !== 'object') continue;
+          for (const key of keys) {
+            const value = row?.[key];
+            if (value && String(value).trim()) return String(value).trim();
+          }
+          const nestedCandidates = [
+            row?.metadata,
+            row?.analysis,
+            row?.call,
+            row?.result,
+            row?.recipient,
+            row?.phone_call
+          ];
+          for (const nested of nestedCandidates) {
+            if (!nested || typeof nested !== 'object') continue;
+            for (const key of keys) {
+              const value = nested?.[key];
+              if (value && String(value).trim()) return String(value).trim();
+            }
+          }
+        }
+        return '';
+      };
+
+      const defaultReasonFromStatus = (status: string, rawStatus: string): string => {
+        const normalized = (status || '').toLowerCase();
+        const raw = (rawStatus || '').toLowerCase();
+        if (normalized === 'busy') return 'Line busy (SIP 486 Busy Here)';
+        if (normalized === 'voicemail') return 'Call reached voicemail';
+        if (normalized === 'no_answer') return 'No answer from recipient';
+        if (normalized === 'failed') {
+          if (raw.includes('busy')) return 'Line busy';
+          if (raw.includes('voice')) return 'Call reached voicemail';
+          if (raw.includes('no_answer') || raw.includes('no answer')) return 'No answer from recipient';
+          if (raw.includes('reject')) return 'Call rejected by recipient';
+          if (raw.includes('decline')) return 'Call declined by recipient';
+          return 'Call failed before completion';
+        }
+        return '';
+      };
+
+      const normalizePhoneForCompare = (value: any): string => {
+        if (!value) return '';
+        const str = String(value).trim();
+        const digits = str.replace(/\D/g, '');
+        if (!digits) return '';
+        // Compare by digits only to avoid +, spaces, and formatting mismatches.
+        return digits;
+      };
+
+      const recipientRows = extractArray(statusResult?.recipients || statusResult);
+      const dedupeRows = (rows: any[]): any[] => {
+        const seen = new Set<string>();
+        const out: any[] = [];
+        for (const row of rows) {
+          const key = String(
+            row?.id ||
+            row?.call_id ||
+            row?.conversation_id ||
+            row?.conversationId ||
+            `${row?.phone_number || row?.phone || ''}_${row?.status || row?.call_status || ''}_${row?.updated_at_unix || row?.created_at_unix || ''}`
+          );
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(row);
+        }
+        return out;
+      };
+      const callRows = dedupeRows([
+        ...extractArray(callsResult),
+        ...extractArray(failedCallsResult),
+        ...extractArray(busyCallsResult),
+        ...extractArray(noAnswerCallsResult),
+        ...extractArray(voicemailCallsResult)
+      ]);
+      const resultRows = extractArray(resultsResult);
+
+      // Live conversation details help resolve final status when batch endpoint still says "initiated".
+      const liveConversationIds = Array.from(
+        new Set(
+          [
+            ...recipientRows.map((r: any) => r?.conversation_id).filter(Boolean),
+            ...callRows.map((r: any) => r?.conversation_id || r?.conversationId).filter(Boolean),
+            ...resultRows.map((r: any) => r?.conversation_id || r?.conversationId || r?.id).filter(Boolean)
+          ].map(String)
+        )
+      ).slice(0, 150);
+
+      const liveConversationMap = new Map<string, any>();
+      if (liveConversationIds.length > 0) {
+        const liveDetails = await Promise.allSettled(
+          liveConversationIds.map(async (conversationId) => ({
+            conversationId,
+            detail: await batchCallingService.getConversationDetail(conversationId)
+          }))
+        );
+
+        for (const item of liveDetails) {
+          if (item.status === 'fulfilled' && item.value?.detail) {
+            liveConversationMap.set(item.value.conversationId, item.value.detail);
+          }
+        }
+      }
+
+      const byConversationId = new Map<string, any>();
+      const byPhone = new Map<string, any>();
+      const byRecipientId = new Map<string, any>();
+
+      const addIndex = (row: any) => {
+        const conversationId = row?.conversation_id || row?.conversationId || row?.call_sid || row?.id;
+        const phone = row?.phone_number || row?.phone || row?.to_number || row?.customer_phone_number;
+        const recipientId = row?.recipient_id || row?.id;
+        if (conversationId && !byConversationId.has(conversationId)) byConversationId.set(conversationId, row);
+        const normalizedPhone = normalizePhoneForCompare(phone);
+        if (normalizedPhone && !byPhone.has(normalizedPhone)) byPhone.set(normalizedPhone, row);
+        if (recipientId && !byRecipientId.has(String(recipientId))) byRecipientId.set(String(recipientId), row);
+      };
+
+      recipientRows.forEach(addIndex);
+      callRows.forEach(addIndex);
+      resultRows.forEach(addIndex);
+
+      const dbConversations = await Conversation.find({
+        organizationId: orgObjectId,
+        channel: 'phone',
+        'metadata.batch_call_id': jobId
+      }).lean();
+
+      const conversationIds = dbConversations.map((c: any) => c._id);
+      const [messageCounts, customers] = await Promise.all([
+        Message.aggregate([
+          { $match: { conversationId: { $in: conversationIds }, type: 'message' } },
+          { $group: { _id: '$conversationId', count: { $sum: 1 } } }
+        ]),
+        Customer.find({
+          _id: { $in: dbConversations.map((c: any) => c.customerId).filter(Boolean) }
+        }).lean()
+      ]);
+
+      const messageCountMap = new Map<string, number>(
+        messageCounts.map((m: any) => [String(m._id), m.count || 0])
+      );
+      const customerMap = new Map<string, any>(
+        customers.map((c: any) => [String(c._id), c])
+      );
+      const dbByPhone = new Map<string, any>();
+      const dbByConversationId = new Map<string, any>();
+      for (const c of dbConversations) {
+        const phone = c?.metadata?.phone_number;
+        const convId = c?.metadata?.conversation_id;
+        if (phone && !dbByPhone.has(phone)) dbByPhone.set(phone, c);
+        if (convId && !dbByConversationId.has(convId)) dbByConversationId.set(convId, c);
+      }
+
+      const allPhones = new Set<string>();
+      const allConversationIds = new Set<string>();
+      recipientRows.forEach((r: any) => r?.phone_number && allPhones.add(r.phone_number));
+      callRows.forEach((r: any) => r?.phone_number && allPhones.add(r.phone_number));
+      resultRows.forEach((r: any) => (r?.phone_number || r?.phone) && allPhones.add(r.phone_number || r.phone));
+      dbConversations.forEach((c: any) => c?.metadata?.phone_number && allPhones.add(c.metadata.phone_number));
+      recipientRows.forEach((r: any) => r?.conversation_id && allConversationIds.add(r.conversation_id));
+      callRows.forEach((r: any) => (r?.conversation_id || r?.conversationId) && allConversationIds.add(r.conversation_id || r.conversationId));
+      resultRows.forEach((r: any) => (r?.conversation_id || r?.conversationId || r?.id) && allConversationIds.add(r.conversation_id || r.conversationId || r.id));
+      dbConversations.forEach((c: any) => c?.metadata?.conversation_id && allConversationIds.add(c.metadata.conversation_id));
+
+      const contacts = [...allPhones].map((phone) => {
+        const normalizedPhone = normalizePhoneForCompare(phone);
+        const statusRow = recipientRows.find((r: any) => normalizePhoneForCompare(r?.phone_number) === normalizedPhone) || byPhone.get(normalizedPhone) || {};
+        const statusRecipientId = statusRow?.id ? String(statusRow.id) : '';
+        const callRow =
+          callRows.find((r: any) => normalizePhoneForCompare(r?.phone_number || r?.phone) === normalizedPhone) ||
+          (statusRecipientId ? byRecipientId.get(statusRecipientId) : null) ||
+          {};
+        const resultRow =
+          resultRows.find((r: any) => normalizePhoneForCompare(r?.phone_number || r?.phone) === normalizedPhone) ||
+          (statusRecipientId ? byRecipientId.get(statusRecipientId) : null) ||
+          {};
+        const conversationId = statusRow?.conversation_id || callRow?.conversation_id || callRow?.conversationId || resultRow?.conversation_id || resultRow?.conversationId || resultRow?.id;
+        const liveConversation = conversationId ? liveConversationMap.get(String(conversationId)) : null;
+        const dbConversation = dbByPhone.get(phone) || (conversationId ? dbByConversationId.get(conversationId) : null);
+        const customer = dbConversation?.customerId ? customerMap.get(String(dbConversation.customerId)) : null;
+        const transcript =
+          resultRow?.transcript ||
+          callRow?.transcript ||
+          dbConversation?.transcript ||
+          null;
+
+        const dynamicVars = statusRow?.conversation_initiation_client_data?.dynamic_variables || {};
+        const displayName = statusRow?.name || callRow?.name || resultRow?.name || dynamicVars.name || dynamicVars.customer_name || customer?.name || 'Unknown';
+        const email = statusRow?.email || callRow?.email || resultRow?.email || dynamicVars.email || dynamicVars.customer_email || customer?.email || '';
+        const rawStatus =
+          liveConversation?.status ||
+          statusRow?.status ||
+          callRow?.status ||
+          callRow?.call_status ||
+          resultRow?.status ||
+          (dbConversation ? 'completed' : 'pending');
+        const durationSeconds =
+          liveConversation?.metadata?.call_duration_secs ||
+          liveConversation?.call_duration_secs ||
+          resultRow?.metadata?.call_duration_secs ||
+          resultRow?.call_duration_secs ||
+          callRow?.duration ||
+          dbConversation?.metadata?.duration_seconds ||
+          0;
+        const reasonText = pickBestReason(
+          liveConversation,
+          liveConversation?.metadata,
+          liveConversation?.analysis,
+          resultRow,
+          resultRow?.metadata,
+          resultRow?.analysis,
+          callRow,
+          callRow?.metadata,
+          statusRow,
+          statusRow?.metadata,
+          dbConversation?.metadata
+        );
+        const endReason =
+          liveConversation?.metadata?.termination_reason ||
+          liveConversation?.end_reason ||
+          resultRow?.metadata?.termination_reason ||
+          resultRow?.end_reason ||
+          dbConversation?.metadata?.end_reason ||
+          reasonText ||
+          '';
+        const failedReason = reasonText;
+        const summary =
+          resultRow?.analysis?.summary ||
+          resultRow?.summary ||
+          resultRow?.call_summary ||
+          '';
+        // If provider marks batch completed but recipient stays initiated with no final reason,
+        // avoid showing initiated forever in UI.
+        const statusForNormalization =
+          (statusResult?.status === 'completed' && String(rawStatus).toLowerCase() === 'initiated' && !failedReason && !endReason)
+            ? 'failed'
+            : rawStatus;
+        const resolvedStatus = normalizeCallStatus(statusForNormalization, `${failedReason} ${endReason}`);
+        const resolvedFailedReason = failedReason || defaultReasonFromStatus(resolvedStatus, rawStatus);
+        const resolvedEndReason = endReason || defaultReasonFromStatus(resolvedStatus, rawStatus);
+
+        return {
+          phone_number: phone,
+          name: displayName,
+          email,
+          status: resolvedStatus,
+          raw_status: rawStatus,
+          conversation_id: conversationId || dbConversation?.metadata?.conversation_id || null,
+          recipient_id: statusRow?.id || statusRow?.recipient_id || null,
+          duration_seconds: durationSeconds,
+          end_reason: resolvedEndReason,
+          failed_reason: resolvedFailedReason,
+          summary,
+          transcript,
+          metadata: {
+            sip_call_sid: resultRow?.metadata?.call_sid || callRow?.call_sid || null,
+            recording_url: resultRow?.recording_url || resultRow?.audio_url || dbConversation?.metadata?.recording_url || dbConversation?.metadata?.audio_url || null,
+            raw_reason: failedReason || endReason || null,
+            created_at_unix: statusRow?.created_at_unix || callRow?.created_at_unix || null,
+            updated_at_unix: statusRow?.updated_at_unix || callRow?.updated_at_unix || null
+          },
+          conversation: dbConversation ? {
+            id: dbConversation._id,
+            status: dbConversation.status,
+            channel: dbConversation.channel,
+            createdAt: dbConversation.createdAt,
+            updatedAt: dbConversation.updatedAt,
+            message_count: messageCountMap.get(String(dbConversation._id)) || 0
+          } : null
+        };
+      });
+
+      const contactsWithoutPhone = [...allConversationIds]
+        .filter((conversationId) => !contacts.some((c) => c.conversation_id === conversationId))
+        .map((conversationId) => {
+          const row = byConversationId.get(conversationId) || {};
+          const liveConversation = liveConversationMap.get(String(conversationId)) || null;
+          const dbConversation = dbByConversationId.get(conversationId) || null;
+          const customer = dbConversation?.customerId ? customerMap.get(String(dbConversation.customerId)) : null;
+          const rawStatus = liveConversation?.status || row?.status || row?.call_status || 'completed';
+          const reasonText = pickBestReason(
+            liveConversation,
+            liveConversation?.metadata,
+            liveConversation?.analysis,
+            row,
+            row?.metadata,
+            row?.analysis,
+            dbConversation?.metadata
+          );
+          const failedReason = reasonText;
+          const endReason =
+            liveConversation?.metadata?.termination_reason ||
+            row?.metadata?.termination_reason ||
+            row?.end_reason ||
+            dbConversation?.metadata?.end_reason ||
+            reasonText ||
+            '';
+          const resolvedStatus = normalizeCallStatus(rawStatus, `${failedReason} ${endReason}`);
+          const resolvedFailedReason = failedReason || defaultReasonFromStatus(resolvedStatus, rawStatus);
+          const resolvedEndReason = endReason || defaultReasonFromStatus(resolvedStatus, rawStatus);
+          return {
+            phone_number: row?.phone_number || dbConversation?.metadata?.phone_number || '',
+            name: row?.name || customer?.name || 'Unknown',
+            email: row?.email || customer?.email || '',
+            status: resolvedStatus,
+            raw_status: rawStatus,
+            conversation_id: conversationId,
+            recipient_id: row?.id || null,
+            duration_seconds: row?.metadata?.call_duration_secs || row?.call_duration_secs || dbConversation?.metadata?.duration_seconds || 0,
+            end_reason: resolvedEndReason,
+            failed_reason: resolvedFailedReason,
+            summary: row?.analysis?.summary || row?.summary || '',
+            transcript: row?.transcript || dbConversation?.transcript || null,
+            metadata: {
+              sip_call_sid: row?.metadata?.call_sid || row?.call_sid || null,
+              recording_url: row?.recording_url || row?.audio_url || dbConversation?.metadata?.recording_url || dbConversation?.metadata?.audio_url || null,
+              raw_reason: failedReason || endReason || null,
+              created_at_unix: row?.created_at_unix || null,
+              updated_at_unix: row?.updated_at_unix || null
+            },
+            conversation: dbConversation ? {
+              id: dbConversation._id,
+              status: dbConversation.status,
+              channel: dbConversation.channel,
+              createdAt: dbConversation.createdAt,
+              updatedAt: dbConversation.updatedAt,
+              message_count: messageCountMap.get(String(dbConversation._id)) || 0
+            } : null
+          };
+        });
+
+      const mergedContacts = [...contacts, ...contactsWithoutPhone]
+        .sort((a, b) => {
+          const aDone = a.status === 'completed' ? 1 : 0;
+          const bDone = b.status === 'completed' ? 1 : 0;
+          if (aDone !== bDone) return aDone - bDone;
+          return (a.name || '').localeCompare(b.name || '');
+        });
+
+      res.status(200).json({
+        success: true,
+        data: {
+          batch: {
+            ...batchCall,
+            live_status: statusResult?.status || batchCall.status,
+            live_total_calls_dispatched: statusResult?.total_calls_dispatched ?? batchCall.total_calls_dispatched,
+            live_total_calls_scheduled: statusResult?.total_calls_scheduled ?? batchCall.total_calls_scheduled,
+            live_total_calls_finished: statusResult?.total_calls_finished ?? batchCall.total_calls_finished
+          },
+          contacts: mergedContacts
+        }
+      });
     } catch (error) {
       next(error);
     }

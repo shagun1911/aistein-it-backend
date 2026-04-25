@@ -1720,13 +1720,65 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
 
         console.log(`\n[Automation Engine] 👤 Processing contact: ${contact.name} (${contact.email || 'no email'})`);
 
+        // Enrich context with conversation data (when trigger includes conversation_id)
+        // so templates can reference {{conversation.summary}}, {{conversation.transcript_text}}, etc.
+        let conversationContext: any = undefined;
+        try {
+          if (triggerData?.conversation_id) {
+            const conversation: any = await Conversation.findById(triggerData.conversation_id).lean();
+            if (conversation) {
+              const messages = await Message.find({
+                conversationId: conversation._id,
+                type: 'message'
+              })
+                .sort({ timestamp: 1 })
+                .select('sender text timestamp')
+                .lean();
+
+              const transcriptText = messages
+                .map((m: any) => {
+                  const speaker = m.sender === 'customer' ? 'User' : (m.sender === 'operator' ? 'Operator' : 'Agent');
+                  return `${speaker}: ${m.text || ''}`.trim();
+                })
+                .filter(Boolean)
+                .join('\n');
+
+              const conversationSummary =
+                conversation?.analysis?.summary ||
+                conversation?.summary ||
+                conversation?.metadata?.summary ||
+                '';
+
+              conversationContext = {
+                id: String(conversation._id),
+                status: conversation.status,
+                channel: conversation.channel,
+                summary: conversationSummary,
+                transcript: conversation.transcript || null,
+                transcript_text: transcriptText,
+                duration_seconds:
+                  conversation?.metadata?.duration_seconds ||
+                  conversation?.metadata?.call_duration_secs ||
+                  0,
+                end_reason: conversation?.metadata?.end_reason || '',
+                caller_number: conversation?.metadata?.phone_number || contact.phone || '',
+                created_at: conversation.createdAt,
+                updated_at: conversation.updatedAt
+              };
+            }
+          }
+        } catch (convErr: any) {
+          console.warn('[Automation Engine] ⚠️ Failed to enrich conversation context:', convErr.message);
+        }
+
         const context: IAutomationExecutionContext = {
           contact,
           triggerData: { ...triggerData, contactId },
           organizationId,
           userId,
           now: new Date().toISOString(),
-          appointment: triggerData.appointment
+          appointment: triggerData.appointment,
+          conversation: conversationContext
         };
 
         console.log(`[Automation Engine] 📦 Context prepared:`, {

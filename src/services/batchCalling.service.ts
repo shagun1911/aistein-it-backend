@@ -213,6 +213,38 @@ export class BatchCallingService {
   }
 
   /**
+   * Resume batch job
+   * Calls Python /api/v1/batch-calling/{job_id}/resume endpoint
+   */
+  async resumeBatchJob(jobId: string): Promise<{ success: boolean; message: string }> {
+    try {
+      const pythonUrl = `${COMM_API_URL}/api/v1/batch-calling/${jobId}/resume`;
+      console.log('[Batch Calling Service] Resuming batch:', jobId);
+
+      const response = await axios.post<{ success: boolean; message: string }>(
+        pythonUrl,
+        {},
+        {
+          timeout: 30000,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      console.log('[Batch Calling Service] ✅ Batch job resumed successfully');
+      return response.data;
+    } catch (error: any) {
+      console.error('[Batch Calling Service] ❌ Failed to resume batch job:', error.response?.data || error.message);
+      throw new AppError(
+        error.response?.status || 500,
+        'BATCH_CALL_ERROR',
+        error.response?.data?.message || error.response?.data?.detail || 'Failed to resume batch job'
+      );
+    }
+  }
+
+  /**
    * Get batch job calls (individual call results)
    * Calls Python /api/v1/batch-calling/{job_id}/calls endpoint
    * If endpoint doesn't exist (404), returns empty result gracefully

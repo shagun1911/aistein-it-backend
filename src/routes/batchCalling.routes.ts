@@ -19,11 +19,17 @@ router.get('/:jobId/calls', batchCallingController.getBatchJobCalls);
 // GET /api/v1/batch-calling/:jobId/results - Get batch job results with transcripts (must be before /:jobId)
 router.get('/:jobId/results', batchCallingController.getBatchJobResults);
 
+// GET /api/v1/batch-calling/:jobId/details - Complete per-contact batch details
+router.get('/:jobId/details', batchCallingController.getBatchJobDetails);
+
 // GET /api/v1/batch-calling/:jobId - Get batch job status
 router.get('/:jobId', batchCallingController.getBatchJobStatus);
 
 // POST /api/v1/batch-calling/:jobId/cancel - Cancel batch job
 router.post('/:jobId/cancel', batchCallingController.cancelBatchJob);
+
+// POST /api/v1/batch-calling/:jobId/resume - Resume a paused/cancelled batch job
+router.post('/:jobId/resume', batchCallingController.resumeBatchJob);
 
 // POST /api/v1/batch-calling/:jobId/sync - Manually sync batch call conversations
 router.post('/:jobId/sync', batchCallingController.syncBatchCallConversations);

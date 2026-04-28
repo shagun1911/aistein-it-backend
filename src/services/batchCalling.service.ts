@@ -484,7 +484,10 @@ export class BatchCallingService {
 
           // ── Recipient completed + transcript ready → process + trigger automation ──
           const vars = recipient.conversation_initiation_client_data?.dynamic_variables || {};
-          const name = vars.name || vars.customer_name || 'Unknown';
+          const firstName = vars.first_name || vars.customer_first_name;
+          const lastName = vars.last_name || vars.customer_last_name;
+          const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
+          const name = fullName || vars.name || vars.customer_name || 'Unknown';
           const email = vars.email || vars.customer_email;
 
           console.log(`[Batch Calling Service] ✅ ${phone} (${name}) – completed, transcript ready (${transcriptItems.length} items, ${duration}s)`);

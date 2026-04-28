@@ -9,10 +9,16 @@ interface CaptchaVerificationResponse {
 }
 
 export async function verifyCaptchaToken(captchaToken: string, remoteIp?: string): Promise<void> {
-  const recaptchaSecret = process.env.RECAPTCHA_SECRET_KEY;
+  const recaptchaSecret =
+    process.env.RECAPTCHA_SECRET_KEY ||
+    process.env.CAPTCHA_SECRET_KEY;
 
   if (!recaptchaSecret) {
-    throw new AppError(500, 'CAPTCHA_CONFIG_MISSING', 'Captcha is not configured on the server');
+    throw new AppError(
+      500,
+      'CAPTCHA_CONFIG_MISSING',
+      'Captcha is not configured on the server. Set RECAPTCHA_SECRET_KEY in backend environment.'
+    );
   }
 
   try {

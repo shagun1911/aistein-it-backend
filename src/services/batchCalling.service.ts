@@ -17,6 +17,11 @@ export interface BatchCallRequest {
   call_name: string;
   phone_number_id: string; // ElevenLabs phone number ID
   recipients: BatchCallRecipient[];
+  retry_count?: number;
+  scheduled_at?: string;
+  timezone?: string;
+  target_concurrency_limit?: number;
+  sender_email?: string;
 }
 
 export interface BatchRecipientStatus {
@@ -77,7 +82,12 @@ export class BatchCallingService {
         agent_id: data.agent_id,
         call_name: data.call_name,
         phone_number_id: data.phone_number_id,
-        recipients_count: data.recipients.length
+        recipients_count: data.recipients.length,
+        retry_count: data.retry_count ?? null,
+        scheduled_at: data.scheduled_at ?? null,
+        timezone: data.timezone ?? null,
+        target_concurrency_limit: data.target_concurrency_limit ?? null,
+        has_sender_email: Boolean(data.sender_email)
       });
 
       // Validate phone_number_id is provided and is a non-empty string
@@ -96,7 +106,7 @@ export class BatchCallingService {
 
       // Build payload with EXACTLY the required fields - no transformations, no enrichment
       // Preserve recipients exactly as received, including dynamic_variables as-is
-      const payload = {
+      const payload: any = {
         agent_id: data.agent_id,
         call_name: data.call_name,
         phone_number_id: String(data.phone_number_id).trim(),
@@ -117,12 +127,23 @@ export class BatchCallingService {
         })
       };
 
+      if (data.retry_count !== undefined) payload.retry_count = data.retry_count;
+      if (data.scheduled_at) payload.scheduled_at = data.scheduled_at;
+      if (data.timezone) payload.timezone = data.timezone;
+      if (data.target_concurrency_limit !== undefined) payload.target_concurrency_limit = data.target_concurrency_limit;
+      if (data.sender_email) payload.sender_email = data.sender_email;
+
       // Log summary only (do not log full payload – no PII in logs; cancelled batches must not leave contact data in logs)
       console.log('[Batch Calling Service] 🚀 Submitting batch:', {
         recipients_count: payload.recipients.length,
         agent_id: payload.agent_id,
         phone_number_id: payload.phone_number_id,
-        call_name: payload.call_name
+        call_name: payload.call_name,
+        retry_count: payload.retry_count ?? null,
+        scheduled_at: payload.scheduled_at ?? null,
+        timezone: payload.timezone ?? null,
+        target_concurrency_limit: payload.target_concurrency_limit ?? null,
+        has_sender_email: Boolean(payload.sender_email)
       });
 
       // Make the request

@@ -86,7 +86,12 @@ const setupQueueProcessor = () => {
     console.log('[Batch Call Queue] Job data:', {
       recipients_count: job.data.recipients?.length || 0,
       agent_id: job.data.agent_id,
-      call_name: job.data.call_name
+      call_name: job.data.call_name,
+      retry_count: job.data.retry_count ?? null,
+      scheduled_at: job.data.scheduled_at ?? null,
+      timezone: job.data.timezone ?? null,
+      target_concurrency_limit: job.data.target_concurrency_limit ?? null,
+      has_sender_email: Boolean(job.data.sender_email)
     });
 
     const {
@@ -94,6 +99,11 @@ const setupQueueProcessor = () => {
       call_name,
       recipients,
       phone_number_id,
+      retry_count,
+      scheduled_at,
+      timezone,
+      target_concurrency_limit,
+      sender_email,
       userId,
       organizationId
     } = job.data;
@@ -103,7 +113,7 @@ const setupQueueProcessor = () => {
       job.progress(10);
 
       // Build payload
-      const payload = {
+      const payload: any = {
         agent_id,
         call_name,
         phone_number_id: String(phone_number_id).trim(),
@@ -123,6 +133,12 @@ const setupQueueProcessor = () => {
           return recipientPayload;
         })
       };
+
+      if (retry_count !== undefined) payload.retry_count = retry_count;
+      if (scheduled_at) payload.scheduled_at = scheduled_at;
+      if (timezone) payload.timezone = timezone;
+      if (target_concurrency_limit !== undefined) payload.target_concurrency_limit = target_concurrency_limit;
+      if (sender_email) payload.sender_email = sender_email;
 
       console.log('[Batch Call Queue] 📋 Submitting batch call to Python API...');
       console.log('[Batch Call Queue] Recipients count:', payload.recipients.length);
@@ -244,6 +260,11 @@ export const enqueueBatchCall = async (data: {
   call_name: string;
   recipients: any[];
   phone_number_id: string;
+  retry_count?: number;
+  scheduled_at?: string;
+  timezone?: string;
+  target_concurrency_limit?: number;
+  sender_email?: string;
   userId: string | mongoose.Types.ObjectId;
   organizationId: string | mongoose.Types.ObjectId;
 }): Promise<Bull.Job | null> => {
@@ -258,6 +279,11 @@ export const enqueueBatchCall = async (data: {
       call_name: data.call_name,
       recipients: data.recipients,
       phone_number_id: data.phone_number_id,
+      retry_count: data.retry_count,
+      scheduled_at: data.scheduled_at,
+      timezone: data.timezone,
+      target_concurrency_limit: data.target_concurrency_limit,
+      sender_email: data.sender_email,
       userId: data.userId,
       organizationId: data.organizationId
     }, {

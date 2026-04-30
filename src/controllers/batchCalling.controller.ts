@@ -17,7 +17,12 @@ export class BatchCallingController {
         agent_id,
         call_name,
         recipients,
-        phone_number_id
+        phone_number_id,
+        retry_count,
+        scheduled_at,
+        timezone,
+        target_concurrency_limit,
+        sender_email
       } = req.body;
 
       console.log('[Batch Calling Controller] ===== SUBMIT BATCH CALL REQUEST =====');
@@ -26,7 +31,13 @@ export class BatchCallingController {
         agent_id,
         call_name,
         recipients_count: recipients?.length || 0,
-        phone_number_id
+        phone_number_id,
+        retry_count,
+        scheduled_at: scheduled_at || null,
+        timezone: timezone || null,
+        target_concurrency_limit:
+          target_concurrency_limit !== undefined ? target_concurrency_limit : null,
+        has_sender_email: Boolean(sender_email)
       });
 
       // Validate required fields
@@ -197,28 +208,42 @@ export class BatchCallingController {
       // Helper to submit batch call (used for initial attempt and retry after re-register)
       const doSubmit = (elevenLabsId: string, chunkRecipientsPayload: any[], chunkCallName: string) => {
         // Build payload with ONLY the required fields - no transformations, no enrichment
-        const payload = {
+        const payload: any = {
           agent_id,
           call_name: chunkCallName,
           phone_number_id: elevenLabsId,
           recipients: chunkRecipientsPayload
         };
 
+        if (retry_count !== undefined) payload.retry_count = retry_count;
+        if (scheduled_at) payload.scheduled_at = scheduled_at;
+        if (timezone) payload.timezone = timezone;
+        if (target_concurrency_limit !== undefined) payload.target_concurrency_limit = target_concurrency_limit;
+        if (sender_email) payload.sender_email = sender_email;
+
         // Log summary only (no PII – do not log full recipient list)
         console.log('[Batch Calling Controller] Submitting batch:', {
           recipients_count: payload.recipients.length,
           agent_id: payload.agent_id,
-          phone_number_id: payload.phone_number_id
+          phone_number_id: payload.phone_number_id,
+          retry_count: payload.retry_count ?? null,
+          scheduled_at: payload.scheduled_at ?? null,
+          timezone: payload.timezone ?? null,
+          target_concurrency_limit: payload.target_concurrency_limit ?? null,
+          has_sender_email: Boolean(payload.sender_email)
         });
 
         return batchCallingService.submitBatchCall(payload);
       };
 
-      // Check if queue is available - use it for background processing
+      // Check if queue is available.
+      // For chunked submissions, use synchronous path so all chunk records are created
+      // immediately and visible in the UI (e.g. 700 -> Batch 1/2 and Batch 2/2).
       const { enqueueBatchCall, isBatchCallQueueAvailable } = await import('../queues/batchCall.queue');
       const queueAvailable = isBatchCallQueueAvailable();
+      const shouldUseQueue = queueAvailable && !isChunkedSubmission;
 
-      if (queueAvailable) {
+      if (shouldUseQueue) {
         console.log('[Batch Calling Controller] 🚀 Queue available - enqueueing batch call job for background processing');
         console.log('[Batch Calling Controller] Recipients count:', recipients.length);
 
@@ -233,6 +258,11 @@ export class BatchCallingController {
             call_name: chunkCallName,
             recipients: recipientsChunk,
             phone_number_id: elevenlabsPhoneNumberId,
+            retry_count,
+            scheduled_at,
+            timezone,
+            target_concurrency_limit,
+            sender_email,
             userId,
             organizationId
           });
@@ -261,7 +291,11 @@ export class BatchCallingController {
           });
         }
       } else {
-        console.log('[Batch Calling Controller] ℹ️  Queue not available - using synchronous processing');
+        if (isChunkedSubmission && queueAvailable) {
+          console.log('[Batch Calling Controller] ℹ️  Queue is available but chunked submission detected - using synchronous processing to persist all chunks immediately');
+        } else {
+          console.log('[Batch Calling Controller] ℹ️  Queue not available - using synchronous processing');
+        }
       }
 
       // Synchronous processing (fallback or when queue unavailable)

@@ -86,11 +86,21 @@ export class BatchCallingController {
       const organizationId = new mongoose.Types.ObjectId(organizationIdStr);
 
       // Find by phone_number_id and (organizationId or userId) so we match legacy records stored with userId
+      const requestedPhoneId = String(phone_number_id).trim();
       const phoneNumber = await PhoneNumber.findOne({
-        phone_number_id,
-        $or: [
-          { organizationId },
-          { userId }
+        $and: [
+          {
+            $or: [
+              { phone_number_id: requestedPhoneId },
+              { elevenlabs_phone_number_id: requestedPhoneId }
+            ]
+          },
+          {
+            $or: [
+              { organizationId },
+              { userId }
+            ]
+          }
         ]
       }).lean();
 
@@ -98,12 +108,19 @@ export class BatchCallingController {
         return res.status(404).json({
           success: false,
           error: "Phone number not found",
-          detail: `Phone number with ID ${phone_number_id} not found`
+          detail: `Phone number with ID ${requestedPhoneId} not found`
         });
       }
 
       // Get ElevenLabs phone_number_id (required for batch calling)
-      let elevenlabsPhoneNumberId = phoneNumber.elevenlabs_phone_number_id;
+      let elevenlabsPhoneNumberId =
+        phoneNumber.elevenlabs_phone_number_id ||
+        (phoneNumber.phone_number_id === requestedPhoneId ? requestedPhoneId : '');
+
+      // If caller passed a direct ElevenLabs phone_number_id, trust and use it.
+      if (phoneNumber.elevenlabs_phone_number_id === requestedPhoneId) {
+        elevenlabsPhoneNumberId = requestedPhoneId;
+      }
 
       // If not registered, try to register it (for Twilio numbers)
       if (!elevenlabsPhoneNumberId && phoneNumber.provider === 'twilio' && phoneNumber.sid && phoneNumber.token) {
@@ -251,12 +268,14 @@ export class BatchCallingController {
       const { enqueueBatchCall, isBatchCallQueueAvailable } = await import('../queues/batchCall.queue');
       const queueAvailable = isBatchCallQueueAvailable();
       const shouldUseQueue = queueAvailable && !isChunkedSubmission;
+      const queueCompletionTimeoutMs = 15000;
 
       if (shouldUseQueue) {
         console.log('[Batch Calling Controller] 🚀 Queue available - enqueueing batch call job for background processing');
         console.log('[Batch Calling Controller] Recipients count:', recipients.length);
 
-        const queuedJobs: string[] = [];
+        const queuedJobIds: string[] = [];
+        const queuedJobs: any[] = [];
 
         for (let i = 0; i < recipientChunks.length; i++) {
           const recipientsChunk = recipientChunks[i];
@@ -277,9 +296,11 @@ export class BatchCallingController {
           });
 
           if (job) {
-            queuedJobs.push(job.id.toString());
+            queuedJobIds.push(job.id.toString());
+            queuedJobs.push(job);
           } else {
             console.warn('[Batch Calling Controller] ⚠️  Failed to enqueue one chunk, falling back to synchronous processing');
+            queuedJobIds.length = 0;
             queuedJobs.length = 0;
             break;
           }
@@ -287,17 +308,70 @@ export class BatchCallingController {
 
         if (queuedJobs.length === totalChunks) {
           console.log('[Batch Calling Controller] ✅ All batch call chunks enqueued:', queuedJobs.length);
-          return res.status(202).json({
-            success: true,
-            message: isChunkedSubmission
-              ? `Batch call split into ${totalChunks} jobs and enqueued`
-              : 'Batch call job enqueued for processing',
-            job_ids: queuedJobs,
-            total_jobs: queuedJobs.length,
-            recipients_count: recipients.length,
-            chunk_size: ELEVENLABS_BATCH_SIZE,
-            status: 'queued'
-          });
+
+          // Try fast-path completion first. If the queue is healthy, jobs should complete quickly.
+          const completionResults = await Promise.all(
+            queuedJobs.map(async (job) => {
+              try {
+                await Promise.race([
+                  job.finished(),
+                  new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('QUEUE_COMPLETION_TIMEOUT')), queueCompletionTimeoutMs)
+                  )
+                ]);
+                return true;
+              } catch {
+                return false;
+              }
+            })
+          );
+
+          const allCompletedQuickly = completionResults.every(Boolean);
+          if (allCompletedQuickly) {
+            console.log('[Batch Calling Controller] ✅ Queue jobs completed within timeout:', queueCompletionTimeoutMs);
+            return res.status(202).json({
+              success: true,
+              message: 'Batch call processed via queue',
+              job_ids: queuedJobIds,
+              total_jobs: queuedJobIds.length,
+              recipients_count: recipients.length,
+              chunk_size: ELEVENLABS_BATCH_SIZE,
+              status: 'queued_completed'
+            });
+          }
+
+          console.warn('[Batch Calling Controller] ⚠️ Queue jobs did not complete quickly. Attempting safe fallback to synchronous processing...');
+
+          // Remove only jobs that have not started yet to avoid duplicate submissions.
+          let canFallbackSafely = true;
+          for (const job of queuedJobs) {
+            try {
+              const state = await job.getState();
+              if (state === 'waiting' || state === 'delayed' || state === 'paused') {
+                await job.remove();
+              } else if (state === 'active' || state === 'completed') {
+                canFallbackSafely = false;
+              }
+            } catch (queueStateError: any) {
+              console.warn('[Batch Calling Controller] ⚠️ Failed to inspect/remove queued job:', queueStateError.message);
+              canFallbackSafely = false;
+            }
+          }
+
+          if (!canFallbackSafely) {
+            console.log('[Batch Calling Controller] ℹ️ Some queued jobs already started; keeping queue path to avoid duplicate provider submissions');
+            return res.status(202).json({
+              success: true,
+              message: 'Batch call is still processing in queue',
+              job_ids: queuedJobIds,
+              total_jobs: queuedJobIds.length,
+              recipients_count: recipients.length,
+              chunk_size: ELEVENLABS_BATCH_SIZE,
+              status: 'queued'
+            });
+          }
+
+          console.log('[Batch Calling Controller] 🔁 Queue jobs removed before start; falling back to synchronous submission now');
         }
       } else {
         if (isChunkedSubmission && queueAvailable) {
@@ -1077,6 +1151,42 @@ export class BatchCallingController {
       };
 
       const pickBestReason = (...rows: any[]): string => {
+        const normalizeReasonValue = (value: any): string => {
+          if (value === null || value === undefined) return '';
+          if (typeof value === 'string') return value.trim();
+          if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+          if (Array.isArray(value)) {
+            for (const item of value) {
+              const normalized = normalizeReasonValue(item);
+              if (normalized) return normalized;
+            }
+            return '';
+          }
+          if (typeof value === 'object') {
+            const preferredKeys = [
+              'message',
+              'detail',
+              'reason',
+              'error',
+              'description',
+              'status_reason',
+              'termination_reason',
+              'hangup_cause'
+            ];
+            for (const key of preferredKeys) {
+              const nested = normalizeReasonValue((value as any)?.[key]);
+              if (nested) return nested;
+            }
+            try {
+              const serialized = JSON.stringify(value);
+              return serialized === '{}' ? '' : serialized;
+            } catch {
+              return '';
+            }
+          }
+          return '';
+        };
+
         const keys = [
           'failure_reason',
           'error_reason',
@@ -1095,7 +1205,8 @@ export class BatchCallingController {
           if (!row || typeof row !== 'object') continue;
           for (const key of keys) {
             const value = row?.[key];
-            if (value && String(value).trim()) return String(value).trim();
+            const normalized = normalizeReasonValue(value);
+            if (normalized) return normalized;
           }
           const nestedCandidates = [
             row?.metadata,
@@ -1109,7 +1220,8 @@ export class BatchCallingController {
             if (!nested || typeof nested !== 'object') continue;
             for (const key of keys) {
               const value = nested?.[key];
-              if (value && String(value).trim()) return String(value).trim();
+              const normalized = normalizeReasonValue(value);
+              if (normalized) return normalized;
             }
           }
         }

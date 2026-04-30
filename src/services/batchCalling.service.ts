@@ -133,7 +133,7 @@ export class BatchCallingService {
       if (data.target_concurrency_limit !== undefined) payload.target_concurrency_limit = data.target_concurrency_limit;
       if (data.sender_email) payload.sender_email = data.sender_email;
 
-      // Log summary only (do not log full payload – no PII in logs; cancelled batches must not leave contact data in logs)
+      // Log summary first
       console.log('[Batch Calling Service] 🚀 Submitting batch:', {
         recipients_count: payload.recipients.length,
         agent_id: payload.agent_id,
@@ -145,6 +145,9 @@ export class BatchCallingService {
         target_concurrency_limit: payload.target_concurrency_limit ?? null,
         has_sender_email: Boolean(payload.sender_email)
       });
+
+      // Debug: print exact payload so it can be replayed directly in provider docs/tools.
+      console.log('[Batch Calling Service] Exact submit payload JSON:', JSON.stringify(payload, null, 2));
 
       // Make the request
       console.log('[Batch Calling Service] Making POST request to:', pythonUrl);

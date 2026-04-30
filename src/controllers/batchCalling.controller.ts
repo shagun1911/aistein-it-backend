@@ -313,21 +313,69 @@ export class BatchCallingController {
           const completionResults = await Promise.all(
             queuedJobs.map(async (job) => {
               try {
-                await Promise.race([
+                const finishedResult = await Promise.race([
                   job.finished(),
                   new Promise((_, reject) =>
                     setTimeout(() => reject(new Error('QUEUE_COMPLETION_TIMEOUT')), queueCompletionTimeoutMs)
                   )
                 ]);
-                return true;
+                return { ok: true as const, finishedResult };
               } catch {
-                return false;
+                return { ok: false as const, finishedResult: null };
               }
             })
           );
 
-          const allCompletedQuickly = completionResults.every(Boolean);
+          const allCompletedQuickly = completionResults.every((result) => result.ok);
           if (allCompletedQuickly) {
+            // Safety net: ensure DB rows exist even if queue worker persistence raced/failed.
+            try {
+              const BatchCall = (await import('../models/BatchCall')).default;
+              const finishedPayloads = completionResults
+                .map((item) => item.finishedResult as any)
+                .filter(Boolean);
+              const userObjectId = userId instanceof mongoose.Types.ObjectId
+                ? userId
+                : new mongoose.Types.ObjectId(userId.toString());
+
+              for (const payload of finishedPayloads) {
+                const result = payload?.result || payload;
+                const batchId = result?.id || payload?.batch_call_id;
+                if (!batchId) continue;
+
+                await BatchCall.updateOne(
+                  { batch_call_id: batchId },
+                  {
+                    $setOnInsert: {
+                      userId: userObjectId,
+                      organizationId,
+                      batch_call_id: batchId,
+                      name: result.name || call_name,
+                      agent_id: result.agent_id || agent_id,
+                      status: result.status || 'pending',
+                      phone_number_id: result.phone_number_id || elevenlabsPhoneNumberId,
+                      phone_provider: result.phone_provider || 'twilio',
+                      created_at_unix: result.created_at_unix || Math.floor(Date.now() / 1000),
+                      scheduled_time_unix: result.scheduled_time_unix || Math.floor(Date.now() / 1000),
+                      timezone: result.timezone || timezone || 'UTC',
+                      total_calls_dispatched: result.total_calls_dispatched || 0,
+                      total_calls_scheduled: result.total_calls_scheduled || 0,
+                      total_calls_finished: result.total_calls_finished || 0,
+                      last_updated_at_unix: result.last_updated_at_unix || Math.floor(Date.now() / 1000),
+                      retry_count: result.retry_count ?? (retry_count ?? 0),
+                      agent_name: result.agent_name || '',
+                      call_name,
+                      recipients_count: recipients.length,
+                      conversations_synced: false
+                    }
+                  },
+                  { upsert: true }
+                );
+              }
+            } catch (queuePersistSafetyError: any) {
+              console.warn('[Batch Calling Controller] ⚠️ Queue completion safety persistence failed:', queuePersistSafetyError.message);
+            }
+
             console.log('[Batch Calling Controller] ✅ Queue jobs completed within timeout:', queueCompletionTimeoutMs);
             return res.status(202).json({
               success: true,

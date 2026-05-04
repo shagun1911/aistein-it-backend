@@ -6,15 +6,16 @@ import mongoose from 'mongoose';
 const MAX_RECIPIENTS = 10000;
 const ELEVENLABS_BATCH_SIZE = 500;
 
-export class BatchCallingController {
-  private async resolveOrganizationObjectId(req: AuthRequest): Promise<mongoose.Types.ObjectId | null> {
-    const userId = req.user?._id;
-    if (!userId) return null;
+const resolveOrganizationObjectId = async (req: AuthRequest): Promise<mongoose.Types.ObjectId | null> => {
+  const userId = req.user?._id;
+  if (!userId) return null;
 
-    const { profileService } = await import('../services/profile.service');
-    const organizationIdStr = await profileService.ensureOrganizationForUser(userId.toString());
-    return new mongoose.Types.ObjectId(organizationIdStr);
-  }
+  const { profileService } = await import('../services/profile.service');
+  const organizationIdStr = await profileService.ensureOrganizationForUser(userId.toString());
+  return new mongoose.Types.ObjectId(organizationIdStr);
+};
+
+export class BatchCallingController {
 
   /**
    * Submit batch calling job
@@ -589,7 +590,7 @@ export class BatchCallingController {
 
       // Verify the batch call belongs to the user's organization
       const BatchCall = (await import('../models/BatchCall')).default;
-      const organizationId = await this.resolveOrganizationObjectId(req);
+      const organizationId = await resolveOrganizationObjectId(req);
 
       if (!organizationId) {
         return res.status(401).json({
@@ -675,7 +676,7 @@ export class BatchCallingController {
 
       // Verify the batch call belongs to the user's organization
       const BatchCall = (await import('../models/BatchCall')).default;
-      const organizationId = await this.resolveOrganizationObjectId(req);
+      const organizationId = await resolveOrganizationObjectId(req);
 
       if (!organizationId) {
         return res.status(401).json({
@@ -744,7 +745,7 @@ export class BatchCallingController {
       }
 
       const BatchCall = (await import('../models/BatchCall')).default;
-      const organizationId = await this.resolveOrganizationObjectId(req);
+      const organizationId = await resolveOrganizationObjectId(req);
       if (!organizationId) {
         return res.status(401).json({
           success: false,
@@ -797,7 +798,7 @@ export class BatchCallingController {
    */
   async getBatchCalls(req: AuthRequest, res: Response, next: NextFunction) {
     try {
-      const organizationId = await this.resolveOrganizationObjectId(req);
+      const organizationId = await resolveOrganizationObjectId(req);
       const includeCancelled = req.query.includeCancelled === 'true';
 
       if (!organizationId) {
@@ -898,7 +899,7 @@ export class BatchCallingController {
 
       // Verify the batch call belongs to the user's organization
       const BatchCall = (await import('../models/BatchCall')).default;
-      const organizationId = await this.resolveOrganizationObjectId(req);
+      const organizationId = await resolveOrganizationObjectId(req);
 
       if (!organizationId) {
         return res.status(401).json({
@@ -959,7 +960,7 @@ export class BatchCallingController {
 
       // Verify the batch call belongs to the user's organization
       const BatchCall = (await import('../models/BatchCall')).default;
-      const organizationId = await this.resolveOrganizationObjectId(req);
+      const organizationId = await resolveOrganizationObjectId(req);
 
       if (!organizationId) {
         return res.status(401).json({
@@ -1019,7 +1020,7 @@ export class BatchCallingController {
 
       // Verify the batch call belongs to the user's organization
       const BatchCall = (await import('../models/BatchCall')).default;
-      const organizationId = await this.resolveOrganizationObjectId(req);
+      const organizationId = await resolveOrganizationObjectId(req);
 
       if (!organizationId) {
         return res.status(401).json({
@@ -1082,7 +1083,7 @@ export class BatchCallingController {
         });
       }
 
-      const organizationId = await this.resolveOrganizationObjectId(req);
+      const organizationId = await resolveOrganizationObjectId(req);
       if (!organizationId) {
         return res.status(401).json({
           success: false,

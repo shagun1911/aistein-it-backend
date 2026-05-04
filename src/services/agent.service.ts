@@ -108,6 +108,36 @@ export interface UpdateAgentPromptResponse {
 }
 
 export class AgentService {
+  private getTtsModelId(language?: string): string {
+    const normalizedLanguage = String(language || '').toLowerCase();
+    if (normalizedLanguage.startsWith('en')) {
+      return 'eleven_flash_v2';
+    }
+    return 'eleven_flash_v2';
+  }
+
+  private buildSafePromptSyncBody(agent: any, toolIds: string[]): Record<string, any> {
+    const dbFirst = typeof agent?.first_message === 'string' ? agent.first_message.trim() : '';
+    const dbGreeting = typeof agent?.greeting_message === 'string' ? agent.greeting_message.trim() : '';
+    const dbSystem = typeof agent?.system_prompt === 'string' ? agent.system_prompt.trim() : '';
+
+    // Defensive fallback: if first_message is blank or accidentally equals full prompt,
+    // prefer greeting_message or a neutral default to avoid prompt pollution in first message.
+    const firstMessageSafe =
+      (dbFirst && dbFirst !== dbSystem ? dbFirst : '') ||
+      dbGreeting ||
+      'Hello! How can I help you today?';
+
+    return {
+      first_message: firstMessageSafe,
+      system_prompt: dbSystem + COLLECT_ONLY_INSTRUCTION,
+      language: agent?.language || 'en',
+      knowledge_base_ids: agent?.knowledge_base_ids || [],
+      tool_ids: toolIds,
+      ...(agent?.voice_id ? { voice_id: agent.voice_id } : {})
+    };
+  }
+
   /**
    * Get all email template tool_ids for a user
    * These are automatically included in all agents
@@ -245,14 +275,15 @@ export class AgentService {
    * This is where the ACTUAL voice used in calls is stored.
    * The voice_id in agent prompt is just metadata - this one controls the TTS!
    */
-  private async updateVoiceInConversationConfig(agentId: string, voiceId: string, quiet?: boolean): Promise<void> {
+  private async updateVoiceInConversationConfig(agentId: string, voiceId: string, language?: string, quiet?: boolean): Promise<void> {
     try {
       const pythonUrl = `${PYTHON_API_BASE_URL}/api/v1/agents/${agentId}`;
+      const ttsModelId = this.getTtsModelId(language);
       const requestBody = {
         conversation_config: {
           tts: {
             voice_id: voiceId,
-            model_id: "eleven_flash_v2_5", // High-quality, low-latency multilingual model
+            model_id: ttsModelId,
             voice_settings: {
               stability: 0.5,
               similarity_boost: 0.8,
@@ -263,7 +294,7 @@ export class AgentService {
         }
       };
 
-      if (!quiet) console.log(`[Agent Service] 🎤 Updating TTS voice_id in conversation_config:`, { agent_id: agentId, voice_id: voiceId, url: pythonUrl });
+      if (!quiet) console.log(`[Agent Service] 🎤 Updating TTS voice_id in conversation_config:`, { agent_id: agentId, voice_id: voiceId, language, model_id: ttsModelId, url: pythonUrl });
 
       await axios.patch(pythonUrl, requestBody, {
         timeout: 15000,
@@ -287,7 +318,6 @@ export class AgentService {
     try {
       const agentId = agent.agent_id;
       const toolIds = agent.tool_ids || [];
-      const systemPrompt = agent.system_prompt || '';
 
       if (!agentId) {
         console.warn('[ElevenLabs Sync] Agent missing agent_id, skipping sync');
@@ -298,22 +328,8 @@ export class AgentService {
 
       const pythonUrl = `${PYTHON_API_BASE_URL}/api/v1/agents/${agentId}/prompt`;
 
-      // Build request body preserving all agent settings
-      const requestBody: any = {
-        system_prompt: (systemPrompt || '').trim() + COLLECT_ONLY_INSTRUCTION,
-        tool_ids: toolIds,
-        first_message: agent.first_message || '',
-        language: agent.language || 'en',
-        knowledge_base_ids: agent.knowledge_base_ids || [],
-      };
-
-      // Add optional fields if they exist
-      if (agent.voice_id) {
-        requestBody.voice_id = agent.voice_id;
-      }
-      if (agent.greeting_message) {
-        requestBody.greeting_message = agent.greeting_message;
-      }
+      // Keep sync payload strict to avoid mutating prompt semantics in ElevenLabs.
+      const requestBody: any = this.buildSafePromptSyncBody(agent, toolIds);
 
       await axios.patch(pythonUrl, requestBody, {
         timeout: 30000,
@@ -331,7 +347,7 @@ export class AgentService {
       // CRITICAL: Update voice_id in conversation_config.tts
       if (agent.voice_id) {
         try {
-          await this.updateVoiceInConversationConfig(agentId, agent.voice_id);
+          await this.updateVoiceInConversationConfig(agentId, agent.voice_id, agent.language);
         } catch (error: any) {
           console.error('[ElevenLabs Sync] ⚠️ Failed to update voice_id (non-fatal):', error.message);
         }
@@ -358,15 +374,7 @@ export class AgentService {
         return;
       }
 
-      const requestBody = {
-        first_message: (agent as any).first_message || '',
-        system_prompt: ((agent as any).system_prompt || '').trim() + COLLECT_ONLY_INSTRUCTION,
-        language: (agent as any).language || 'en',
-        knowledge_base_ids: (agent as any).knowledge_base_ids || [],
-        tool_ids: toolIds,
-        ...((agent as any).voice_id && { voice_id: (agent as any).voice_id }),
-        ...((agent as any).greeting_message && { greeting_message: (agent as any).greeting_message })
-      };
+      const requestBody = this.buildSafePromptSyncBody(agent, toolIds);
 
       await axios.patch(pythonUrl, requestBody, {
         timeout: 30000,
@@ -382,7 +390,7 @@ export class AgentService {
       // CRITICAL: Update voice_id in conversation_config.tts
       if ((agent as any).voice_id) {
         try {
-          await this.updateVoiceInConversationConfig(agentId, (agent as any).voice_id);
+          await this.updateVoiceInConversationConfig(agentId, (agent as any).voice_id, (agent as any).language);
         } catch (error: any) {
           console.error('[Agent Service] ⚠️ Failed to update voice_id during tool sync (non-fatal):', error.message);
         }
@@ -493,7 +501,7 @@ export class AgentService {
       // This ensures the voice is actually used in calls
       if (data.voice_id) {
         try {
-          await this.updateVoiceInConversationConfig(agent.agent_id, data.voice_id);
+            await this.updateVoiceInConversationConfig(agent.agent_id, data.voice_id, data.language);
         } catch (error: any) {
           console.error('[Agent Service] ⚠️ Failed to update voice in conversation_config (non-fatal):', error.message);
           // Don't throw - agent was created successfully
@@ -681,7 +689,11 @@ export class AgentService {
       // CRITICAL: Update voice_id in conversation_config.tts
       // This is where the ACTUAL voice used in calls is stored!
       if (data.voice_id) {
-        await this.updateVoiceInConversationConfig(agentId, data.voice_id);
+        try {
+          await this.updateVoiceInConversationConfig(agentId, data.voice_id, data.language);
+        } catch (error: any) {
+          console.error('[Agent Service] ⚠️ Failed to update voice in conversation_config after prompt update (non-fatal):', error.message);
+        }
       }
 
       // Attach POST_CALL_WEBHOOK_ID to agent after successful update
@@ -776,7 +788,7 @@ export class AgentService {
         // CRITICAL: Update voice in conversation_config for the new agent
         if (data.voice_id) {
           try {
-            await this.updateVoiceInConversationConfig(newAgent.agent_id, data.voice_id);
+            await this.updateVoiceInConversationConfig(newAgent.agent_id, data.voice_id, data.language);
           } catch (error: any) {
             console.error('[Agent Service] ⚠️ Failed to update voice in conversation_config for fallback agent:', error.message);
           }

@@ -16,6 +16,7 @@
     "create:admin": "ts-node-dev --transpile-only src/scripts/createAdmin.ts",
     "remove:admin-roles": "ts-node-dev --transpile-only src/scripts/removeAdminRoles.ts",
     "wipe:social-integrations": "npx ts-node scripts/wipe-all-social-integrations.ts",
+    "redis:clean-old-bull-jobs": "npx ts-node scripts/clean-old-bull-jobs.ts",
     "test": "echo \"No tests yet\""
   },
   "keywords": [
@@ -53,6 +54,7 @@
     "express-validator": "^7.0.1",
     "form-data": "^4.0.1",
     "googleapis": "^166.0.0",
+    "ioredis": "^5.4.2",
     "json2csv": "^6.0.0-alpha.2",
     "jsonwebtoken": "^9.0.2",
     "mammoth": "^1.11.0",
@@ -66,7 +68,6 @@
     "passport-google-oauth20": "^2.0.0",
     "pdf-parse": "^2.4.5",
     "puppeteer": "^24.27.0",
-    "redis": "^4.6.12",
     "socket.io": "^4.8.1",
     "svix": "^1.81.0",
     "uuid": "^8.3.2"

@@ -108,6 +108,28 @@ export interface UpdateAgentPromptResponse {
 }
 
 export class AgentService {
+  private buildSafePromptSyncBody(agent: any, toolIds: string[]): Record<string, any> {
+    const dbFirst = typeof agent?.first_message === 'string' ? agent.first_message.trim() : '';
+    const dbGreeting = typeof agent?.greeting_message === 'string' ? agent.greeting_message.trim() : '';
+    const dbSystem = typeof agent?.system_prompt === 'string' ? agent.system_prompt.trim() : '';
+
+    // Defensive fallback: if first_message is blank or accidentally equals full prompt,
+    // prefer greeting_message or a neutral default to avoid prompt pollution in first message.
+    const firstMessageSafe =
+      (dbFirst && dbFirst !== dbSystem ? dbFirst : '') ||
+      dbGreeting ||
+      'Hello! How can I help you today?';
+
+    return {
+      first_message: firstMessageSafe,
+      system_prompt: dbSystem + COLLECT_ONLY_INSTRUCTION,
+      language: agent?.language || 'en',
+      knowledge_base_ids: agent?.knowledge_base_ids || [],
+      tool_ids: toolIds,
+      ...(agent?.voice_id ? { voice_id: agent.voice_id } : {})
+    };
+  }
+
   /**
    * Get all email template tool_ids for a user
    * These are automatically included in all agents
@@ -287,7 +309,6 @@ export class AgentService {
     try {
       const agentId = agent.agent_id;
       const toolIds = agent.tool_ids || [];
-      const systemPrompt = agent.system_prompt || '';
 
       if (!agentId) {
         console.warn('[ElevenLabs Sync] Agent missing agent_id, skipping sync');
@@ -298,22 +319,8 @@ export class AgentService {
 
       const pythonUrl = `${PYTHON_API_BASE_URL}/api/v1/agents/${agentId}/prompt`;
 
-      // Build request body preserving all agent settings
-      const requestBody: any = {
-        system_prompt: (systemPrompt || '').trim() + COLLECT_ONLY_INSTRUCTION,
-        tool_ids: toolIds,
-        first_message: agent.first_message || '',
-        language: agent.language || 'en',
-        knowledge_base_ids: agent.knowledge_base_ids || [],
-      };
-
-      // Add optional fields if they exist
-      if (agent.voice_id) {
-        requestBody.voice_id = agent.voice_id;
-      }
-      if (agent.greeting_message) {
-        requestBody.greeting_message = agent.greeting_message;
-      }
+      // Keep sync payload strict to avoid mutating prompt semantics in ElevenLabs.
+      const requestBody: any = this.buildSafePromptSyncBody(agent, toolIds);
 
       await axios.patch(pythonUrl, requestBody, {
         timeout: 30000,
@@ -358,15 +365,7 @@ export class AgentService {
         return;
       }
 
-      const requestBody = {
-        first_message: (agent as any).first_message || '',
-        system_prompt: ((agent as any).system_prompt || '').trim() + COLLECT_ONLY_INSTRUCTION,
-        language: (agent as any).language || 'en',
-        knowledge_base_ids: (agent as any).knowledge_base_ids || [],
-        tool_ids: toolIds,
-        ...((agent as any).voice_id && { voice_id: (agent as any).voice_id }),
-        ...((agent as any).greeting_message && { greeting_message: (agent as any).greeting_message })
-      };
+      const requestBody = this.buildSafePromptSyncBody(agent, toolIds);
 
       await axios.patch(pythonUrl, requestBody, {
         timeout: 30000,

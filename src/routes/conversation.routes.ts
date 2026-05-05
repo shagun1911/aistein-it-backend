@@ -11,6 +11,11 @@ const router = Router();
 // Usage tracking handled in controller (widgetId = userId)
 router.post('/widget', conversationController.saveWidgetConversation);
 
+// Public call-recording playback (no auth) — used in spreadsheet/email links.
+// Streams audio with Content-Disposition: inline so browsers play it instead
+// of downloading. Accepts only the upstream external conversation id.
+router.get('/recording/:externalConvId', conversationController.fetchPublicRecording);
+
 router.use(authenticate); // All other routes require authentication
 
 router.get('/', conversationController.getAll);

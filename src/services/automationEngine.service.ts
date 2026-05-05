@@ -154,6 +154,129 @@ export class AutomationEngine {
     const contactName = context.contact?.name || context.triggerData?.freshContactData?.name || '';
     const contactEmail = context.contact?.email || context.triggerData?.freshContactData?.email || '';
     const contactPhone = context.contact?.phone || context.triggerData?.freshContactData?.phone || '';
+    const contactFirstName =
+      context.triggerData?.freshContactData?.first_name ||
+      context.triggerData?.dynamic_variables?.first_name ||
+      ex.first_name ||
+      (contactName ? String(contactName).trim().split(/\s+/)[0] : '');
+    const contactLastName =
+      context.triggerData?.freshContactData?.last_name ||
+      context.triggerData?.dynamic_variables?.last_name ||
+      ex.last_name ||
+      (contactName
+        ? String(contactName).trim().split(/\s+/).slice(1).join(' ')
+        : '');
+    const mergedAppointmentDate = mergedDate || context.triggerData?.dynamic_variables?.appointment_date || '';
+    const mergedAppointmentTime = mergedTime || context.triggerData?.dynamic_variables?.appointment_time || '';
+    const mergedAppointmentDateTime =
+      [mergedAppointmentDate, mergedAppointmentTime].filter(Boolean).join(' ').trim();
+    const commApiBase =
+      process.env.PYTHON_API_URL ||
+      process.env.COMM_API_URL ||
+      'https://elvenlabs-voiceagent.onrender.com';
+    const externalConversationId =
+      context.conversation?.conversation_id ||
+      context.triggerData?.conversation_id ||
+      '';
+
+    // Public proxy URL on OUR backend — streams audio with Content-Disposition:
+    // inline so the link plays in the browser instead of downloading. Used as
+    // the preferred recording link in spreadsheets/emails. Defaults to
+    // localhost so the dev backend exercises the proxy too; production should
+    // set BACKEND_URL to its public origin.
+    const backendPublicBase = (
+      process.env.BACKEND_URL ||
+      process.env.PUBLIC_API_URL ||
+      `http://localhost:${process.env.PORT || 5001}`
+    ).replace(/\/+$/, '');
+    const publicProxyUrl = externalConversationId
+      ? `${backendPublicBase}/api/v1/conversations/recording/${externalConversationId}`
+      : '';
+
+    // Build a playable audio URL. Order of preference:
+    //   1. Public proxy on our backend (forces inline playback).
+    //   2. Provider-supplied signed/audio URL.
+    //   3. Python comm-api audio stream.
+    const buildPlayableRecordingUrl = (): string => {
+      if (publicProxyUrl) return publicProxyUrl;
+
+      const candidates = [
+        context.conversation?.recording_url,
+        context.conversation?.audio_url,
+        context.triggerData?.recording_url,
+        context.triggerData?.audio_url
+      ].filter((v) => v != null && String(v).trim() !== '');
+
+      const audioFallback = externalConversationId
+        ? `${commApiBase}/api/v1/conversations/${externalConversationId}/audio`
+        : '';
+
+      if (candidates.length === 0) return audioFallback;
+
+      let url = String(candidates[0]).trim();
+      if (!/^https?:\/\//i.test(url) && !url.startsWith('/')) {
+        if (!url.includes('.') && !url.includes('/')) return audioFallback;
+        url = `https://${url}`;
+      }
+      if (url.startsWith('/')) url = `${commApiBase}${url}`;
+
+      // Convert "/conversations/<id>" (JSON) to "/conversations/<id>/audio" (playable)
+      if (/\/conversations\/[^/?#]+\/?(\?|#|$)/i.test(url) && !/\/audio(\?|#|$)/i.test(url)) {
+        url = url.replace(/\/conversations\/([^/?#]+)\/?/i, '/conversations/$1/audio');
+      }
+      return url;
+    };
+    const recordingLink = buildPlayableRecordingUrl();
+    const isMeaningful = (v: any) =>
+      v != null && String(v).trim() !== '' && String(v).toLowerCase() !== 'null' && String(v).toLowerCase() !== 'undefined';
+
+    const fallbackAddressCandidates = [
+      ex.address,
+      ex.full_address,
+      ex.customer_address,
+      ex.home_address,
+      context.triggerData?.dynamic_variables?.address,
+      context.triggerData?.dynamic_variables?.full_address,
+      context.triggerData?.dynamic_variables?.customer_address,
+      context.triggerData?.freshContactData?.address,
+      context.contact?.customProperties?.address,
+      context.contact?.metadata?.address,
+      context.contact?.address
+    ].filter(isMeaningful);
+    const resolvedAddress =
+      fallbackAddressCandidates.length > 0 ? String(fallbackAddressCandidates[0]) : 'Not Provided';
+
+    const fallbackEmailCandidates = [
+      contactEmail,
+      ex.email,
+      ex.customer_email,
+      context.triggerData?.dynamic_variables?.email,
+      context.triggerData?.dynamic_variables?.customer_email,
+      context.contact?.customProperties?.email,
+      context.contact?.metadata?.email
+    ].filter(isMeaningful);
+    const resolvedEmail =
+      fallbackEmailCandidates.length > 0 ? String(fallbackEmailCandidates[0]) : 'Not Provided';
+
+    const fallbackPhoneCandidates = [
+      contactPhone,
+      ex.phone,
+      ex.phone_number,
+      ex.customer_phone,
+      context.triggerData?.dynamic_variables?.phone,
+      context.triggerData?.dynamic_variables?.phone_number,
+      context.triggerData?.dynamic_variables?.customer_phone,
+      context.triggerData?.freshContactData?.phone,
+      context.contact?.customProperties?.phone,
+      context.contact?.metadata?.phone
+    ].filter(isMeaningful);
+    const resolvedPhone =
+      fallbackPhoneCandidates.length > 0 ? String(fallbackPhoneCandidates[0]) : 'Not Provided';
+
+    const resolvedName =
+      (contactName && String(contactName).trim()) ||
+      [contactFirstName, contactLastName].filter(Boolean).join(' ').trim() ||
+      'Not Provided';
 
     const appointmentBlock = {
       ...appt,
@@ -185,18 +308,28 @@ export class AutomationEngine {
       time: mergedTime,
       appointment_date: mergedDate,
       appointment_time: mergedTime,
-      name: contactName,
-      email: contactEmail,
-      phone: contactPhone,
-      contact_name: contactName,
-      contact_email: contactEmail,
-      contact_phone: contactPhone,
+      appointment_datetime: mergedAppointmentDateTime || 'Not Provided',
+      name: resolvedName,
+      first_name: contactFirstName,
+      last_name: contactLastName,
+      email: resolvedEmail,
+      phone: resolvedPhone,
+      phone_number: resolvedPhone,
+      address: resolvedAddress,
+      created_time: context.now,
+      recording_link: recordingLink,
+      call_recording_link: recordingLink,
+      extracted_json: JSON.stringify(extractedBlock),
+      dynamic_variables_json: JSON.stringify(context.triggerData?.dynamic_variables || {}),
+      contact_name: resolvedName,
+      contact_email: resolvedEmail,
+      contact_phone: resolvedPhone,
       // Nested blocks
       contact: {
         ...(context.contact || {}),
-        name: contactName,
-        email: contactEmail,
-        phone: contactPhone
+        name: resolvedName,
+        email: resolvedEmail,
+        phone: resolvedPhone
       },
       appointment: appointmentBlock,
       extracted: extractedBlock,
@@ -1631,10 +1764,65 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
     // Google Sheets - Append Row
     this.actions.set('aistein_google_sheet_append_row', {
       execute: async (config, triggerData, context: IAutomationExecutionContext) => {
-        const { spreadsheetId, values } = config;
-        if (!spreadsheetId || !Array.isArray(values) || values.length === 0) {
-          console.log('[Automation Engine] ⏭️ Skipping Google Sheets append: sheet configuration missing');
+        const { spreadsheetId } = config;
+        const userValues: any[] = Array.isArray((config as any).values) ? (config as any).values : [];
+
+        // Default to fixed format unless explicitly disabled (useFixedFormat=false).
+        // Fixed format guarantees a clean predictable client-friendly sheet structure.
+        const useFixedFormat = (config as any).useFixedFormat !== false;
+        const extraExtractedKeys: string[] = Array.isArray((config as any).extraExtractedKeys)
+          ? (config as any).extraExtractedKeys.filter((k: any) => typeof k === 'string' && k.trim() !== '')
+          : [];
+
+        // Fixed columns (locked, in this order)
+        const FIXED_COLUMNS: { header: string; template: string }[] = [
+          { header: 'Name', template: '{{name}}' },
+          { header: 'Address', template: '{{address}}' },
+          { header: 'Email', template: '{{email}}' },
+          { header: 'Phone Number', template: '{{phone}}' },
+          { header: 'Appointment Date & Time', template: '{{appointment_datetime}}' },
+          { header: 'Call Recording', template: '{{recording_link}}' }
+        ];
+
+        // Keys already covered by FIXED_COLUMNS (so smart merge skips them).
+        const COVERED_EXTRACTED_KEYS = new Set<string>([
+          'name',
+          'first_name',
+          'last_name',
+          'customer_name',
+          'address',
+          'full_address',
+          'customer_address',
+          'home_address',
+          'email',
+          'customer_email',
+          'phone',
+          'phone_number',
+          'customer_phone',
+          'date',
+          'time',
+          'preferred_date',
+          'preferred_time',
+          'appointment_date',
+          'appointment_time',
+          'scheduled_date',
+          'scheduled_time',
+          'meeting_date',
+          'meeting_time',
+          'slot_date',
+          'slot_time',
+          'booking_date',
+          'booking_time'
+        ]);
+
+        if (!spreadsheetId) {
+          console.log('[Automation Engine] ⏭️ Skipping Google Sheets append: spreadsheetId missing');
           return { success: true, status: 'skipped', reason: 'Sheet configuration missing' };
+        }
+
+        if (!useFixedFormat && userValues.length === 0) {
+          console.log('[Automation Engine] ⏭️ Skipping Google Sheets append: no values mapped');
+          return { success: true, status: 'skipped', reason: 'No mapped columns' };
         }
 
         const integration = await GoogleIntegration.findOne({
@@ -1672,7 +1860,182 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           };
           const sheetRangePrefix = `${escapeSheetTitleForA1(configured)}!A1`;
 
-          const resolvedValues = await Promise.all(values.map(v => this.resolveTemplate(String(v), context)));
+          const titleCase = (s: string): string =>
+            String(s || '')
+              .replace(/[._]/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .replace(/\b\w/g, (c: string) => c.toUpperCase());
+
+          const toHeaderLabel = (raw: string): string => {
+            const text = String(raw || '').trim();
+            const varMatch = text.match(/^\{\{\s*([^}]+)\s*\}\}$/);
+            const token = (varMatch ? varMatch[1] : text).trim();
+            const map: Record<string, string> = {
+              name: 'Name',
+              first_name: 'First Name',
+              last_name: 'Last Name',
+              appointment_date: 'Appointment Date',
+              appointment_time: 'Appointment Time',
+              appointment_datetime: 'Appointment Date & Time',
+              address: 'Address',
+              email: 'Email',
+              phone: 'Phone Number',
+              phone_number: 'Phone Number',
+              created_time: 'Created Time',
+              recording_link: 'Call Recording',
+              call_recording_link: 'Call Recording',
+              'contact.name': 'Name',
+              'contact.email': 'Email',
+              'contact.phone': 'Phone Number',
+              extracted_json: 'Extracted JSON',
+              dynamic_variables_json: 'Dynamic Variables JSON',
+              now: 'Created Time'
+            };
+            if (map[token]) return map[token];
+            if (token.startsWith('extracted.')) {
+              const tail = token.replace(/^extracted\./, '');
+              return `Extracted ${titleCase(tail)}`;
+            }
+            return titleCase(token);
+          };
+
+          // Build row plan = ordered list of { header, template }
+          let rowPlan: { header: string; template: string }[];
+          if (useFixedFormat) {
+            // Strict: only the user-selected extra fields get appended.
+            // The 6 fixed columns are always there; nothing else is added unless
+            // the user explicitly ticks it in the "Extra extracted fields" panel.
+            const allExtraKeys = Array.from(new Set<string>(extraExtractedKeys))
+              .filter((k) => k && !COVERED_EXTRACTED_KEYS.has(String(k).toLowerCase()));
+
+            rowPlan = [
+              ...FIXED_COLUMNS,
+              ...allExtraKeys.map((k) => ({
+                header: `Extracted ${titleCase(k)}`,
+                template: `{{extracted.${k}}}`
+              }))
+            ];
+          } else {
+            rowPlan = userValues.map((v: any) => ({
+              header: toHeaderLabel(String(v)),
+              template: String(v)
+            }));
+          }
+
+          const headerValues = rowPlan.map((r) => r.header);
+
+          // Ensure row 1 has human-readable headers.
+          // If row 1 already contains non-header data, insert a new top row and write headers.
+          const rowOne = await sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: `${escapeSheetTitleForA1(configured)}!1:1`
+          });
+          const existingHeaders = rowOne.data.values?.[0] || [];
+          const normalize = (s: string) => String(s || '').trim().toLowerCase();
+          const existingSlice = headerValues.map((_, i) => normalize(String(existingHeaders[i] || '')));
+          const expectedSlice = headerValues.map((h) => normalize(h));
+          const rowLooksLikeExpectedHeaders =
+            expectedSlice.length > 0 &&
+            expectedSlice.every((h, i) => h !== '' && existingSlice[i] === h);
+          const rowHasAnyValue = existingHeaders.some((h: any) => String(h || '').trim() !== '');
+
+          if (!rowLooksLikeExpectedHeaders) {
+            if (rowHasAnyValue) {
+              // Keep existing data safe by inserting a fresh row 1 for headers.
+              const sheetId = sheetMeta.data.sheets?.find(
+                (s: any) => s?.properties?.title === configured
+              )?.properties?.sheetId;
+              if (sheetId !== undefined && sheetId !== null) {
+                await sheets.spreadsheets.batchUpdate({
+                  spreadsheetId,
+                  requestBody: {
+                    requests: [
+                      {
+                        insertDimension: {
+                          range: {
+                            sheetId,
+                            dimension: 'ROWS',
+                            startIndex: 0,
+                            endIndex: 1
+                          },
+                          inheritFromBefore: false
+                        }
+                      }
+                    ]
+                  }
+                });
+              }
+            }
+
+            await sheets.spreadsheets.values.update({
+              spreadsheetId,
+              range: `${escapeSheetTitleForA1(configured)}!A1`,
+              valueInputOption: 'RAW',
+              requestBody: { values: [headerValues] }
+            });
+          }
+
+          const resolvedValues = await Promise.all(
+            rowPlan.map(async (r) => {
+              const v = await this.resolveTemplate(r.template, context);
+              const s = String(v ?? '').trim();
+              if (!s) return 'Not Provided';
+              if (s === '[object Object]' || s === 'undefined' || s === 'null' || s === 'Not Provided') return 'Not Provided';
+              return s;
+            })
+          );
+
+          console.log(
+            `[Automation Engine] 📋 Sheets row plan (${useFixedFormat ? 'STANDARD' : 'CUSTOM'}, ${rowPlan.length} cols):\n` +
+            rowPlan
+              .map((r, i) => `  ${String.fromCharCode(65 + i)}: ${r.header} = ${String(resolvedValues[i]).slice(0, 80)}`)
+              .join('\n')
+          );
+
+          // Sheet-level dedup: never write two rows for the same phone+conversation.
+          // Looks at the existing sheet content and skips append if a matching
+          // row already exists. This is the final safety net behind the worker-
+          // level automation_triggered_phones check.
+          const phoneIdx = rowPlan.findIndex(
+            (r) => /\{\{\s*(phone|phone_number|contact\.phone)\s*\}\}/i.test(r.template)
+          );
+          const phoneVal = phoneIdx >= 0 ? String(resolvedValues[phoneIdx]).trim() : '';
+          const convIdVal = String(
+            context.conversation?.conversation_id ||
+            context.triggerData?.conversation_id ||
+            ''
+          ).trim();
+
+          if ((phoneVal && phoneVal !== 'Not Provided') || convIdVal) {
+            try {
+              const allRows = await sheets.spreadsheets.values.get({
+                spreadsheetId,
+                range: `${escapeSheetTitleForA1(configured)}!A:Z`
+              });
+              const rows: any[][] = allRows.data.values || [];
+              const normPhone = phoneVal.replace(/\D/g, '');
+              const looksLikeMatch = rows.slice(1).some((row) => {
+                if (!row || row.length === 0) return false;
+                if (convIdVal && row.some((c) => String(c || '').includes(convIdVal))) return true;
+                if (normPhone && phoneIdx >= 0) {
+                  const cellPhone = String(row[phoneIdx] || '').replace(/\D/g, '');
+                  if (cellPhone && (cellPhone === normPhone || cellPhone.endsWith(normPhone) || normPhone.endsWith(cellPhone))) {
+                    return true;
+                  }
+                }
+                return false;
+              });
+              if (looksLikeMatch) {
+                console.log(
+                  `[Automation Engine] ⏭️ Sheet already has a row for phone "${phoneVal}" / conv "${convIdVal}" — skipping append to avoid duplicate.`
+                );
+                return { success: true, status: 'skipped', reason: 'Duplicate row prevented' };
+              }
+            } catch (dedupErr: any) {
+              console.warn('[Automation Engine] ⚠️ Sheet dedup check failed (continuing with append):', dedupErr.message);
+            }
+          }
 
           await sheets.spreadsheets.values.append({
             spreadsheetId,
@@ -1682,7 +2045,10 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
             requestBody: { values: [resolvedValues] }
           });
 
-          return { success: true, status: 'completed' };
+          console.log(
+            `[Automation Engine] ✅ Google Sheets append OK (${useFixedFormat ? 'fixed' : 'custom'} format, ${rowPlan.length} cols)`
+          );
+          return { success: true, status: 'completed', columns: rowPlan.length };
         } catch (error: any) {
           console.error('[Automation] Google Sheets error:', error.message);
           return { success: true, status: 'failed', error: error.message };
@@ -1753,6 +2119,8 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
       'keplero_google_sheet_append_row': 'aistein_google_sheet_append_row',
       'keplero_google_gmail_send': 'aistein_google_gmail_send',
       'keplero_mass_sending': 'aistein_mass_sending',
+      // Frontend offers a "User-scoped Google Sheets append" service ID; both share the same handler.
+      'aistein_user_google_sheet_append_row': 'aistein_google_sheet_append_row',
     };
 
     // Register legacy action handlers
@@ -1915,6 +2283,7 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
 
               conversationContext = {
                 id: String(conversation._id),
+                conversation_id: conversation?.metadata?.conversation_id || '',
                 status: conversation.status,
                 channel: conversation.channel,
                 summary: conversationSummary,
@@ -1925,6 +2294,14 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
                   conversation?.metadata?.call_duration_secs ||
                   0,
                 end_reason: conversation?.metadata?.end_reason || '',
+                recording_url:
+                  conversation?.metadata?.recording_url ||
+                  conversation?.metadata?.audio_url ||
+                  '',
+                audio_url:
+                  conversation?.metadata?.audio_url ||
+                  conversation?.metadata?.recording_url ||
+                  '',
                 caller_number: conversation?.metadata?.phone_number || contact.phone || '',
                 created_at: conversation.createdAt,
                 updated_at: conversation.updatedAt

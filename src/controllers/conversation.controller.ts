@@ -447,6 +447,76 @@ export class ConversationController {
       next(error);
     }
   };
+
+  /**
+   * Public audio playback for spreadsheet/email links.
+   *
+   * GET /api/v1/conversations/recording/:externalConvId
+   *
+   * Streams the call recording from the upstream voice provider with
+   * `Content-Disposition: inline` so browsers play it inline instead of
+   * downloading. No auth required — link is shared with end customers.
+   * Only the upstream provider's external conversation_id is accepted, so it
+   * cannot be used to enumerate our internal records.
+   */
+  fetchPublicRecording = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { externalConvId } = req.params;
+
+      if (!externalConvId || !/^[A-Za-z0-9_\-]+$/.test(externalConvId)) {
+        res.status(400).type('text/plain').send('Invalid recording id');
+        return;
+      }
+
+      const COMM_API_URL =
+        process.env.PYTHON_API_URL ||
+        process.env.COMM_API_URL ||
+        'https://elvenlabs-voiceagent.onrender.com';
+
+      const axios = (await import('axios')).default;
+
+      const upstream = await axios.get(
+        `${COMM_API_URL}/api/v1/conversations/${externalConvId}/audio`,
+        {
+          responseType: 'arraybuffer',
+          timeout: 60000,
+          headers: { Accept: 'audio/*' },
+          validateStatus: (s) => s < 500
+        }
+      );
+
+      if (upstream.status === 404) {
+        res.status(404).type('text/plain').send('Recording not available');
+        return;
+      }
+      if (upstream.status >= 400) {
+        res.status(upstream.status).type('text/plain').send('Recording unavailable');
+        return;
+      }
+
+      const buffer = Buffer.from(upstream.data);
+      const rawContentType = upstream.headers['content-type'];
+      const contentType =
+        typeof rawContentType === 'string'
+          ? rawContentType
+          : Array.isArray(rawContentType) && typeof rawContentType[0] === 'string'
+            ? rawContentType[0]
+            : 'audio/mpeg';
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Length', buffer.length);
+      // inline (not attachment) → browsers play it instead of downloading
+      res.setHeader('Content-Disposition', `inline; filename="call-${externalConvId}.mp3"`);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+
+      res.send(buffer);
+    } catch (error: any) {
+      console.error('[Conversation Controller] Public recording fetch failed:', error?.message);
+      next(error);
+    }
+  };
 }
 
 export const conversationController = new ConversationController();

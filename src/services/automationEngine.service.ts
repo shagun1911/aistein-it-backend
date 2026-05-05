@@ -101,58 +101,163 @@ export class AutomationEngine {
   }
 
   /**
-   * Resolve dynamic variables in text using trigger data with strict validation.
-   * If any {{variable}} remains, it throws an error to prevent silent corruption.
+   * Resolve dynamic variables in text using the automation context.
+   *
+   * Supported template syntaxes (all of these work for the same value):
+   *   {{appointment.date}}    {{appointment.time}}
+   *   {{extracted.date}}      {{extracted.time}}
+   *   {{date}}                {{time}}
+   *   {{appointment_date}}    {{appointment_time}}
+   *   {{contact.name}}        {{contact.email}}        {{contact.phone}}
+   *   {{name}}                {{email}}                {{phone}}
+   *
+   * Date/time are merged from many possible source fields (LLM extractions vary
+   * between `date`/`time`, `preferred_date`, `appointment_date`, etc.) so the
+   * template always resolves to the same value regardless of which alias the
+   * user typed.
    */
   private async resolveTemplate(template: string, context: IAutomationExecutionContext): Promise<string> {
     if (!template || typeof template !== 'string') return template;
     let resolved = template;
 
+    const ex: Record<string, any> = context.extracted || {};
+    const appt: Record<string, any> = context.appointment || {};
+
+    // Pull date/time from every possible alias in extracted/appointment so
+    // {{appointment.date}} / {{date}} always resolve to the same value.
+    const exAppt = ex.appointment && typeof ex.appointment === 'object' ? ex.appointment : {};
+    const dateCandidates = [
+      appt.date,
+      (exAppt as any).date,
+      ex.date,
+      ex.preferred_date,
+      ex.appointment_date,
+      ex.scheduled_date,
+      ex.meeting_date,
+      ex.slot_date,
+      ex.booking_date
+    ].filter((v) => v != null && String(v).trim() !== '' && String(v).toLowerCase() !== 'null');
+    const timeCandidates = [
+      appt.time,
+      (exAppt as any).time,
+      ex.time,
+      ex.preferred_time,
+      ex.appointment_time,
+      ex.scheduled_time,
+      ex.meeting_time,
+      ex.slot_time,
+      ex.booking_time
+    ].filter((v) => v != null && String(v).trim() !== '' && String(v).toLowerCase() !== 'null');
+    const mergedDate = dateCandidates.length > 0 ? String(dateCandidates[0]) : '';
+    const mergedTime = timeCandidates.length > 0 ? String(timeCandidates[0]) : '';
+
+    const contactName = context.contact?.name || context.triggerData?.freshContactData?.name || '';
+    const contactEmail = context.contact?.email || context.triggerData?.freshContactData?.email || '';
+    const contactPhone = context.contact?.phone || context.triggerData?.freshContactData?.phone || '';
+
+    const appointmentBlock = {
+      ...appt,
+      booked:
+        typeof appt.booked === 'boolean' ? appt.booked : !!(mergedDate || mergedTime),
+      date: mergedDate,
+      time: mergedTime
+    };
+
+    const extractedBlock = {
+      ...ex,
+      date: ex.date || (exAppt as any).date || mergedDate,
+      time: ex.time || (exAppt as any).time || mergedTime,
+      appointment: {
+        ...((ex.appointment && typeof ex.appointment === 'object' ? ex.appointment : {}) as Record<string, unknown>),
+        booked:
+          typeof (exAppt as any).booked === 'boolean'
+            ? (exAppt as any).booked
+            : appointmentBlock.booked,
+        date: (exAppt as any).date || mergedDate,
+        time: (exAppt as any).time || mergedTime
+      }
+    };
+
     const data: Record<string, any> = {
       ...context.triggerData,
-      contact: context.contact,
-      appointment: context.appointment,
-      extracted: context.extracted,
+      // Flat aliases (so {{date}}, {{time}}, {{name}} all work)
+      date: mergedDate,
+      time: mergedTime,
+      appointment_date: mergedDate,
+      appointment_time: mergedTime,
+      name: contactName,
+      email: contactEmail,
+      phone: contactPhone,
+      contact_name: contactName,
+      contact_email: contactEmail,
+      contact_phone: contactPhone,
+      // Nested blocks
+      contact: {
+        ...(context.contact || {}),
+        name: contactName,
+        email: contactEmail,
+        phone: contactPhone
+      },
+      appointment: appointmentBlock,
+      extracted: extractedBlock,
       conversation: context.conversation,
       now: context.now
     };
 
-    // Add computed time variables for appointment scheduling
-    if (context.appointment?.time) {
-      const timeParts = context.appointment.time.split(':');
+    // Computed convenience: appointment.time_plus_30 → "HH:MM" 30 minutes after appointment.time.
+    const timeForPlus30 = mergedTime || context.appointment?.time;
+    if (timeForPlus30 && /^\d{1,2}:\d{2}/.test(String(timeForPlus30))) {
+      const timeParts = String(timeForPlus30).split(':');
       const hour = parseInt(timeParts[0], 10);
       const minute = parseInt(timeParts[1] || '0', 10);
-
-      // Calculate time + 30 minutes
-      const totalMinutes = hour * 60 + minute + 30;
-      const newHour = Math.floor(totalMinutes / 60) % 24;
-      const newMinute = totalMinutes % 60;
-
-      data.appointment = {
-        ...data.appointment,
-        time_plus_30: `${String(newHour).padStart(2, '0')}:${String(newMinute).padStart(2, '0')}`
-      };
+      if (!isNaN(hour) && !isNaN(minute)) {
+        const totalMinutes = hour * 60 + minute + 30;
+        const newHour = Math.floor(totalMinutes / 60) % 24;
+        const newMinute = totalMinutes % 60;
+        data.appointment = {
+          ...data.appointment,
+          time_plus_30: `${String(newHour).padStart(2, '0')}:${String(newMinute).padStart(2, '0')}`
+        };
+      }
     }
 
-    // 1. Resolve nested contact/appointment/conversation properties
-    // e.g. {{contact.name}}, {{appointment.booked}}
-    resolved = resolved.replace(/\{\{(\w+)\.(\w+)\}\}/g, (match, type, key) => {
-      const value = data[type]?.[key];
-      return value !== undefined && value !== null ? String(value) : '';
+    const getPath = (root: Record<string, any>, path: string): any => {
+      const segments = path.split('.').filter(Boolean);
+      let cur: any = root;
+      for (const seg of segments) {
+        if (cur == null || typeof cur !== 'object') return undefined;
+        cur = cur[seg];
+      }
+      return cur;
+    };
+
+    // 1. Dot-path variables at any depth: {{extracted.appointment.date}}, {{contact.name}}, {{date}}
+    resolved = resolved.replace(/\{\{([\w.]+)\}\}/g, (_match, path: string) => {
+      const value = getPath(data, path);
+      if (value === undefined || value === null) return '';
+      if (typeof value === 'object') return '';
+      return String(value);
     });
 
-    // 2. Resolve flat triggerData properties
-    // e.g. {{conversation_id}}, {{call_name}}
-    resolved = resolved.replace(/\{\{(\w+)\}\}/g, (match, key) => {
-      const value = data[key];
-      return value !== undefined && value !== null ? String(value) : '';
-    });
-
-    // Replace any remaining {{...}} with empty string (do not throw – skip node instead if needed)
+    // Anything still wrapped in {{...}} → log + strip (don't crash the email).
     if (resolved.includes('{{')) {
-      const missing = resolved.match(/\{\{([^}]+)\}\}/g);
-      console.warn(`[Automation Engine] ⚠️ Unresolved variables (replaced with empty): ${missing?.join(', ')}`);
+      const missing = resolved.match(/\{\{([^}]+)\}\}/g) || [];
+      console.warn(
+        `[Automation Engine] ⚠️ Unresolved template variables: ${missing.join(', ')}`
+      );
       resolved = resolved.replace(/\{\{[^}]+\}\}/g, '');
+    }
+
+    // Diagnostic: if the user templated date/time but we have nothing to show,
+    // log loudly so we can tell whether it's an extraction problem or a config
+    // problem next time.
+    const referencedDateOrTime = /\{\{(appointment\.|extracted\.)?(date|time)|appointment_(date|time)\}\}/.test(template);
+    if (referencedDateOrTime && !mergedDate && !mergedTime) {
+      console.warn(
+        `[Automation Engine] ⚠️ Template references date/time but neither was extracted. ` +
+        `context.appointment=${JSON.stringify(context.appointment || {})} ` +
+        `context.extracted=${JSON.stringify(Object.keys(context.extracted || {}))}`
+      );
     }
 
     return resolved;
@@ -634,36 +739,67 @@ export class AutomationEngine {
           options
         ) as { success: boolean; appointment_booked?: boolean | string; date?: string; time?: string; confidence?: number; extracted_data?: Record<string, any>; error?: string };
 
-        if (result.extracted_data) {
-          context.extracted = result.extracted_data;
-          const ed = result.extracted_data;
-          if (ed.appointment_booked != null || ed.date || ed.time) {
-            context.appointment = {
-              booked: ed.appointment_booked === true || ed.appointment_booked === 'true',
-              date: ed.date,
-              time: ed.time,
-              confidence: ed.confidence
-            };
-          }
-          if (!context.appointment) context.appointment = { booked: false };
-          if (!context.appointment!.date && (ed.preferred_date ?? ed.date)) {
-            context.appointment!.date = ed.preferred_date ?? ed.date;
-          }
-          if (!context.appointment!.time && (ed.preferred_time ?? ed.time)) {
-            context.appointment!.time = ed.preferred_time ?? ed.time;
-          }
-          if (context.appointment!.date && !context.appointment!.time) {
-            context.appointment!.time = '09:00';
-          }
-        }
-        if (result.success && result.appointment_booked != null && !context.appointment) {
-          context.appointment = {
-            booked: result.appointment_booked === true || result.appointment_booked === 'true',
-            date: result.date,
-            time: result.time,
-            confidence: result.confidence
-          };
-        }
+        // Reuse the same merge/normalize logic as aistein_extract_appointment
+        const ed: Record<string, any> = (result.extracted_data || {}) as Record<string, any>;
+        const cleanStr = (v: any) => {
+          if (v == null) return '';
+          const s = String(v).trim();
+          return s && s.toLowerCase() !== 'null' ? s : '';
+        };
+        const finalDate =
+          cleanStr(ed.date) ||
+          cleanStr(ed.preferred_date) ||
+          cleanStr(ed.appointment_date) ||
+          cleanStr(ed.scheduled_date) ||
+          cleanStr(ed.meeting_date) ||
+          cleanStr(ed.slot_date) ||
+          cleanStr(ed.booking_date) ||
+          cleanStr(result.date);
+        const finalTime =
+          cleanStr(ed.time) ||
+          cleanStr(ed.preferred_time) ||
+          cleanStr(ed.appointment_time) ||
+          cleanStr(ed.scheduled_time) ||
+          cleanStr(ed.meeting_time) ||
+          cleanStr(ed.slot_time) ||
+          cleanStr(ed.booking_time) ||
+          cleanStr(result.time);
+
+        const apptBookedRaw =
+          ed.appointment_booked != null ? ed.appointment_booked : result.appointment_booked;
+        const finalBooked =
+          apptBookedRaw === true ||
+          apptBookedRaw === 'true' ||
+          ((apptBookedRaw === undefined || apptBookedRaw === null || apptBookedRaw === '') &&
+            !!(finalDate || finalTime));
+
+        const resolvedTime = finalTime || (finalDate ? '09:00' : '');
+
+        context.appointment = {
+          booked: finalBooked,
+          date: finalDate || undefined,
+          time: resolvedTime || undefined,
+          confidence: result.confidence ?? ed.confidence
+        };
+
+        context.extracted = {
+          ...(result.extracted_data || {}),
+          ...(context.extracted || {}),
+          date: finalDate || undefined,
+          time: resolvedTime || undefined,
+          appointment_booked: finalBooked,
+          appointment: {
+            booked: finalBooked,
+            date: finalDate || undefined,
+            time: resolvedTime || undefined
+          },
+          interested: finalBooked || !!(result.extracted_data as any)?.interested
+        };
+
+        console.log(
+          `[Automation Engine] 📋 Extraction summary: booked=${finalBooked} date="${finalDate}" time="${resolvedTime}" ` +
+          `(extracted_data keys: ${Object.keys(result.extracted_data || {}).join(', ') || 'none'})`
+        );
 
         return result;
       }
@@ -732,10 +868,18 @@ export class AutomationEngine {
           return { success: true, status: 'skipped', reason: 'Invalid email' };
         }
 
-        // 2. Resolve content (Subject & Body)
-        // If resolution fails (unresolved variables), it will throw here (Task 4)
+        // 2. Resolve content (Subject & Body) — log the substitutions for diagnostics.
+        console.log(
+          `[Automation Engine] ✉️  Resolving email template. ` +
+          `appointment=${JSON.stringify(context.appointment || {})} ` +
+          `extracted.date="${(context.extracted as any)?.date || ''}" ` +
+          `extracted.time="${(context.extracted as any)?.time || ''}"`
+        );
         const emailSubject = await this.resolveTemplate(subject || 'Notification', context);
         const emailBody = await this.resolveTemplate(body || '', context);
+        const bodyPreview = emailBody.length > 200 ? emailBody.slice(0, 200) + '…' : emailBody;
+        console.log(`[Automation Engine] ✉️  Resolved subject: "${emailSubject}"`);
+        console.log(`[Automation Engine] ✉️  Resolved body preview: ${bodyPreview}`);
 
         try {
           const fromEmail = process.env.EMAIL_FROM || undefined;
@@ -1296,50 +1440,77 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
 
           console.log(`[Automation Engine] ✅ Extraction result:`, result.success ? (result.extracted_data || { appointment_booked: result.appointment_booked, date: result.date, time: result.time }) : result.error);
 
-          if (result.extracted_data) {
-            context.extracted = result.extracted_data;
-            const ed = result.extracted_data;
-            if (ed.appointment_booked != null || ed.date || ed.time) {
-              context.appointment = {
-                booked: ed.appointment_booked === true || ed.appointment_booked === 'true',
-                date: ed.date,
-                time: ed.time,
-                confidence: ed.confidence
-              };
-            }
-            // Map common extracted fields to appointment so {{appointment.date}} / {{appointment.time}} resolve in templates
-            if (!context.appointment) context.appointment = { booked: false };
-            if (!context.appointment.date && (ed.preferred_date ?? ed.date)) {
-              context.appointment.date = ed.preferred_date ?? ed.date;
-            }
-            if (!context.appointment.time && (ed.preferred_time ?? ed.time)) {
-              context.appointment.time = ed.preferred_time ?? ed.time;
-            }
-            // Default time when date is set but time missing (e.g. dynamic extraction only has preferred_date)
-            if (context.appointment.date && !context.appointment.time) {
-              context.appointment.time = '09:00';
-            }
-          }
-          if (result.success && result.appointment_booked != null && !context.appointment) {
-            context.appointment = result.appointment_booked
-              ? { booked: true, date: result.date, time: result.time, confidence: result.confidence }
-              : { booked: false };
-          }
-          if (!context.appointment) context.appointment = { booked: false };
+          // ── Pull date/time from EVERY field the LLM might use (legacy + dynamic) ──
+          const ed: Record<string, any> = (result.extracted_data || {}) as Record<string, any>;
+          const cleanStr = (v: any) => {
+            if (v == null) return '';
+            const s = String(v).trim();
+            return s && s.toLowerCase() !== 'null' ? s : '';
+          };
+          const finalDate =
+            cleanStr(ed.date) ||
+            cleanStr(ed.preferred_date) ||
+            cleanStr(ed.appointment_date) ||
+            cleanStr(ed.scheduled_date) ||
+            cleanStr(ed.meeting_date) ||
+            cleanStr(ed.slot_date) ||
+            cleanStr(ed.booking_date) ||
+            cleanStr(result.date);
+          const finalTime =
+            cleanStr(ed.time) ||
+            cleanStr(ed.preferred_time) ||
+            cleanStr(ed.appointment_time) ||
+            cleanStr(ed.scheduled_time) ||
+            cleanStr(ed.meeting_time) ||
+            cleanStr(ed.slot_time) ||
+            cleanStr(ed.booking_time) ||
+            cleanStr(result.time);
 
-          // Legacy appointment path has no extracted_data; conditions often still use extracted.interested (UI copies).
-          if (!result.extracted_data) {
-            context.extracted = {
-              ...(context.extracted || {}),
-              interested: !!context.appointment?.booked
-            };
-          }
+          const apptBookedRaw =
+            ed.appointment_booked != null ? ed.appointment_booked : result.appointment_booked;
+          const finalBooked =
+            apptBookedRaw === true ||
+            apptBookedRaw === 'true' ||
+            ((apptBookedRaw === undefined || apptBookedRaw === null || apptBookedRaw === '') &&
+              !!(finalDate || finalTime));
+
+          // Default the time when only the date was extracted, so calendar slots
+          // still resolve to something sensible.
+          const resolvedTime = finalTime || (finalDate ? '09:00' : '');
+
+          // ── Update both context.appointment AND context.extracted with merged values ──
+          context.appointment = {
+            booked: finalBooked,
+            date: finalDate || undefined,
+            time: resolvedTime || undefined,
+            confidence: result.confidence ?? ed.confidence
+          };
+
+          context.extracted = {
+            ...(result.extracted_data || {}),
+            ...(context.extracted || {}),
+            date: finalDate || undefined,
+            time: resolvedTime || undefined,
+            appointment_booked: finalBooked,
+            // Nested mirror for conditions + templates: {{extracted.appointment.date}}
+            appointment: {
+              booked: finalBooked,
+              date: finalDate || undefined,
+              time: resolvedTime || undefined
+            },
+            interested: finalBooked || !!(result.extracted_data as any)?.interested
+          };
+
+          console.log(
+            `[Automation Engine] 📋 Extraction summary: booked=${finalBooked} date="${finalDate}" time="${resolvedTime}" ` +
+            `(extracted_data keys: ${Object.keys(result.extracted_data || {}).join(', ') || 'none'})`
+          );
 
           return {
             success: true,
-            appointment_booked: context.appointment?.booked ?? result.appointment_booked ?? false,
-            date: result.date ?? context.appointment?.date ?? null,
-            time: result.time ?? context.appointment?.time ?? null,
+            appointment_booked: finalBooked,
+            date: finalDate || null,
+            time: resolvedTime || null,
             extracted_data: result.extracted_data,
             confidence: result.confidence ?? 0,
             reason: result.error
@@ -2030,7 +2201,8 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
 
   /**
    * Evaluate condition node
-   * Supports checking nested properties like "appointment.booked"
+   * Supports dot paths of any depth, e.g. "appointment.booked", "extracted.appointment.date",
+   * "extracted.interested_in_loan".
    */
   private async evaluateCondition(config: any, context: IAutomationExecutionContext): Promise<boolean> {
     const { field, operator, value } = config;
@@ -2040,34 +2212,44 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
       return false;
     }
 
-    // Get actual value from context using dot notation
-    let actualValue: any;
-    const fieldParts = field.split('.');
+    const evaluationRoot: Record<string, any> = {
+      contact: context.contact,
+      appointment: context.appointment,
+      extracted: context.extracted,
+      conversation: context.conversation,
+      ...context.triggerData
+    };
 
-    if (fieldParts.length === 2) {
-      // Nested property like "appointment.booked" or "extracted.interested_in_loan"
-      const [category, key] = fieldParts;
-      const contextData: Record<string, any> = {
-        contact: context.contact,
-        appointment: context.appointment,
-        extracted: context.extracted,
-        conversation: context.conversation,
-        ...context.triggerData
-      };
-      actualValue = contextData[category]?.[key];
-    } else {
-      // Flat property
-      actualValue = (context as any)[field] || context.triggerData?.[field];
+    const fieldParts = String(field)
+      .split('.')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    let actualValue: any = evaluationRoot;
+    for (const part of fieldParts) {
+      if (actualValue == null || typeof actualValue !== 'object') {
+        actualValue = undefined;
+        break;
+      }
+      actualValue = actualValue[part];
     }
 
     console.log(`[Automation Engine] 🔍 Condition check: ${field} ${operator} ${value} | Actual: ${actualValue}`);
 
+    const coerceBoolEq = (a: any, b: any): boolean => {
+      const norm = (x: any) => {
+        if (x === true || x === 'true' || x === 'True' || x === 1 || x === '1') return true;
+        if (x === false || x === 'false' || x === 'False' || x === 0 || x === '0') return false;
+        return x;
+      };
+      return norm(a) === norm(b);
+    };
+
     // Evaluate based on operator
     switch (operator) {
       case 'equals':
-        return actualValue === value;
+        return coerceBoolEq(actualValue, value);
       case 'not_equals':
-        return actualValue !== value;
+        return !coerceBoolEq(actualValue, value);
       case 'contains':
         return String(actualValue || '').includes(String(value));
       case 'not_contains':

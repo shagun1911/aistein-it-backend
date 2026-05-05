@@ -1150,52 +1150,106 @@ export class BatchCallingController {
         return [];
       };
 
-      const normalizeCallStatus = (rawStatus: string, reason: string): string => {
+      /**
+       * Normal call endings that sometimes appear in failure_* / reason fields (not a real error):
+       * - agent `end_call` tool, callee hangup ("remote party"), etc.
+       */
+      const isBenignAgentTerminationReason = (text: string): boolean => {
+        const s = (text || '').toLowerCase();
+        if (!s.trim()) return false;
+        if (/\bend_call\b/.test(s)) return true;
+        if (s.includes('end call tool')) return true;
+        if (s.includes('tool was called') && /end/.test(s)) return true;
+        if (s.includes('remote party') || s.includes('ended by remote')) return true;
+        if (s.includes('customer ended') || s.includes('user hung up') || s.includes('hangup by user')) return true;
+        return false;
+      };
+
+      const friendlyBenignEndReason = (reasonA: string, reasonB: string): string => {
+        const low = `${reasonA} ${reasonB}`.toLowerCase();
+        if (low.includes('remote party') || low.includes('ended by remote')) return 'Customer ended the call';
+        if (/\bend_call\b/.test(low) || low.includes('end call tool') || (low.includes('tool was called') && /end/.test(low)))
+          return 'Call ended by agent';
+        return 'Call completed';
+      };
+
+      /**
+       * Detect dial outcome (busy / voicemail / no_answer) from a status string OR free-text reason.
+       * Returns one of: 'busy' | 'voicemail' | 'no_answer' | '' (empty = no specific dial outcome detected).
+       */
+      const detectDialOutcome = (rawStatus: string, reason: string): '' | 'busy' | 'voicemail' | 'no_answer' => {
         const status = (rawStatus || '').toLowerCase().trim();
-        const failureReason = (reason || '').toLowerCase();
+        const statusFlat = status.replace(/_/g, ' ').replace(/-/g, ' ');
+        const r = (reason || '').toLowerCase();
 
-        if (status.includes('busy') || status === 'rejected_busy') return 'busy';
-        if (status.includes('voicemail') || status.includes('voice_mail')) return 'voicemail';
-        if (status.includes('no_answer') || status.includes('no-answer')) return 'no_answer';
-        if (status.includes('reject') || status.includes('decline')) return 'failed';
+        const busy =
+          statusFlat.includes('busy') ||
+          status === 'rejected_busy' ||
+          r.includes('busy here') ||
+          r.includes('line busy') ||
+          r.includes('user busy') ||
+          r.includes('subscriber busy') ||
+          r.includes('sip status: 486') ||
+          r.includes('sip 486') ||
+          r.includes('486 busy') ||
+          r.includes('sip 603') ||
+          r.includes('sip status: 603');
+        if (busy) return 'busy';
 
-        // SIP 486 / busy line should be surfaced clearly in UI.
+        const vm =
+          statusFlat.includes('voicemail') ||
+          statusFlat.includes('voice mail') ||
+          status.includes('voice_mail') ||
+          r.includes('voicemail') ||
+          r.includes('voice mail') ||
+          r.includes('answered by voicemail') ||
+          r.includes('machine detection') ||
+          r.includes('amd');
+        if (vm) return 'voicemail';
+
+        const na =
+          statusFlat.includes('no answer') ||
+          statusFlat.includes('noanswer') ||
+          status === 'unanswered' ||
+          statusFlat.includes('not answered') ||
+          statusFlat.includes('ring timeout') ||
+          statusFlat.includes('ringing timeout') ||
+          statusFlat.includes('no pickup') ||
+          status.includes('no_answer') ||
+          status.includes('no-answer') ||
+          r.includes('no answer') ||
+          r.includes('did not answer') ||
+          r.includes('didnt answer') ||
+          r.includes('not answered') ||
+          r.includes('unanswered') ||
+          r.includes('no pickup') ||
+          r.includes('not picked') ||
+          r.includes('ring timeout') ||
+          r.includes('ringing timeout') ||
+          r.includes('call timeout');
+        if (na) return 'no_answer';
+
+        return '';
+      };
+
+      /**
+       * Backward-compatible wrapper kept for any external callers — the new outcome
+       * resolver below (`resolveCallOutcome`) is what the controller actually uses.
+       */
+      const normalizeCallStatus = (rawStatus: string, reason: string): string => {
+        const dial = detectDialOutcome(rawStatus, reason);
+        if (dial) return dial;
+        const status = (rawStatus || '').toLowerCase().trim();
         if (
-          failureReason.includes('busy here') ||
-          failureReason.includes('line busy') ||
-          failureReason.includes('user busy') ||
-          failureReason.includes('sip status: 486') ||
-          failureReason.includes('sip 486')
+          status === 'done' ||
+          status === 'completed' ||
+          status === 'complete' ||
+          status === 'finished' ||
+          status === 'success' ||
+          status === 'successful'
         ) {
-          return 'busy';
+          return 'completed';
         }
-
-        if (
-          failureReason.includes('voicemail') ||
-          failureReason.includes('voice mail') ||
-          failureReason.includes('answered by voicemail')
-        ) {
-          return 'voicemail';
-        }
-
-        if (
-          failureReason.includes('no answer') ||
-          failureReason.includes('did not answer') ||
-          failureReason.includes('timeout')
-        ) {
-          return 'no_answer';
-        }
-
-        if (
-          failureReason.includes('failed') ||
-          failureReason.includes('error') ||
-          failureReason.includes('rejected') ||
-          failureReason.includes('declined') ||
-          failureReason.includes('invalid number')
-        ) {
-          return 'failed';
-        }
-
         return status || 'pending';
       };
 
@@ -1418,6 +1472,205 @@ export class BatchCallingController {
       resultRows.forEach((r: any) => (r?.conversation_id || r?.conversationId || r?.id) && allConversationIds.add(r.conversation_id || r.conversationId || r.id));
       dbConversations.forEach((c: any) => c?.metadata?.conversation_id && allConversationIds.add(c.metadata.conversation_id));
 
+      const scheduledBatch = Number(statusResult?.total_calls_scheduled ?? 0);
+      const finishedBatch = Number(statusResult?.total_calls_finished ?? 0);
+      const batchStatusLower = String(statusResult?.status || '').toLowerCase();
+      const batchJobStillRunning =
+        batchStatusLower === 'pending' ||
+        batchStatusLower === 'in_progress' ||
+        batchStatusLower === 'running' ||
+        batchStatusLower === 'queued' ||
+        batchStatusLower === 'processing';
+      /** ElevenLabs explicitly says the batch job is finished. Trust this even if the
+       *  finished/scheduled counts haven't caught up yet (they often lag behind the
+       *  status flip by several seconds). */
+      const batchExplicitlyComplete =
+        batchStatusLower === 'completed' ||
+        batchStatusLower === 'done' ||
+        batchStatusLower === 'finished';
+      const batchHasOutstandingCalls =
+        !batchExplicitlyComplete &&
+        statusResult != null &&
+        scheduledBatch > 0 &&
+        Number.isFinite(finishedBatch) &&
+        finishedBatch < scheduledBatch;
+      /** Batch not fully settled yet — don't show terminal failed tags mid-dial. */
+      const batchNotDoneYet = batchJobStillRunning || batchHasOutstandingCalls;
+      /** Batch fully settled — every recipient must end up in a terminal tag (no "in_progress"). */
+      const batchFullyDone =
+        !batchNotDoneYet &&
+        (batchExplicitlyComplete ||
+          (statusResult != null && scheduledBatch > 0 && finishedBatch >= scheduledBatch));
+
+      /** Mid-dial states only — NOT "dispatched" (often stays set after the call ends). */
+      const recipientLooksInFlight = (raw: string): boolean => {
+        const s = String(raw || '')
+          .toLowerCase()
+          .replace(/_/g, ' ')
+          .replace(/-/g, ' ')
+          .trim();
+        if (!s) return false;
+        return (
+          s === 'pending' ||
+          s === 'queued' ||
+          s === 'scheduled' ||
+          s === 'initiated' ||
+          s.includes('in progress') ||
+          s.includes('ringing') ||
+          s.includes('dialing') ||
+          s.includes('calling') ||
+          s.includes('processing')
+        );
+      };
+
+      /**
+       * Single source of truth for a contact's final tag.
+       * Priority ladder (highest → lowest):
+       *   1. Explicit dial outcome (busy / voicemail / no_answer) detected from status or reason text.
+       *   2. Any evidence the call actually ran (duration, transcript, messages, terminal live status) → completed.
+       *   3. Raw status that is itself a "completed/done" terminal → completed.
+       *   4. Mid-dial state while the batch is still running → in_progress.
+       *   5. Batch fully done with a conversation_id but no terminal hint → completed (avoid stuck "in progress").
+       *   6. Explicit failure (rawStatus === 'failed' with concrete reason, not benign) → failed.
+       *   7. Batch fully done with no evidence of any call → no_answer (call never connected).
+       *   8. Otherwise → 'pending' / raw status passthrough.
+       *
+       * Never returns 'failed' just because data is missing — only when there is concrete failure evidence.
+       */
+      const resolveCallOutcome = (args: {
+        rawStatus: string;
+        reasonText: string;
+        endReasonText: string;
+        durationSeconds: number;
+        hasTranscript: boolean;
+        hasMessages: boolean;
+        hasConversationId: boolean;
+        liveStatus: string;
+      }): { status: string; failed_reason: string; end_reason: string } => {
+        const raw = String(args.rawStatus || '').toLowerCase().trim();
+        const reasonAll = `${args.reasonText || ''} ${args.endReasonText || ''}`.trim();
+        const liveLow = String(args.liveStatus || '').toLowerCase();
+        // Strong evidence the call actually connected:
+        //   • duration > 0     (Twilio confirmed audio seconds)
+        //   • transcript text  (the agent + customer exchanged words)
+        //   • DB messages      (conversation was persisted)
+        // We do NOT count `liveConversation.status === 'completed'` as evidence —
+        // ElevenLabs marks the conversation as completed for unanswered calls too
+        // (because the dispatch completed, not because the call was answered).
+        const hasProgress =
+          args.durationSeconds >= 1 || args.hasTranscript || args.hasMessages;
+        const benign =
+          isBenignAgentTerminationReason(args.reasonText) ||
+          isBenignAgentTerminationReason(args.endReasonText);
+        const friendlyEnd = benign
+          ? friendlyBenignEndReason(args.reasonText || '', args.endReasonText || '')
+          : (args.endReasonText || args.reasonText || '');
+
+        // 1) Explicit dial outcome wins immediately
+        const dial = detectDialOutcome(args.rawStatus, reasonAll);
+        if (dial === 'busy') {
+          return {
+            status: 'busy',
+            failed_reason: 'Line busy',
+            end_reason: 'Recipient was on another call'
+          };
+        }
+        if (dial === 'voicemail') {
+          return {
+            status: 'voicemail',
+            failed_reason: 'Reached voicemail',
+            end_reason: 'Call sent to voicemail'
+          };
+        }
+        if (dial === 'no_answer') {
+          return {
+            status: 'no_answer',
+            failed_reason: 'No answer',
+            end_reason: 'Recipient did not answer'
+          };
+        }
+
+        // 2) Any evidence the call ran → completed (clear any noisy failure copy)
+        if (hasProgress) {
+          return {
+            status: 'completed',
+            failed_reason: '',
+            end_reason: friendlyEnd || 'Call completed'
+          };
+        }
+
+        // 3) Raw status itself is terminal "done" → completed
+        if (
+          raw === 'completed' ||
+          raw === 'complete' ||
+          raw === 'done' ||
+          raw === 'finished' ||
+          raw === 'success' ||
+          raw === 'successful'
+        ) {
+          return {
+            status: 'completed',
+            failed_reason: '',
+            end_reason: friendlyEnd || 'Call completed'
+          };
+        }
+
+        // 4) Mid-dial while batch is still running → in_progress
+        const inFlight = recipientLooksInFlight(args.rawStatus) || raw === 'dispatched';
+        if (inFlight && batchNotDoneYet) {
+          return { status: 'in_progress', failed_reason: '', end_reason: '' };
+        }
+
+        // 5) Explicit failure (NOT benign agent end-call) — must come BEFORE the
+        //    "batch done → completed" fallback so a real failure still wins.
+        const explicitFailRaw =
+          raw === 'failed' ||
+          raw === 'error' ||
+          raw === 'rejected' ||
+          raw === 'declined' ||
+          raw.includes('reject') ||
+          raw.includes('decline');
+        const explicitFailReason =
+          !benign &&
+          /\b(failed|error|rejected|declined|invalid number|cannot connect|carrier rejected)\b/.test(
+            reasonAll.toLowerCase()
+          );
+        if ((explicitFailRaw || explicitFailReason) && !benign) {
+          const failedCopy = String(args.reasonText || args.endReasonText || '').trim();
+          return {
+            status: 'failed',
+            failed_reason: failedCopy || 'Call failed',
+            end_reason: friendlyEnd || 'Call failed'
+          };
+        }
+
+        // 6) Batch is fully done — recipient MUST end up in a terminal tag.
+        //    Discriminator: REAL call progress (duration / transcript / messages).
+        //    A `conversation_id` alone is NOT enough — ElevenLabs creates one on
+        //    dispatch even for unanswered calls.
+        if (batchFullyDone) {
+          if (hasProgress) {
+            return {
+              status: 'completed',
+              failed_reason: '',
+              end_reason: friendlyEnd || 'Call completed'
+            };
+          }
+          // No real call activity → call didn't connect.
+          // Show a neutral "no answer" tag; the next sync cycle will upgrade
+          // this to 'busy' / 'voicemail' / 'failed' once ElevenLabs flips the
+          // recipient row to a more specific reason.
+          return {
+            status: 'no_answer',
+            failed_reason: 'No answer',
+            end_reason: 'Recipient did not answer'
+          };
+        }
+
+        // 7) Otherwise — still pending
+        return { status: raw || 'pending', failed_reason: '', end_reason: '' };
+      };
+
       const contacts = [...allPhones].map((phone) => {
         const normalizedPhone = normalizePhoneForCompare(phone);
         const statusRow = recipientRows.find((r: any) => normalizePhoneForCompare(r?.phone_number) === normalizedPhone) || byPhone.get(normalizedPhone) || {};
@@ -1443,11 +1696,13 @@ export class BatchCallingController {
         const dynamicVars = statusRow?.conversation_initiation_client_data?.dynamic_variables || {};
         const displayName = statusRow?.name || callRow?.name || resultRow?.name || dynamicVars.name || dynamicVars.customer_name || customer?.name || 'Unknown';
         const email = statusRow?.email || callRow?.email || resultRow?.email || dynamicVars.email || dynamicVars.customer_email || customer?.email || '';
+        // Prefer batch recipient / call row status over conversation GET — the latter is often
+        // "completed" for every terminal dial outcome (including busy / no-answer / voicemail).
         const rawStatus =
-          liveConversation?.status ||
           statusRow?.status ||
           callRow?.status ||
           callRow?.call_status ||
+          liveConversation?.status ||
           resultRow?.status ||
           (dbConversation ? 'completed' : 'pending');
         const durationSeconds =
@@ -1479,39 +1734,55 @@ export class BatchCallingController {
           dbConversation?.metadata?.end_reason ||
           reasonText ||
           '';
-        const failedReason = reasonText;
         const summary =
           resultRow?.analysis?.summary ||
           resultRow?.summary ||
           resultRow?.call_summary ||
           '';
-        // If provider marks batch completed but recipient stays initiated with no final reason,
-        // avoid showing initiated forever in UI.
-        const statusForNormalization =
-          (statusResult?.status === 'completed' && String(rawStatus).toLowerCase() === 'initiated' && !failedReason && !endReason)
-            ? 'failed'
-            : rawStatus;
-        const resolvedStatus = normalizeCallStatus(statusForNormalization, `${failedReason} ${endReason}`);
-        const resolvedFailedReason = failedReason || defaultReasonFromStatus(resolvedStatus, rawStatus);
-        const resolvedEndReason = endReason || defaultReasonFromStatus(resolvedStatus, rawStatus);
+
+        const msgCountForContact = dbConversation
+          ? messageCountMap.get(String(dbConversation._id)) || 0
+          : 0;
+        const hasTranscriptContent = (() => {
+          const t = transcript;
+          if (!t) return false;
+          if (typeof t === 'string') return t.trim().length > 0;
+          if (Array.isArray(t)) return t.length > 0;
+          if (typeof t === 'object') {
+            const arr = (t as any).messages || (t as any).items;
+            return Array.isArray(arr) && arr.length > 0;
+          }
+          return false;
+        })();
+
+        const outcome = resolveCallOutcome({
+          rawStatus,
+          reasonText,
+          endReasonText: String(endReason || ''),
+          durationSeconds,
+          hasTranscript: hasTranscriptContent,
+          hasMessages: msgCountForContact > 0,
+          hasConversationId: !!conversationId,
+          liveStatus: String(liveConversation?.status || '')
+        });
 
         return {
           phone_number: phone,
           name: displayName,
           email,
-          status: resolvedStatus,
+          status: outcome.status,
           raw_status: rawStatus,
           conversation_id: conversationId || dbConversation?.metadata?.conversation_id || null,
           recipient_id: statusRow?.id || statusRow?.recipient_id || null,
           duration_seconds: durationSeconds,
-          end_reason: resolvedEndReason,
-          failed_reason: resolvedFailedReason,
+          end_reason: outcome.end_reason,
+          failed_reason: outcome.failed_reason,
           summary,
           transcript,
           metadata: {
             sip_call_sid: resultRow?.metadata?.call_sid || callRow?.call_sid || null,
             recording_url: resultRow?.recording_url || resultRow?.audio_url || dbConversation?.metadata?.recording_url || dbConversation?.metadata?.audio_url || null,
-            raw_reason: failedReason || endReason || null,
+            raw_reason: reasonText || endReason || null,
             created_at_unix: statusRow?.created_at_unix || callRow?.created_at_unix || null,
             updated_at_unix: statusRow?.updated_at_unix || callRow?.updated_at_unix || null
           },
@@ -1533,7 +1804,7 @@ export class BatchCallingController {
           const liveConversation = liveConversationMap.get(String(conversationId)) || null;
           const dbConversation = dbByConversationId.get(conversationId) || null;
           const customer = dbConversation?.customerId ? customerMap.get(String(dbConversation.customerId)) : null;
-          const rawStatus = liveConversation?.status || row?.status || row?.call_status || 'completed';
+          const rawStatus = row?.status || row?.call_status || liveConversation?.status || 'completed';
           const reasonText = pickBestReason(
             liveConversation,
             liveConversation?.metadata,
@@ -1543,7 +1814,6 @@ export class BatchCallingController {
             row?.analysis,
             dbConversation?.metadata
           );
-          const failedReason = reasonText;
           const endReason =
             liveConversation?.metadata?.termination_reason ||
             row?.metadata?.termination_reason ||
@@ -1551,26 +1821,48 @@ export class BatchCallingController {
             dbConversation?.metadata?.end_reason ||
             reasonText ||
             '';
-          const resolvedStatus = normalizeCallStatus(rawStatus, `${failedReason} ${endReason}`);
-          const resolvedFailedReason = failedReason || defaultReasonFromStatus(resolvedStatus, rawStatus);
-          const resolvedEndReason = endReason || defaultReasonFromStatus(resolvedStatus, rawStatus);
+          const durationSecondsRow =
+            row?.metadata?.call_duration_secs || row?.call_duration_secs || dbConversation?.metadata?.duration_seconds || 0;
+          const transcriptRow = row?.transcript || dbConversation?.transcript || null;
+          const msgRow = dbConversation ? messageCountMap.get(String(dbConversation._id)) || 0 : 0;
+          const hasTranscriptRow = (() => {
+            const t = transcriptRow;
+            if (!t) return false;
+            if (typeof t === 'string') return t.trim().length > 0;
+            if (Array.isArray(t)) return t.length > 0;
+            if (typeof t === 'object') {
+              const arr = (t as any).messages || (t as any).items;
+              return Array.isArray(arr) && arr.length > 0;
+            }
+            return false;
+          })();
+          const outcomeRow = resolveCallOutcome({
+            rawStatus,
+            reasonText,
+            endReasonText: String(endReason || ''),
+            durationSeconds: durationSecondsRow,
+            hasTranscript: hasTranscriptRow,
+            hasMessages: msgRow > 0,
+            hasConversationId: !!conversationId,
+            liveStatus: String(liveConversation?.status || '')
+          });
           return {
             phone_number: row?.phone_number || dbConversation?.metadata?.phone_number || '',
             name: row?.name || customer?.name || 'Unknown',
             email: row?.email || customer?.email || '',
-            status: resolvedStatus,
+            status: outcomeRow.status,
             raw_status: rawStatus,
             conversation_id: conversationId,
             recipient_id: row?.id || null,
-            duration_seconds: row?.metadata?.call_duration_secs || row?.call_duration_secs || dbConversation?.metadata?.duration_seconds || 0,
-            end_reason: resolvedEndReason,
-            failed_reason: resolvedFailedReason,
+            duration_seconds: durationSecondsRow,
+            end_reason: outcomeRow.end_reason,
+            failed_reason: outcomeRow.failed_reason,
             summary: row?.analysis?.summary || row?.summary || '',
-            transcript: row?.transcript || dbConversation?.transcript || null,
+            transcript: transcriptRow,
             metadata: {
               sip_call_sid: row?.metadata?.call_sid || row?.call_sid || null,
               recording_url: row?.recording_url || row?.audio_url || dbConversation?.metadata?.recording_url || dbConversation?.metadata?.audio_url || null,
-              raw_reason: failedReason || endReason || null,
+              raw_reason: reasonText || endReason || null,
               created_at_unix: row?.created_at_unix || null,
               updated_at_unix: row?.updated_at_unix || null
             },

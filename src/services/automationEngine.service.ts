@@ -65,6 +65,7 @@ export interface IAutomationExecutionContext {
   contact: any;
   conversation?: any;
   triggerData: any;
+  automationId?: string;
   appointment?: {
     booked: boolean;
     date?: string;
@@ -1712,16 +1713,66 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
       execute: async (config, triggerData, context: IAutomationExecutionContext) => {
         const { summary, description, startTime, endTime, attendees } = config;
         const resolvedSummary = await this.resolveTemplate(summary || '', context);
-        const resolvedStart = await this.resolveTemplate(startTime || '', context);
-        const resolvedEnd = await this.resolveTemplate(endTime || '', context);
+        let resolvedStart = await this.resolveTemplate(startTime || '', context);
+        let resolvedEnd = await this.resolveTemplate(endTime || '', context);
+        const fallbackDate = String(
+          context.appointment?.date ||
+          context.extracted?.date ||
+          context.triggerData?.appointment?.date ||
+          context.triggerData?.dynamic_variables?.appointment_date ||
+          ''
+        ).trim();
+        const fallbackTime = String(
+          context.appointment?.time ||
+          context.extracted?.time ||
+          context.triggerData?.appointment?.time ||
+          context.triggerData?.dynamic_variables?.appointment_time ||
+          '09:00'
+        ).trim();
 
-        const hasUnresolved = resolvedStart.includes('{{') || resolvedEnd.includes('{{') || !resolvedStart.trim() || !resolvedEnd.trim();
-        const startD = new Date(resolvedStart);
-        const endD = new Date(resolvedEnd);
-        const validDates = !isNaN(startD.getTime()) && !isNaN(endD.getTime());
+        const hasUnresolvedToken = (v: string): boolean => String(v || '').includes('{{');
+        const parseDate = (value: string): Date | null => {
+          const text = String(value || '').trim();
+          if (!text || hasUnresolvedToken(text)) return null;
+          const direct = new Date(text);
+          if (!isNaN(direct.getTime())) return direct;
+          const dateOnly = text.match(/^(\d{4}-\d{2}-\d{2})$/);
+          if (dateOnly) {
+            const guessed = new Date(`${dateOnly[1]}T${fallbackTime || '09:00'}:00`);
+            return isNaN(guessed.getTime()) ? null : guessed;
+          }
+          return null;
+        };
 
-        if (hasUnresolved || !validDates) {
+        if (!resolvedStart.trim() || hasUnresolvedToken(resolvedStart)) {
+          if (fallbackDate) resolvedStart = `${fallbackDate} ${fallbackTime || '09:00'}`;
+        }
+        let startD = parseDate(resolvedStart);
+
+        if (!resolvedEnd.trim() || hasUnresolvedToken(resolvedEnd)) {
+          if (startD) {
+            const plusOneHour = new Date(startD.getTime() + 60 * 60 * 1000);
+            resolvedEnd = plusOneHour.toISOString();
+          } else if (fallbackDate) {
+            const fallbackStart = parseDate(`${fallbackDate} ${fallbackTime || '09:00'}`);
+            if (fallbackStart) {
+              startD = fallbackStart;
+              resolvedStart = fallbackStart.toISOString();
+              resolvedEnd = new Date(fallbackStart.getTime() + 60 * 60 * 1000).toISOString();
+            }
+          }
+        }
+
+        const endD = parseDate(resolvedEnd);
+        const startMs = startD ? startD.getTime() : NaN;
+        const endMs = endD ? endD.getTime() : NaN;
+        const validDates = !isNaN(startMs) && !isNaN(endMs) && endMs > startMs;
+
+        if (!validDates) {
           console.log(`[Automation Engine] ⏭️ Skipping Google Calendar create event: missing or invalid date/time (start: ${resolvedStart || '(empty)'}, end: ${resolvedEnd || '(empty)'})`);
+          return { success: true, status: 'skipped', reason: 'Missing or invalid appointment date/time' };
+        }
+        if (!startD || !endD) {
           return { success: true, status: 'skipped', reason: 'Missing or invalid appointment date/time' };
         }
 
@@ -1766,6 +1817,23 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
       execute: async (config, triggerData, context: IAutomationExecutionContext) => {
         const { spreadsheetId } = config;
         const userValues: any[] = Array.isArray((config as any).values) ? (config as any).values : [];
+        const isBatchCompletedEvent = String(context?.triggerData?.event || '').trim() === 'batch_call_completed';
+        const externalConversationId = String(
+          context?.conversation?.conversation_id ||
+          context?.triggerData?.conversation_id ||
+          ''
+        ).trim();
+        const transcriptReady = Boolean(context?.conversation?.transcript || context?.conversation?.transcript_text);
+
+        // Hard gate for batch flow: do not write partially-ready rows.
+        // Recording link can arrive later on some providers, so we don't block on it.
+        if (isBatchCompletedEvent && (!externalConversationId || !transcriptReady)) {
+          console.log('[Automation Engine] ⏭️ Skipping Google Sheets append: batch conversation not fully ready yet', {
+            hasConversationId: Boolean(externalConversationId),
+            transcriptReady
+          });
+          return { success: true, status: 'skipped', reason: 'Batch conversation not fully ready' };
+        }
 
         // Default to fixed format unless explicitly disabled (useFixedFormat=false).
         // Fixed format guarantees a clean predictable client-friendly sheet structure.
@@ -1859,6 +1927,28 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
             return `'${t.replace(/'/g, "''")}'`;
           };
           const sheetRangePrefix = `${escapeSheetTitleForA1(configured)}!A1`;
+          const rawSyncKey = [
+            String(context?.automationId || 'unknown-automation'),
+            spreadsheetId,
+            configured
+          ].join('|');
+          const syncKey = rawSyncKey.replace(/[.$\s]/g, '_');
+          const dbConversationId = String(context?.conversation?.id || '').trim();
+          const metadataSyncPath = `metadata.sheet_sync.${syncKey}`;
+
+          // Persistent idempotency guard (DB-level): one row max per automation/sheet/tab/conversation.
+          if (dbConversationId && externalConversationId) {
+            const alreadySynced = await Conversation.exists({
+              _id: dbConversationId,
+              [metadataSyncPath]: externalConversationId
+            });
+            if (alreadySynced) {
+              console.log(
+                `[Automation Engine] ⏭️ DB idempotency skip: conversation already synced to this sheet (${syncKey})`
+              );
+              return { success: true, status: 'skipped', reason: 'Already sheet-synced' };
+            }
+          }
 
           const titleCase = (s: string): string =>
             String(s || '')
@@ -1939,35 +2029,24 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
             expectedSlice.length > 0 &&
             expectedSlice.every((h, i) => h !== '' && existingSlice[i] === h);
           const rowHasAnyValue = existingHeaders.some((h: any) => String(h || '').trim() !== '');
+          const KNOWN_HEADERS = new Set([
+            'name',
+            'address',
+            'email',
+            'phone number',
+            'appointment date & time',
+            'call recording'
+          ]);
+          const existingNormalized = existingHeaders
+            .map((h: any) => normalize(String(h || '')))
+            .filter(Boolean);
+          const existingHeaderLikeCount = existingNormalized.filter((h: string) => KNOWN_HEADERS.has(h)).length;
+          const rowLooksLikeLegacyHeaders = existingHeaderLikeCount >= Math.min(3, KNOWN_HEADERS.size);
 
           if (!rowLooksLikeExpectedHeaders) {
-            if (rowHasAnyValue) {
-              // Keep existing data safe by inserting a fresh row 1 for headers.
-              const sheetId = sheetMeta.data.sheets?.find(
-                (s: any) => s?.properties?.title === configured
-              )?.properties?.sheetId;
-              if (sheetId !== undefined && sheetId !== null) {
-                await sheets.spreadsheets.batchUpdate({
-                  spreadsheetId,
-                  requestBody: {
-                    requests: [
-                      {
-                        insertDimension: {
-                          range: {
-                            sheetId,
-                            dimension: 'ROWS',
-                            startIndex: 0,
-                            endIndex: 1
-                          },
-                          inheritFromBefore: false
-                        }
-                      }
-                    ]
-                  }
-                });
-              }
-            }
-
+            // Never insert a new top row for headers. Inserting causes duplicated
+            // headings and visual "overwrites" when users already have row 1 data.
+            // We only normalize row 1 headers in-place.
             await sheets.spreadsheets.values.update({
               spreadsheetId,
               range: `${escapeSheetTitleForA1(configured)}!A1`,
@@ -1993,10 +2072,10 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
               .join('\n')
           );
 
-          // Sheet-level dedup: never write two rows for the same phone+conversation.
-          // Looks at the existing sheet content and skips append if a matching
-          // row already exists. This is the final safety net behind the worker-
-          // level automation_triggered_phones check.
+          // Sheet-level dedup:
+          // - For batch_call_completed, dedup ONLY by exact conversation_id.
+          //   (Same phone can have multiple valid calls; each should append.)
+          // - For non-batch flows, keep phone fallback dedup to avoid noise.
           const phoneIdx = rowPlan.findIndex(
             (r) => /\{\{\s*(phone|phone_number|contact\.phone)\s*\}\}/i.test(r.template)
           );
@@ -2014,11 +2093,19 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
                 range: `${escapeSheetTitleForA1(configured)}!A:Z`
               });
               const rows: any[][] = allRows.data.values || [];
+              const convHeaderIdx = headerValues.findIndex((h) => normalize(h) === 'conversation id');
               const normPhone = phoneVal.replace(/\D/g, '');
+              const strictConversationDedup = isBatchCompletedEvent && !!convIdVal;
               const looksLikeMatch = rows.slice(1).some((row) => {
                 if (!row || row.length === 0) return false;
-                if (convIdVal && row.some((c) => String(c || '').includes(convIdVal))) return true;
-                if (normPhone && phoneIdx >= 0) {
+                if (convIdVal) {
+                  if (convHeaderIdx >= 0) {
+                    const existingConv = String(row[convHeaderIdx] || '').trim();
+                    if (existingConv && existingConv === convIdVal) return true;
+                  }
+                  if (row.some((c) => String(c || '').trim() === convIdVal)) return true;
+                }
+                if (!strictConversationDedup && normPhone && phoneIdx >= 0) {
                   const cellPhone = String(row[phoneIdx] || '').replace(/\D/g, '');
                   if (cellPhone && (cellPhone === normPhone || cellPhone.endsWith(normPhone) || normPhone.endsWith(cellPhone))) {
                     return true;
@@ -2044,6 +2131,17 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
             insertDataOption: 'INSERT_ROWS',
             requestBody: { values: [resolvedValues] }
           });
+
+          if (dbConversationId && externalConversationId) {
+            try {
+              await Conversation.updateOne(
+                { _id: dbConversationId },
+                { $set: { [metadataSyncPath]: externalConversationId } }
+              );
+            } catch (persistErr: any) {
+              console.warn('[Automation Engine] ⚠️ Failed to persist sheet sync marker:', persistErr.message);
+            }
+          }
 
           console.log(
             `[Automation Engine] ✅ Google Sheets append OK (${useFixedFormat ? 'fixed' : 'custom'} format, ${rowPlan.length} cols)`
@@ -2202,6 +2300,43 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
     console.log(`${'='.repeat(80)}\n`);
 
     try {
+      const serviceLabel = (service: string): string => {
+        const labels: Record<string, string> = {
+          aistein_extract_data: 'Extract Data',
+          aistein_extract_appointment: 'Extract Appointment',
+          aistein_google_sheet_append_row: 'Add Row to Google Sheet',
+          aistein_user_google_sheet_append_row: 'Add Row to Google Sheet',
+          aistein_google_calendar_check_availability: 'Check Calendar Availability',
+          aistein_google_calendar_create_event: 'Create Google Calendar Event',
+          aistein_google_gmail_send: 'Send Gmail',
+          aistein_send_email: 'Send Email',
+          aistein_send_sms: 'Send SMS',
+          aistein_whatsapp_send: 'Send WhatsApp',
+          aistein_outbound_call: 'Outbound Call',
+          aistein_api_call: 'API Call',
+          aistein_create_contact: 'Create Contact',
+          aistein_batch_calling: 'Start Batch Calling'
+        };
+        return labels[service] || service.replace(/^aistein_/, '').replace(/^keplero_/, '').replace(/_/g, ' ');
+      };
+
+      const contactExecutionSummaries: Array<{
+        contactId: string;
+        name: string;
+        phone: string;
+        email: string;
+        completed: number;
+        skipped: number;
+        failed: number;
+        timeline: Array<{
+          nodeType: string;
+          service: string;
+          label: string;
+          status: 'completed' | 'skipped' | 'failed';
+          message: string;
+        }>;
+      }> = [];
+
       const sortedNodes = [...automation.nodes].sort((a, b) => a.position - b.position);
       console.log(`[Automation Engine] 📋 Total nodes to process: ${sortedNodes.length}`);
 
@@ -2218,17 +2353,26 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
         console.log(`[Automation Engine] ❌ Trigger criteria not met`);
         execution.status = 'failed';
         execution.errorMessage = 'Trigger criteria not met';
+        execution.actionData = {
+          humanSummary: {
+            headline: 'Automation did not run because trigger conditions were not met.',
+            event: triggerData?.event || 'unknown',
+            contacts: 0
+          }
+        };
         await execution.save();
         return;
       }
 
       const contactIds = Array.isArray(triggerData.contactIds) ? triggerData.contactIds : [triggerData.contactId].filter(Boolean);
       console.log(`[Automation Engine] 👥 Processing ${contactIds.length} contact(s)`);
+      const missingContacts: string[] = [];
 
       for (const contactId of contactIds) {
         let contact = await Customer.findById(contactId).lean();
         if (!contact) {
           console.log(`[Automation Engine] ⚠️  Contact ${contactId} not found, skipping`);
+          missingContacts.push(String(contactId));
           continue;
         }
 
@@ -2251,6 +2395,16 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
         }
 
         console.log(`\n[Automation Engine] 👤 Processing contact: ${contact.name} (${contact.email || 'no email'})`);
+        const timeline: Array<{
+          nodeType: string;
+          service: string;
+          label: string;
+          status: 'completed' | 'skipped' | 'failed';
+          message: string;
+        }> = [];
+        let completedCount = 0;
+        let skippedCount = 0;
+        let failedCount = 0;
 
         // Enrich context with conversation data (when trigger includes conversation_id)
         // so templates can reference {{conversation.summary}}, {{conversation.transcript_text}}, etc.
@@ -2315,6 +2469,7 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
         const context: IAutomationExecutionContext = {
           contact,
           triggerData: { ...triggerData, contactId },
+          automationId,
           organizationId,
           userId,
           now: new Date().toISOString(),
@@ -2346,19 +2501,51 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
             console.log(`[Automation Engine] ⏱️  Delaying for ${nodeConfig.delay} ${nodeConfig.delayUnit}`);
             await this.delay(nodeConfig.delay, nodeConfig.delayUnit);
             console.log(`[Automation Engine] ✅ Delay completed`);
+            completedCount++;
+            timeline.push({
+              nodeType: node.type,
+              service: node.service,
+              label: 'Delay',
+              status: 'completed',
+              message: `Waited for ${nodeConfig.delay} ${nodeConfig.delayUnit}`
+            });
           } else if (node.type === 'condition') {
             // Evaluate condition
             const conditionMet = await this.evaluateCondition(nodeConfig, context);
             console.log(`[Automation Engine] 🔍 Condition evaluation: ${conditionMet ? '✅ PASS' : '❌ FAIL'}`, nodeConfig);
 
             if (!conditionMet) {
+              skippedCount++;
+              timeline.push({
+                nodeType: node.type,
+                service: node.service,
+                label: 'Condition',
+                status: 'skipped',
+                message: 'Condition did not match, remaining actions skipped for this contact'
+              });
               console.log(`[Automation Engine] ⏭️  Condition not met, skipping remaining actions for this contact`);
               break; // Skip remaining nodes for this contact
             }
+            completedCount++;
+            timeline.push({
+              nodeType: node.type,
+              service: node.service,
+              label: 'Condition',
+              status: 'completed',
+              message: 'Condition matched'
+            });
           } else if (node.type === 'action') {
             const runner = this.actions.get(node.service);
             if (!runner) {
               console.log(`[Automation Engine] ⚠️  No runner found for ${node.service}, skipping`);
+              skippedCount++;
+              timeline.push({
+                nodeType: node.type,
+                service: node.service,
+                label: serviceLabel(node.service),
+                status: 'skipped',
+                message: 'Action handler not found'
+              });
               continue;
             }
 
@@ -2369,24 +2556,123 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
               if (res) {
                 if (res.success === false) {
                   console.log(`[Automation Engine] ❌ Action failed (continuing): ${node.service}`, res.error || res.reason);
+                  failedCount++;
+                  timeline.push({
+                    nodeType: node.type,
+                    service: node.service,
+                    label: serviceLabel(node.service),
+                    status: 'failed',
+                    message: String(res.error || res.reason || 'Action failed')
+                  });
                 } else if (res.status === 'skipped') {
                   console.log(`[Automation Engine] ⏭️  Action skipped: ${node.service} - ${res.reason}`);
+                  skippedCount++;
+                  timeline.push({
+                    nodeType: node.type,
+                    service: node.service,
+                    label: serviceLabel(node.service),
+                    status: 'skipped',
+                    message: String(res.reason || 'Skipped')
+                  });
                 } else if (res.status === 'completed' || res.success === true) {
                   console.log(`[Automation Engine] ✅ Action completed: ${node.service}`);
                   if (res.recipient) console.log(`[Automation Engine]    → Recipient: ${res.recipient}`);
+                  completedCount++;
+                  timeline.push({
+                    nodeType: node.type,
+                    service: node.service,
+                    label: serviceLabel(node.service),
+                    status: 'completed',
+                    message: String(res.reason || 'Completed')
+                  });
                 } else {
                   console.log(`[Automation Engine] ✅ Action result:`, res);
+                  completedCount++;
+                  timeline.push({
+                    nodeType: node.type,
+                    service: node.service,
+                    label: serviceLabel(node.service),
+                    status: 'completed',
+                    message: 'Completed'
+                  });
                 }
               } else {
                 console.log(`[Automation Engine] ✅ Action completed: ${node.service} (no return value)`);
+                completedCount++;
+                timeline.push({
+                  nodeType: node.type,
+                  service: node.service,
+                  label: serviceLabel(node.service),
+                  status: 'completed',
+                  message: 'Completed'
+                });
               }
             } catch (actionErr: any) {
               console.error(`[Automation Engine] ⚠️ Action threw (skipping node, continuing automation): ${node.service}`, actionErr.message);
+              failedCount++;
+              timeline.push({
+                nodeType: node.type,
+                service: node.service,
+                label: serviceLabel(node.service),
+                status: 'failed',
+                message: String(actionErr?.message || 'Action error')
+              });
             }
           }
         }
+
+        contactExecutionSummaries.push({
+          contactId: String(contactId),
+          name: String(contact?.name || triggerData?.freshContactData?.name || 'Unknown'),
+          phone: String(contact?.phone || triggerData?.freshContactData?.phone || ''),
+          email: String(contact?.email || triggerData?.freshContactData?.email || ''),
+          completed: completedCount,
+          skipped: skippedCount,
+          failed: failedCount,
+          timeline
+        });
       }
 
+      if (contactExecutionSummaries.length === 0) {
+        execution.status = 'failed';
+        execution.errorMessage = missingContacts.length > 0
+          ? `No valid contacts found for execution. Missing contact IDs: ${missingContacts.join(', ')}`
+          : 'No contacts available for execution';
+        execution.actionData = {
+          humanSummary: {
+            headline: 'Automation did not run any steps because no valid contact was available.',
+            event: triggerData?.event || 'manual',
+            contacts: 0,
+            totals: { completed: 0, skipped: 0, failed: 1 }
+          },
+          contacts: [],
+          missingContacts
+        };
+        await execution.save();
+        console.log(`[Automation Engine] ❌ No valid contacts for execution ${execution._id}`);
+        return;
+      }
+
+      const totals = contactExecutionSummaries.reduce(
+        (acc, c) => {
+          acc.completed += c.completed;
+          acc.skipped += c.skipped;
+          acc.failed += c.failed;
+          return acc;
+        },
+        { completed: 0, skipped: 0, failed: 0 }
+      );
+
+      execution.actionData = {
+        humanSummary: {
+          headline: `Automation ran for ${contactExecutionSummaries.length} contact(s): ${totals.completed} step(s) completed, ${totals.skipped} skipped, ${totals.failed} failed.`,
+          event: triggerData?.event || 'manual',
+          contacts: contactExecutionSummaries.length,
+          totals
+        },
+        contacts: contactExecutionSummaries,
+        missingContacts
+      };
       execution.status = 'success';
       await execution.save();
 

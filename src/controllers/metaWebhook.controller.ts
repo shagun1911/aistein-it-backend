@@ -2309,13 +2309,14 @@ export class MetaWebhookController {
         console.warn(`[Instagram Webhook] Could not check token permissions:`, debugError.message);
       }
 
-      // Build endpoint URL with access_token as query param (matches working test script)
-      // Instagram API uses graph.instagram.com
-      // Token is passed as query parameter (NOT Authorization header)
-      const graphHost = process.env.INSTAGRAM_GRAPH_HOST || 'https://graph.instagram.com';
-      const endpointUrl = new URL(`${graphHost}/v21.0/me/messages`);
-      endpointUrl.searchParams.set('access_token', accessToken);
-      console.log(`[Instagram Webhook] Endpoint: ${graphHost}/v21.0/me/messages?access_token=***`);
+      // Build candidate endpoints with access_token as query param.
+      // Primary host can be configured; if Meta returns transient OAuthException
+      // errors, fall back to the alternate Graph host.
+      const primaryGraphHost = process.env.INSTAGRAM_GRAPH_HOST || 'https://graph.instagram.com';
+      const fallbackGraphHost = primaryGraphHost.includes('graph.instagram.com')
+        ? 'https://graph.facebook.com'
+        : 'https://graph.instagram.com';
+      const endpointCandidates = [primaryGraphHost, fallbackGraphHost];
       console.log(`[Instagram Webhook] Recipient ID: ${senderId}`);
       console.log(`[Instagram Webhook] Message length: ${messageText.length} characters`);
 
@@ -2331,18 +2332,37 @@ export class MetaWebhookController {
 
       console.log(`[Instagram Webhook] Payload:`, JSON.stringify(payload, null, 2));
 
-      // Send message via Instagram Business Graph API
-      // POST /v21.0/me/messages?access_token=TOKEN
-      // Uses instagram_manage_messages permission (not instagram_business_manage_messages)
-      const response = await axios.post(
-        endpointUrl.toString(),
-        payload,
-        {
-          headers: {
-            'Content-Type': 'application/json'
+      // Send message via Instagram Business Graph API with host fallback.
+      let response: any;
+      let lastError: any;
+      for (let i = 0; i < endpointCandidates.length; i++) {
+        const graphHost = endpointCandidates[i];
+        const endpointUrl = new URL(`${graphHost}/v21.0/me/messages`);
+        endpointUrl.searchParams.set('access_token', accessToken);
+        console.log(`[Instagram Webhook] Endpoint attempt ${i + 1}/${endpointCandidates.length}: ${graphHost}/v21.0/me/messages?access_token=***`);
+
+        try {
+          response = await axios.post(
+            endpointUrl.toString(),
+            payload,
+            {
+              headers: {
+                'Content-Type': 'application/json'
+              }
+            }
+          );
+          break;
+        } catch (sendErr: any) {
+          lastError = sendErr;
+          const code = sendErr?.response?.data?.error?.code;
+          const msg = sendErr?.response?.data?.error?.message || sendErr.message;
+          console.warn(`[Instagram Webhook] Send attempt ${i + 1} failed (code: ${code ?? 'N/A'}): ${msg}`);
+          if (i < endpointCandidates.length - 1) {
+            console.warn('[Instagram Webhook] Retrying with alternate Graph host...');
           }
         }
-      );
+      }
+      if (!response) throw lastError;
 
       console.log(`[Instagram Webhook] ✅ Instagram reply sent successfully`);
       console.log(`[Instagram Webhook] Response:`, JSON.stringify(response.data, null, 2));

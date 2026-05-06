@@ -1128,18 +1128,24 @@ export class AutomationEngine {
         let connectedGmailEmail = '';
         try {
           const googleIntegration = await GoogleIntegration.findOne({
-            organizationId: context.organizationId,
             status: 'active',
-            'services.gmail': true
+            'services.gmail': true,
+            $or: [
+              { organizationId: context.organizationId },
+              { userId: context.userId }
+            ]
           }).select('googleProfile.email').lean();
 
           if (googleIntegration?.googleProfile?.email) {
             connectedGmailEmail = String(googleIntegration.googleProfile.email).trim();
           } else {
             const gmailSocial = await SocialIntegration.findOne({
-              organizationId: context.organizationId,
               platform: 'gmail',
-              status: 'connected'
+              status: 'connected',
+              $or: [
+                { organizationId: context.organizationId },
+                { userId: context.userId }
+              ]
             }).lean();
             const socialEmail =
               (gmailSocial as any)?.metadata?.email ||

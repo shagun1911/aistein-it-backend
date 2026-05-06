@@ -2349,6 +2349,7 @@ export class MetaWebhookController {
     integration: any,
     pageId: string
   ) {
+    console.log('[Instagram Webhook] 🔥 NEW CODE LOADED - Starting message processing');
     try {
       const messageId = message.mid;
       const messageText = message.text || '[Attachment]';

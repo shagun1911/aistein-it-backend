@@ -1579,13 +1579,22 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
         const extractionTypeNorm = String(extraction_type).toLowerCase();
         const extraction_prompt = config.extraction_prompt;
         const json_example = config.json_example && typeof config.json_example === 'object' ? config.json_example : undefined;
+        const schemaKeys = Object.keys(json_example || {}).map((k) => String(k).toLowerCase());
+        const APPOINTMENT_CORE_KEYS = new Set(['appointment_booked', 'date', 'time', 'confidence']);
+        const hasCustomSchemaFields = schemaKeys.some((k) => !APPOINTMENT_CORE_KEYS.has(k));
         // Stale UI/config often leaves extraction_prompt + json_example (e.g. lead: interested/occupation) on
         // "appointment" automations — that forced dynamic mode and returned wrong booleans. Use the dedicated
         // appointment LLM unless user explicitly opts in (dynamic_extraction) or extraction is non-appointment.
         const useDynamicSchema =
           !!extraction_prompt &&
           !!json_example &&
-          (config.dynamic_extraction === true || extractionTypeNorm !== 'appointment');
+          (
+            config.dynamic_extraction === true ||
+            extractionTypeNorm !== 'appointment' ||
+            // If schema asks for any non-core field (e.g. address/budget), honor it
+            // even for appointment extraction.
+            hasCustomSchemaFields
+          );
         const options = useDynamicSchema ? { extraction_prompt, json_example } : undefined;
 
         console.log(
@@ -1680,8 +1689,8 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           };
 
           context.extracted = {
-            ...(result.extracted_data || {}),
             ...(context.extracted || {}),
+            ...(result.extracted_data || {}),
             date: finalDate || undefined,
             time: resolvedTime || undefined,
             appointment_booked: finalBooked,

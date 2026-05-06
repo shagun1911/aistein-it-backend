@@ -92,13 +92,41 @@ export class AutomationEngine {
   private triggers: Map<string, TriggerHandler>;
   private actions: Map<string, ActionHandler>;
   private whatsappService: WhatsAppService;
+  // Cooldown tracking for inbound chatbox messages to prevent duplicate notifications
+  private recentConversationTriggers: Map<string, number>;
+  private readonly COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes cooldown
 
   constructor() {
     this.triggers = new Map();
     this.actions = new Map();
     this.whatsappService = new WhatsAppService();
+    this.recentConversationTriggers = new Map();
 
     this.registerHandlers();
+
+    // Clean up old cooldown entries every hour
+    setInterval(() => {
+      this.cleanupCooldownEntries();
+    }, 60 * 60 * 1000);
+  }
+
+  /**
+   * Clean up old cooldown entries to prevent memory leaks
+   */
+  private cleanupCooldownEntries() {
+    const now = Date.now();
+    const entriesToDelete: string[] = [];
+    
+    for (const [conversationId, timestamp] of this.recentConversationTriggers.entries()) {
+      if (now - timestamp > this.COOLDOWN_MS) {
+        entriesToDelete.push(conversationId);
+      }
+    }
+    
+    entriesToDelete.forEach(id => this.recentConversationTriggers.delete(id));
+    if (entriesToDelete.length > 0) {
+      console.log(`[Automation Engine] Cleaned up ${entriesToDelete.length} expired cooldown entries`);
+    }
   }
 
   /**
@@ -547,8 +575,28 @@ export class AutomationEngine {
     // Inbound Chatbox Message Trigger (Unified for Facebook, Instagram, WhatsApp)
     this.triggers.set('inbound_chatbox_message', {
       validate: async (config, data) => {
-        // Trigger fires when any inbound message is received from connected platforms
-        return data.event === 'message_received';
+        // Check if this is a message_received event
+        if (data.event !== 'message_received') {
+          return false;
+        }
+
+        // Apply cooldown to prevent duplicate notifications for rapid messages in the same conversation
+        const conversationId = data.conversationId;
+        if (conversationId) {
+          const lastTriggeredAt = this.recentConversationTriggers.get(conversationId);
+          const now = Date.now();
+
+          if (lastTriggeredAt && now - lastTriggeredAt < this.COOLDOWN_MS) {
+            console.log(`[Automation Engine] ⏭️ Skipping inbound_chatbox_message trigger for conversation ${conversationId} - cooldown active (${Math.round((this.COOLDOWN_MS - (now - lastTriggeredAt)) / 1000)}s remaining)`);
+            return false;
+          }
+
+          // Mark this conversation as recently triggered
+          this.recentConversationTriggers.set(conversationId, now);
+          console.log(`[Automation Engine] ✅ inbound_chatbox_message trigger allowed for conversation ${conversationId}`);
+        }
+
+        return true;
       }
     });
 

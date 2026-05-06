@@ -2459,6 +2459,38 @@ export class MetaWebhookController {
         }
       });
 
+      // Trigger automations for instagram_message (non-blocking)
+      const { automationEngine } = await import('../services/automationEngine.service');
+      
+      console.log('[Instagram Webhook] Triggering automations for message received...');
+      
+      const automationData = {
+        event: 'message_received',
+        platform: 'instagram',
+        instagramAccountId: recipientId,
+        senderId: senderId,
+        messageText: messageText,
+        contactId: customer._id.toString(),
+        conversationId: conversation._id.toString(),
+        organizationId: integration.organizationId.toString(),
+        userId: integration.userId.toString(),
+        contact: {
+          name: customer.name,
+          email: customer.email,
+          phone: customer.phone,
+          tags: customer.tags || []
+        }
+      };
+
+      const context = {
+        organizationId: integration.organizationId.toString(),
+        userId: integration.userId.toString()
+      };
+
+      // Trigger both specific Instagram and unified inbound chatbox automations
+      automationEngine.triggerByEvent('instagram_message', automationData, context).catch(err => console.error('[Instagram Webhook] Instagram automation trigger error:', err));
+      automationEngine.triggerByEvent('inbound_chatbox_message', automationData, context).catch(err => console.error('[Instagram Webhook] Inbound chatbox automation trigger error:', err));
+
       // Generate chatbot reply using Settings + AIBehavior ONLY
       if (conversation.isAiManaging) {
         // CRITICAL: userId MUST come from integration.userId (SINGLE SOURCE OF TRUTH)
@@ -2592,38 +2624,6 @@ export class MetaWebhookController {
           // Don't throw - we don't want to break the webhook flow
         }
       }
-
-      // Trigger automations for instagram_message (non-blocking)
-      const { automationEngine } = await import('../services/automationEngine.service');
-      
-      console.log('[Instagram Webhook] Triggering automations for message received...');
-      
-      const automationData = {
-        event: 'message_received',
-        platform: 'instagram',
-        instagramAccountId: recipientId,
-        senderId: senderId,
-        messageText: messageText,
-        contactId: customer._id.toString(),
-        conversationId: conversation._id.toString(),
-        organizationId: integration.organizationId.toString(),
-        userId: integration.userId.toString(),
-        contact: {
-          name: customer.name,
-          email: customer.email,
-          phone: customer.phone,
-          tags: customer.tags || []
-        }
-      };
-
-      const context = {
-        organizationId: integration.organizationId.toString(),
-        userId: integration.userId.toString()
-      };
-
-      // Trigger both specific Instagram and unified inbound chatbox automations
-      automationEngine.triggerByEvent('instagram_message', automationData, context).catch(err => console.error('[Instagram Webhook] Instagram automation trigger error:', err));
-      automationEngine.triggerByEvent('inbound_chatbox_message', automationData, context).catch(err => console.error('[Instagram Webhook] Inbound chatbox automation trigger error:', err));
 
     } catch (error) {
       console.error('[Instagram Webhook] Error handling message:', error);

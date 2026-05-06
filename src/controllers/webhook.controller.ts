@@ -207,6 +207,35 @@ export class WebhookController {
         console.error('[Webhook] Socket emit error:', socketError);
       }
 
+      // Trigger inbound chatbox automations
+      const { automationEngine } = await import('../services/automationEngine.service');
+      
+      const automationData = {
+        event: 'message_received',
+        platform: 'whatsapp',
+        phoneNumberId: phoneNumberId,
+        senderId: from,
+        messageText: messageText,
+        contactId: customer._id.toString(),
+        conversationId: conversation._id.toString(),
+        organizationId: integration.organizationId.toString(),
+        userId: integration.userId.toString(),
+        contact: {
+          name: customer.name,
+          email: customer.email,
+          phone: customer.phone,
+          tags: customer.tags || []
+        }
+      };
+
+      const context = {
+        organizationId: integration.organizationId.toString(),
+        userId: integration.userId.toString()
+      };
+
+      console.log('[Webhook] Triggering inbound chatbox automations for WhatsApp...');
+      automationEngine.triggerByEvent('inbound_chatbox_message', automationData, context).catch(err => console.error('[Webhook] Inbound chatbox automation trigger error:', err));
+
       // Trigger AI auto-reply if conversation is AI-managed
       if (conversation.isAiManaging) {
         console.log('[Webhook] Triggering AI auto-reply...');

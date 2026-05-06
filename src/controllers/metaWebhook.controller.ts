@@ -1767,8 +1767,9 @@ export class MetaWebhookController {
           console.log('[Messenger Webhook] ✅ Customer updated with extracted data');
 
           // Trigger automation with complete data
-          automationEngine.triggerByEvent('facebook_message', {
+          const automationData = {
             event: 'message_received',
+            platform: 'facebook',
             pageId: pageId,
             senderPsid: senderPsid,
             messageText: messageText,
@@ -1786,10 +1787,16 @@ export class MetaWebhookController {
             appointmentDate: extractedData.appointmentDate,
             appointmentTime: extractedData.appointmentTime,
             extractedData: extractedData
-          }, {
+          };
+
+          const context = {
             organizationId: conversation.organizationId.toString(),
             userId: integration.userId.toString()
-          }).catch(err => console.error('[Messenger Webhook] Automation trigger error:', err));
+          };
+
+          // Trigger both specific Facebook and unified inbound chatbox automations
+          automationEngine.triggerByEvent('facebook_message', automationData, context).catch(err => console.error('[Messenger Webhook] Facebook automation trigger error:', err));
+          automationEngine.triggerByEvent('inbound_chatbox_message', automationData, context).catch(err => console.error('[Messenger Webhook] Inbound chatbox automation trigger error:', err));
         } else {
           console.log('[Messenger Webhook] ⏳ Waiting for complete data before triggering automation...');
         }
@@ -2590,8 +2597,10 @@ export class MetaWebhookController {
       const { automationEngine } = await import('../services/automationEngine.service');
       
       console.log('[Instagram Webhook] Triggering automations for message received...');
-      automationEngine.triggerByEvent('instagram_message', {
+      
+      const automationData = {
         event: 'message_received',
+        platform: 'instagram',
         instagramAccountId: recipientId,
         senderId: senderId,
         messageText: messageText,
@@ -2605,10 +2614,16 @@ export class MetaWebhookController {
           phone: customer.phone,
           tags: customer.tags || []
         }
-      }, {
+      };
+
+      const context = {
         organizationId: integration.organizationId.toString(),
         userId: integration.userId.toString()
-      }).catch(err => console.error('[Instagram Webhook] Automation trigger error:', err));
+      };
+
+      // Trigger both specific Instagram and unified inbound chatbox automations
+      automationEngine.triggerByEvent('instagram_message', automationData, context).catch(err => console.error('[Instagram Webhook] Instagram automation trigger error:', err));
+      automationEngine.triggerByEvent('inbound_chatbox_message', automationData, context).catch(err => console.error('[Instagram Webhook] Inbound chatbox automation trigger error:', err));
 
     } catch (error) {
       console.error('[Instagram Webhook] Error handling message:', error);

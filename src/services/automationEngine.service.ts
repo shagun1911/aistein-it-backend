@@ -544,6 +544,14 @@ export class AutomationEngine {
       }
     });
 
+    // Inbound Chatbox Message Trigger (Unified for Facebook, Instagram, WhatsApp)
+    this.triggers.set('inbound_chatbox_message', {
+      validate: async (config, data) => {
+        // Trigger fires when any inbound message is received from connected platforms
+        return data.event === 'message_received';
+      }
+    });
+
     // ============ AISTEIN-IT ACTIONS ============
 
     // API Call Action

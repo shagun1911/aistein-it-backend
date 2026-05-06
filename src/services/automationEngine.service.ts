@@ -222,7 +222,7 @@ export class AutomationEngine {
       'http://localhost:3000'
     ).replace(/\/+$/, '');
     const conversationLink = externalConversationId
-      ? `${appBaseUrl}/conversations/${externalConversationId}`
+      ? `${appBaseUrl}/conversations?conversationId=${encodeURIComponent(externalConversationId)}`
       : '';
 
     // Public proxy URL on OUR backend — streams audio with Content-Disposition:
@@ -1188,7 +1188,9 @@ export class AutomationEngine {
           context.conversation?.id ||
           context.conversation?.conversation_id ||
           '';
-        const conversationLink = conversationId ? `${appBaseUrl}/conversations/${conversationId}` : '';
+        const conversationLink = conversationId
+          ? `${appBaseUrl}/conversations?conversationId=${encodeURIComponent(conversationId)}`
+          : '';
         if (conversationLink) {
           emailBody = emailBody.replace(/https?:\/\/yourcrm\.com\/conversations\/[^\s]+/gi, conversationLink);
         }

@@ -2186,7 +2186,9 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           await sheets.spreadsheets.values.append({
             spreadsheetId,
             range: sheetRangePrefix,
-            valueInputOption: 'USER_ENTERED',
+            // Keep rendered text stable (e.g. "2026-03-03 16:00") and avoid
+            // Sheets auto-converting it into serial numbers like 46091.66667.
+            valueInputOption: 'RAW',
             insertDataOption: 'INSERT_ROWS',
             requestBody: { values: [resolvedValues] }
           });

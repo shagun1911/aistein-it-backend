@@ -2474,20 +2474,25 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
 
       console.log(`[Automation Engine] ✅ Trigger validated: ${triggerNode.service}`);
 
-      const triggerConfig = this.convertConfigToPlainObject(triggerNode.config);
-      if (!(await triggerHandler.validate(triggerConfig, triggerData))) {
-        console.log(`[Automation Engine] ❌ Trigger criteria not met`);
-        execution.status = 'failed';
-        execution.errorMessage = 'Trigger criteria not met';
-        execution.actionData = {
-          humanSummary: {
-            headline: 'Automation did not run because trigger conditions were not met.',
-            event: triggerData?.event || 'unknown',
-            contacts: 0
-          }
-        };
-        await execution.save();
-        return;
+      const skipTriggerValidation = externalContext?.skipTriggerValidation === true;
+      if (skipTriggerValidation) {
+        console.log('[Automation Engine] ⏭️ Skipping trigger re-validation (already validated at event dispatch)');
+      } else {
+        const triggerConfig = this.convertConfigToPlainObject(triggerNode.config);
+        if (!(await triggerHandler.validate(triggerConfig, triggerData))) {
+          console.log(`[Automation Engine] ❌ Trigger criteria not met`);
+          execution.status = 'failed';
+          execution.errorMessage = 'Trigger criteria not met';
+          execution.actionData = {
+            humanSummary: {
+              headline: 'Automation did not run because trigger conditions were not met.',
+              event: triggerData?.event || 'unknown',
+              contacts: 0
+            }
+          };
+          await execution.save();
+          return;
+        }
       }
 
       const contactIds = Array.isArray(triggerData.contactIds) ? triggerData.contactIds : [triggerData.contactId].filter(Boolean);
@@ -2861,7 +2866,10 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           console.log(`[Automation Engine] 🚀 Starting async execution...`);
 
           const automationId = (automation._id as any).toString();
-          this.executeAutomation(automationId, eventData, context).catch(err => {
+          this.executeAutomation(automationId, eventData, {
+            ...(context || {}),
+            skipTriggerValidation: true
+          }).catch(err => {
             console.error(`[Automation Engine] ❌ Async failure for ${automation.name}:`, err.message);
           });
           results.push({ automationId, name: automation.name });

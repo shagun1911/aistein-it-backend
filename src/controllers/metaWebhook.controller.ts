@@ -2062,6 +2062,38 @@ export class MetaWebhookController {
         }
       });
 
+      // Trigger both specific Instagram and unified inbound chatbox automations
+      const { automationEngine } = await import('../services/automationEngine.service');
+      const automationData = {
+        event: 'message_received',
+        platform: 'instagram',
+        instagramAccountId,
+        senderId,
+        messageText,
+        contactId: customer._id.toString(),
+        conversationId: conversation._id.toString(),
+        organizationId: customerOrgId.toString(),
+        userId,
+        contact: {
+          name: customer.name,
+          email: customer.email,
+          phone: customer.phone,
+          tags: customer.tags || []
+        }
+      };
+      const automationContext = {
+        organizationId: customerOrgId.toString(),
+        userId
+      };
+
+      console.log('[Instagram Webhook] Triggering automations for message received...');
+      automationEngine.triggerByEvent('instagram_message', automationData, automationContext).catch(err =>
+        console.error('[Instagram Webhook] Instagram automation trigger error:', err)
+      );
+      automationEngine.triggerByEvent('inbound_chatbox_message', automationData, automationContext).catch(err =>
+        console.error('[Instagram Webhook] Inbound chatbox automation trigger error:', err)
+      );
+
       // Generate chatbot reply using Settings + AIBehavior ONLY
       // userId is already set above (from integration.userId)
       

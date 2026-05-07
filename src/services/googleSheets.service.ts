@@ -249,8 +249,21 @@ export class GoogleSheetsService {
       const oauth2Client = this.getOAuth2Client(integration.accessToken, integration.refreshToken);
       const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
 
-      const trimmed = (sheetName || 'Sheet1').trim() || 'Sheet1';
-      const range = `${this.escapeSheetTitleForA1(trimmed)}!1:1`;
+      const requestedTab = (sheetName || 'Sheet1').trim() || 'Sheet1';
+      const meta = await sheets.spreadsheets.get({ spreadsheetId });
+      const availableTabs = (meta.data.sheets || [])
+        .map((s: any) => String(s?.properties?.title || '').trim())
+        .filter(Boolean);
+      const fallbackTab = availableTabs[0] || 'Sheet1';
+      const resolvedTab = availableTabs.includes(requestedTab) ? requestedTab : fallbackTab;
+
+      if (resolvedTab !== requestedTab) {
+        console.warn(
+          `Google Sheets getHeaderRow: tab "${requestedTab}" not found, using "${resolvedTab}" instead`
+        );
+      }
+
+      const range = `${this.escapeSheetTitleForA1(resolvedTab)}!1:1`;
 
       const response = await sheets.spreadsheets.values.get({
         spreadsheetId,

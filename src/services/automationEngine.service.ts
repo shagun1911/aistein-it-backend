@@ -2164,10 +2164,21 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
 
           const sheetMeta = await sheets.spreadsheets.get({ spreadsheetId });
           const fallbackTab = sheetMeta.data.sheets?.[0]?.properties?.title || 'Sheet1';
-          const configured =
+          const configuredRaw =
             typeof (config as any).sheetName === 'string' && String((config as any).sheetName).trim() !== ''
               ? String((config as any).sheetName).trim()
               : fallbackTab;
+          const availableTabs = new Set(
+            (sheetMeta.data.sheets || [])
+              .map((s: any) => String(s?.properties?.title || '').trim())
+              .filter(Boolean)
+          );
+          const configured = availableTabs.has(configuredRaw) ? configuredRaw : fallbackTab;
+          if (configured !== configuredRaw) {
+            console.warn(
+              `[Automation Engine] ⚠️ Configured sheet tab "${configuredRaw}" not found in spreadsheet; falling back to "${configured}".`
+            );
+          }
           const escapeSheetTitleForA1 = (title: string): string => {
             const t = title.trim() || 'Sheet1';
             if (/^[A-Za-z0-9_]+$/.test(t)) return t;

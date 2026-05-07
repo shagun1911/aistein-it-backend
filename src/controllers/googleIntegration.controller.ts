@@ -54,10 +54,13 @@ export class GoogleIntegrationController {
         'https://www.googleapis.com/auth/userinfo.profile'
       ];
 
-      // Always include Drive.file (safer, doesn't require verification)
-      // This allows creating/uploading files but not accessing all Drive files
+      // Drive scopes:
+      // - drive.file keeps write access for files created/opened by this app
+      // - drive.metadata.readonly lets us list existing user spreadsheets reliably
+      //   across accounts (including files not originally created by this app)
       if (!services || services.includes('drive') || services.includes('sheets')) {
         scopes.push('https://www.googleapis.com/auth/drive.file');
+        scopes.push('https://www.googleapis.com/auth/drive.metadata.readonly');
       }
 
       // Sheets scope

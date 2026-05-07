@@ -208,9 +208,13 @@ export class GoogleSheetsService {
 
       const response = await drive.files.list({
         q: "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
-        fields: 'files(id, name)',
+        fields: 'files(id, name), nextPageToken',
         orderBy: 'modifiedTime desc',
-        pageSize: 50
+        pageSize: 100,
+        spaces: 'drive',
+        corpora: 'user',
+        includeItemsFromAllDrives: true,
+        supportsAllDrives: true
       });
 
       // Return only { id, name } as requested

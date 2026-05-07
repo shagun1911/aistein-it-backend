@@ -130,6 +130,26 @@ export class AutomationEngine {
   }
 
   /**
+   * `{{conversation_id}}` prefers the provider's external id (e.g. ElevenLabs `conv_…`)
+   * for recording links, but `Conversation.findById` only accepts our Mongo `_id`.
+   * Map a template-resolved id to the document id used in the database.
+   */
+  private mongoConversationIdForExtraction(
+    resolvedFromTemplate: string | undefined,
+    context: IAutomationExecutionContext
+  ): string | undefined {
+    const cand = resolvedFromTemplate != null ? String(resolvedFromTemplate).trim() : '';
+    const mongo24 = /^[a-fA-F0-9]{24}$/;
+    if (mongo24.test(cand)) return cand;
+    const fallback =
+      (context.conversation?.id != null && String(context.conversation.id).trim()) ||
+      (context.triggerData?.conversation_id != null && String(context.triggerData.conversation_id).trim()) ||
+      '';
+    if (fallback && mongo24.test(fallback)) return fallback;
+    return undefined;
+  }
+
+  /**
    * Resolve dynamic variables in text using the automation context.
    *
    * Supported template syntaxes (all of these work for the same value):
@@ -953,7 +973,9 @@ export class AutomationEngine {
       execute: async (config, triggerData, context: IAutomationExecutionContext) => {
         const conversationIdRaw = config.conversation_id || '{{conversation_id}}';
         const resolvedConvId = await this.resolveTemplate(conversationIdRaw, context);
-        const conversationId = resolvedConvId || triggerData.conversation_id;
+        const conversationId =
+          this.mongoConversationIdForExtraction(resolvedConvId || triggerData.conversation_id, context) ||
+          '';
         const extractionType = config.extraction_type || 'appointment';
         const extraction_prompt = config.extraction_prompt;
         const json_example = config.json_example && typeof config.json_example === 'object' ? config.json_example : undefined;
@@ -1754,6 +1776,23 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           };
         }
 
+        const mongoConversationId = this.mongoConversationIdForExtraction(
+          resolvedConvId || triggerData.conversation_id,
+          context
+        );
+        if (!mongoConversationId) {
+          console.warn(
+            `[Automation Engine] ⚠️ Template resolved to external id "${resolvedConvId}" but no MongoDB conversation id found on the trigger/context; cannot load transcript. Skipping extraction.`
+          );
+          context.appointment = { booked: false };
+          return {
+            success: true,
+            appointment_booked: false,
+            error: 'No MongoDB conversation id for extraction',
+            skipped: true
+          };
+        }
+
         const extraction_type = config.extraction_type || 'appointment';
         const extractionTypeNorm = String(extraction_type).toLowerCase();
         const extraction_prompt = config.extraction_prompt;
@@ -1777,14 +1816,16 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
         const options = useDynamicSchema ? { extraction_prompt, json_example } : undefined;
 
         console.log(
-          `[Automation Engine] 🧠 Extracting data from conversation: ${resolvedConvId}`,
+          `[Automation Engine] 🧠 Extracting data from conversation: ${mongoConversationId}${
+            resolvedConvId !== mongoConversationId ? ` (external: ${resolvedConvId})` : ''
+          }`,
           options ? '(dynamic)' : `(${extraction_type})`
         );
 
         try {
           const { automationService } = await import('./automation.service');
           const result = await automationService.extractConversationData(
-            resolvedConvId,
+            mongoConversationId,
             extraction_type,
             context.organizationId,
             options

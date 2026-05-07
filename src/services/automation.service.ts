@@ -312,7 +312,14 @@ export class AutomationService {
         Conversation = (await import('../models/Conversation')).default;
       }
 
-      const conversation = await Conversation.findById(conversationId).lean();
+      const cid = String(conversationId ?? '').trim();
+      const mongo24 = /^[a-fA-F0-9]{24}$/;
+      let conversation: any = mongo24.test(cid)
+        ? await Conversation.findById(cid).lean()
+        : await Conversation.findOne({
+            organizationId,
+            'metadata.conversation_id': cid
+          }).lean();
 
       if (!conversation) {
         return {
@@ -346,9 +353,11 @@ export class AutomationService {
       }
 
       // Fallback: build transcript from Message collection (batch sync saves messages separately)
+      const docId = String(conversation._id);
+
       if (!transcriptText || transcriptText.trim().length === 0) {
         const Message = (await import('../models/Message')).default;
-        const messages = await Message.find({ conversationId })
+        const messages = await Message.find({ conversationId: docId })
           .sort({ timestamp: 1 })
           .lean();
         if (messages && messages.length > 0) {
@@ -490,11 +499,11 @@ Respond ONLY with valid JSON:
         const transcriptTurns = Array.isArray(transcript) ? transcript.length : (transcript.messages?.length ?? 0);
         const durationSeconds = conversation.duration_seconds ?? conversation.duration ?? 0;
 
-        console.log('[Automation Service] Dynamic extraction result:', { conversationId, extracted_data });
+        console.log('[Automation Service] Dynamic extraction result:', { conversationId: docId, externalId: cid !== docId ? cid : undefined, extracted_data });
 
         return {
           success: true,
-          conversation_id: conversationId,
+          conversation_id: docId,
           extraction_type: extractionType || 'custom',
           extracted_data,
           transcript_turns: transcriptTurns,
@@ -503,7 +512,7 @@ Respond ONLY with valid JSON:
         };
       }
 
-      console.log('[Automation Service] Extracted data from conversation:', { conversationId, extractedData: parsed });
+      console.log('[Automation Service] Extracted data from conversation:', { conversationId: docId, externalId: cid !== docId ? cid : undefined, extractedData: parsed });
 
       return {
         success: true,

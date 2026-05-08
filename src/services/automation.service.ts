@@ -79,23 +79,78 @@ function followingWeekdayIso(base: Date, targetWeekday: number): string {
 function resolveRelativeDateFromTranscript(transcriptText: string, base: Date): string | null {
   const text = transcriptText.toLowerCase();
   const weekdays = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as const;
+  const weekdaysIt = ['domenica', 'lunedi', 'martedi', 'mercoledi', 'giovedi', 'venerdi', 'sabato'] as const;
+  const normalize = (s: string) =>
+    s
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  const normalized = normalize(text);
 
-  if (/\bday\s+after\s+tomorrow\b/.test(text)) return formatIsoDate(addDays(base, 2));
-  if (/\btomorrow\b|\bnext\s+day\b/.test(text)) return formatIsoDate(addDays(base, 1));
-  if (/\btoday\b/.test(text)) return formatIsoDate(base);
+  if (/\bday\s+after\s+tomorrow\b/.test(normalized) || /\bdopodomani\b/.test(normalized)) return formatIsoDate(addDays(base, 2));
+  if (/\btomorrow\b|\bnext\s+day\b/.test(normalized) || /\bdomani\b/.test(normalized)) return formatIsoDate(addDays(base, 1));
+  if (/\btoday\b/.test(normalized) || /\boggi\b/.test(normalized)) return formatIsoDate(base);
 
-  const nextWeekdayMatch = text.match(/\bnext\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  const nextWeekdayMatch = normalized.match(/\bnext\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
   if (nextWeekdayMatch?.[1]) {
     const idx = weekdays.indexOf(nextWeekdayMatch[1] as (typeof weekdays)[number]);
     if (idx >= 0) return followingWeekdayIso(base, idx);
   }
+  const prossimoWeekdayMatch = normalized.match(/\bprossim[oa]\s+(domenica|lunedi|martedi|mercoledi|giovedi|venerdi|sabato)\b/);
+  if (prossimoWeekdayMatch?.[1]) {
+    const idx = weekdaysIt.indexOf(prossimoWeekdayMatch[1] as (typeof weekdaysIt)[number]);
+    if (idx >= 0) return followingWeekdayIso(base, idx);
+  }
 
-  const nearestWeekdayMatch = text.match(/\b(?:this\s+|on\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  const nearestWeekdayMatch = normalized.match(/\b(?:this\s+|on\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
   if (nearestWeekdayMatch?.[1]) {
     const idx = weekdays.indexOf(nearestWeekdayMatch[1] as (typeof weekdays)[number]);
     if (idx >= 0) return nearestWeekdayIso(base, idx);
   }
+  const nearestWeekdayMatchIt = normalized.match(/\b(?:quest[oa]\s+|di\s+)?(domenica|lunedi|martedi|mercoledi|giovedi|venerdi|sabato)\b/);
+  if (nearestWeekdayMatchIt?.[1]) {
+    const idx = weekdaysIt.indexOf(nearestWeekdayMatchIt[1] as (typeof weekdaysIt)[number]);
+    if (idx >= 0) return nearestWeekdayIso(base, idx);
+  }
 
+  return null;
+}
+
+function resolveTimeFromTranscript(transcriptText: string): string | null {
+  const text = transcriptText.toLowerCase();
+  const normalize = (s: string) =>
+    s
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  const normalized = normalize(text);
+
+  const numericMatches = [...normalized.matchAll(/\b(?:alle|at)?\s*(\d{1,2})([:.](\d{2}))?\s*(am|pm)?\b/g)];
+  if (numericMatches.length > 0) {
+    const last = numericMatches[numericMatches.length - 1];
+    let hour = Number(last[1]);
+    const minute = Number(last[3] || '00');
+    const meridiem = (last[4] || '').toLowerCase();
+    if (Number.isFinite(hour) && Number.isFinite(minute) && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+      if (meridiem === 'pm' && hour < 12) hour += 12;
+      if (meridiem === 'am' && hour === 12) hour = 0;
+      return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+    }
+  }
+
+  const italianHours: Record<string, number> = {
+    zero: 0, una: 1, uno: 1, due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9, dieci: 10,
+    undici: 11, dodici: 12, tredici: 13, quattordici: 14, quindici: 15, sedici: 16, diciassette: 17, diciotto: 18,
+    diciannove: 19, venti: 20, ventuno: 21, ventidue: 22, ventitre: 23
+  };
+  const wordMatches = [...normalized.matchAll(/\b(?:alle|ore)\s+(zero|una|uno|due|tre|quattro|cinque|sei|sette|otto|nove|dieci|undici|dodici|tredici|quattordici|quindici|sedici|diciassette|diciotto|diciannove|venti|ventuno|ventidue|ventitre)\b/g)];
+  if (wordMatches.length > 0) {
+    const w = wordMatches[wordMatches.length - 1][1];
+    const hour = italianHours[w];
+    if (hour != null) return `${String(hour).padStart(2, '0')}:00`;
+  }
   return null;
 }
 
@@ -548,8 +603,12 @@ Respond ONLY with valid JSON:
         if (coerced !== undefined) parsed.appointment_booked = coerced;
       }
       const resolvedRelativeDate = resolveRelativeDateFromTranscript(transcriptText, now);
+      const resolvedRelativeTime = resolveTimeFromTranscript(transcriptText);
       if (resolvedRelativeDate && extractionType === 'appointment') {
         parsed.date = resolvedRelativeDate;
+      }
+      if (resolvedRelativeTime && extractionType === 'appointment' && (parsed.time == null || String(parsed.time).trim() === '')) {
+        parsed.time = resolvedRelativeTime;
       }
 
       if (useDynamicExtraction && options.json_example) {
@@ -574,6 +633,14 @@ Respond ONLY with valid JSON:
             }
           }
         }
+        if (resolvedRelativeTime) {
+          const timeLikeKeys = ['time', 'appointment_time', 'preferred_time', 'appointmentTime', 'preferredTime'];
+          for (const k of timeLikeKeys) {
+            if (k in extracted_data) {
+              extracted_data[k] = resolvedRelativeTime;
+            }
+          }
+        }
         // If we have city and country, remove separate address field (city + country is our address)
         const hasCity = extracted_data.city != null && String(extracted_data.city).trim() !== '';
         const hasCountry = extracted_data.country != null && String(extracted_data.country).trim() !== '';
@@ -590,6 +657,8 @@ Respond ONLY with valid JSON:
           conversation_id: conversationId,
           extraction_type: extractionType || 'custom',
           extracted_data,
+          date: resolvedRelativeDate || null,
+          time: resolvedRelativeTime || null,
           transcript_turns: transcriptTurns,
           duration_seconds: durationSeconds,
           method: 'llm'

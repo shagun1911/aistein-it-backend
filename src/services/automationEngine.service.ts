@@ -292,6 +292,20 @@ export class AutomationEngine {
     const resolvedAddress =
       fallbackAddressCandidates.length > 0 ? String(fallbackAddressCandidates[0]) : 'Not Provided';
 
+    const fallbackCityCandidates = [
+      ex.city,
+      ex.customer_city,
+      ex.home_city,
+      context.triggerData?.dynamic_variables?.city,
+      context.triggerData?.dynamic_variables?.customer_city,
+      context.triggerData?.freshContactData?.city,
+      context.contact?.customProperties?.city,
+      context.contact?.metadata?.city,
+      context.contact?.city
+    ].filter(isMeaningful);
+    const resolvedCity =
+      fallbackCityCandidates.length > 0 ? String(fallbackCityCandidates[0]) : 'Not Provided';
+
     const fallbackEmailCandidates = [
       contactEmail,
       ex.email,
@@ -374,6 +388,7 @@ export class AutomationEngine {
       phone: resolvedPhone,
       phone_number: resolvedPhone,
       address: resolvedAddress,
+      city: resolvedCity,
       created_time: context.now,
       formatted_now: formattedNow,
       recording_link: recordingLink,
@@ -2096,7 +2111,8 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           { header: 'Email', template: '{{email}}' },
           { header: 'Phone Number', template: '{{phone}}' },
           { header: 'Appointment Date & Time', template: '{{appointment_datetime}}' },
-          { header: 'Call Recording', template: '{{recording_link}}' }
+          { header: 'Call Recording', template: '{{recording_link}}' },
+          { header: 'City', template: '{{city}}' }
         ];
 
         // Keys already covered by FIXED_COLUMNS (so smart merge skips them).
@@ -2109,6 +2125,9 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           'full_address',
           'customer_address',
           'home_address',
+          'city',
+          'customer_city',
+          'home_city',
           'email',
           'customer_email',
           'phone',
@@ -2227,6 +2246,7 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
               appointment_time: 'Appointment Time',
               appointment_datetime: 'Appointment Date & Time',
               address: 'Address',
+              city: 'City',
               email: 'Email',
               phone: 'Phone Number',
               phone_number: 'Phone Number',
@@ -2252,7 +2272,7 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           let rowPlan: { header: string; template: string }[];
           if (useFixedFormat) {
             // Strict: only the user-selected extra fields get appended.
-            // The 6 fixed columns are always there; nothing else is added unless
+            // The fixed columns are always there; nothing else is added unless
             // the user explicitly ticks it in the "Extra extracted fields" panel.
             const allExtraKeys = Array.from(new Set<string>(extraExtractedKeys))
               .filter((k) => k && !COVERED_EXTRACTED_KEYS.has(String(k).toLowerCase()));
@@ -2305,7 +2325,8 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
             'email',
             'phone number',
             'appointment date & time',
-            'call recording'
+            'call recording',
+            'city'
           ]);
           const existingNormalized = existingHeaders
             .map((h: any) => normalize(String(h || '')))

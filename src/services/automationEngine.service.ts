@@ -607,6 +607,19 @@ export class AutomationEngine {
       }
     });
 
+    // WhatsApp Message Trigger
+    this.triggers.set('whatsapp_message', {
+      validate: async (config, data) => {
+        // Trigger fires when a message is received on WhatsApp
+        if (data.event !== 'message_received') return false;
+
+        // If phoneNumberId is configured, match it
+        if (config.phoneNumberId && data.phoneNumberId !== config.phoneNumberId) return false;
+
+        return true;
+      }
+    });
+
 
     this.triggers.set('shopify_order', {
       validate: async (config, data) => {

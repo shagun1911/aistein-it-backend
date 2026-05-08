@@ -935,6 +935,41 @@ export class MetaWebhookController {
         }
       });
 
+      // Trigger WhatsApp and unified inbound chatbox automations immediately on inbound message.
+      // Keep this independent from AI reply flow so automations still run even if AI is disabled/errors.
+      try {
+        const { automationEngine } = await import('../services/automationEngine.service');
+        const automationData = {
+          event: 'message_received',
+          platform: 'whatsapp',
+          phoneNumberId,
+          messageText,
+          contactId: customer._id.toString(),
+          conversationId: conversation._id.toString(),
+          organizationId: integration.organizationId.toString(),
+          userId: integration.userId.toString(),
+          contact: {
+            name: customer.name,
+            email: customer.email,
+            phone: customer.phone,
+            tags: customer.tags || []
+          }
+        };
+        const context = {
+          organizationId: integration.organizationId.toString(),
+          userId: integration.userId.toString()
+        };
+
+        automationEngine
+          .triggerByEvent('whatsapp_message', automationData, context)
+          .catch(err => console.error('[WhatsApp Webhook] WhatsApp automation trigger error:', err));
+        automationEngine
+          .triggerByEvent('inbound_chatbox_message', automationData, context)
+          .catch(err => console.error('[WhatsApp Webhook] Inbound chatbox automation trigger error:', err));
+      } catch (triggerError: any) {
+        console.error('[WhatsApp Webhook] Failed to initialize automation trigger:', triggerError.message);
+      }
+
       // Generate chatbot reply using Settings + AIBehavior ONLY
       if (conversation.isAiManaging) {
         // CRITICAL: userId MUST come from integration.userId (SINGLE SOURCE OF TRUTH)
@@ -1543,15 +1578,21 @@ export class MetaWebhookController {
         return; // Exit after sending fallback
       }
 
-      // 2. CHECK FOR ACTIVE AUTOMATIONS - If active, AI should collect contact details
+      // 2. CHECK FOR ACTIVE AUTOMATIONS
       const Automation = (await import('../models/Automation')).default;
-      const activeAutomation = await Automation.findOne({
+      const activeFacebookAutomation = await Automation.findOne({
         userId: new mongoose.Types.ObjectId(userId),
         isActive: true,
         'nodes.service': 'facebook_message'
       });
+      const activeInboundChatboxAutomation = await Automation.findOne({
+        userId: new mongoose.Types.ObjectId(userId),
+        isActive: true,
+        'nodes.service': 'inbound_chatbox_message'
+      });
 
-      console.log('[Messenger Webhook] Active facebook_message automation:', activeAutomation ? 'YES' : 'NO');
+      console.log('[Messenger Webhook] Active facebook_message automation:', activeFacebookAutomation ? 'YES' : 'NO');
+      console.log('[Messenger Webhook] Active inbound_chatbox_message automation:', activeInboundChatboxAutomation ? 'YES' : 'NO');
 
       // 3. SYSTEM PROMPT: Fetch from AIBehavior using userId ONLY
       const aiBehavior = await aiBehaviorService.get(userId);
@@ -1568,8 +1609,8 @@ export class MetaWebhookController {
       const hasDate = !!existingExtractedData.appointmentDate;
       const hasTime = !!existingExtractedData.appointmentTime;
 
-      // If automation is active, modify system prompt to collect required information
-      if (activeAutomation) {
+      // If Facebook-specific automation is active, modify system prompt to collect required information
+      if (activeFacebookAutomation) {
         console.log('[Messenger Webhook] 🤖 Automation is active - AI will collect contact details');
         console.log('[Messenger Webhook] Existing data:', {
           hasName,
@@ -1737,8 +1778,40 @@ export class MetaWebhookController {
         }
       });
 
-      // If automation is active, extract contact data and trigger automation when ready
-      if (activeAutomation) {
+      const hasAnyAutomation = Boolean(activeFacebookAutomation || activeInboundChatboxAutomation);
+
+      // Trigger inbound chatbox automation immediately on each inbound message.
+      // This trigger is generic and should not wait for contact extraction completeness.
+      if (activeInboundChatboxAutomation) {
+        const { automationEngine } = await import('../services/automationEngine.service');
+        const inboundAutomationData = {
+          event: 'message_received',
+          platform: 'facebook',
+          pageId: pageId,
+          senderPsid: senderPsid,
+          messageText: messageText,
+          contactId: customer._id.toString(),
+          conversationId: conversation._id.toString(),
+          organizationId: conversation.organizationId.toString(),
+          userId: integration.userId.toString(),
+          contact: {
+            name: customer.name,
+            email: customer.email,
+            phone: customer.phone,
+            tags: customer.tags || []
+          }
+        };
+        const inboundContext = {
+          organizationId: conversation.organizationId.toString(),
+          userId: integration.userId.toString()
+        };
+        automationEngine
+          .triggerByEvent('inbound_chatbox_message', inboundAutomationData, inboundContext)
+          .catch(err => console.error('[Messenger Webhook] Inbound chatbox automation trigger error:', err));
+      }
+
+      // For Facebook-specific automation, extract contact data and trigger only when ready.
+      if (activeFacebookAutomation) {
         console.log('[Messenger Webhook] 📊 Extracting contact data from conversation...');
         
         const conversationExtractionService = (await import('../services/conversationExtraction.service')).default;
@@ -1794,14 +1867,15 @@ export class MetaWebhookController {
             userId: integration.userId.toString()
           };
 
-          // Trigger both specific Facebook and unified inbound chatbox automations
+          // Trigger Facebook-specific automation when contact extraction is complete.
           automationEngine.triggerByEvent('facebook_message', automationData, context).catch(err => console.error('[Messenger Webhook] Facebook automation trigger error:', err));
-          automationEngine.triggerByEvent('inbound_chatbox_message', automationData, context).catch(err => console.error('[Messenger Webhook] Inbound chatbox automation trigger error:', err));
         } else {
-          console.log('[Messenger Webhook] ⏳ Waiting for complete data before triggering automation...');
+          console.log('[Messenger Webhook] ⏳ Waiting for complete data before triggering facebook_message automation...');
         }
       } else {
-        console.log('[Messenger Webhook] No active automation - skipping trigger');
+        if (!hasAnyAutomation) {
+          console.log('[Messenger Webhook] No active automation - skipping trigger');
+        }
       }
 
     } catch (error: any) {

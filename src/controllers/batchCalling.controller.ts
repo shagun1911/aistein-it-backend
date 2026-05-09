@@ -804,6 +804,9 @@ export class BatchCallingController {
     try {
       const { jobId } = req.params;
 
+      console.log('[Batch Calling Controller] ===== RETRY BATCH JOB REQUEST =====');
+      console.log('[Batch Calling Controller] Job ID:', jobId);
+
       if (!jobId) {
         return res.status(400).json({
           success: false,
@@ -825,6 +828,7 @@ export class BatchCallingController {
       const batchCall = await BatchCall.findOne({ batch_call_id: jobId, organizationId }).lean();
 
       if (!batchCall) {
+        console.log('[Batch Calling Controller] ❌ Batch call not found for job ID:', jobId);
         return res.status(404).json({
           success: false,
           error: {
@@ -834,19 +838,34 @@ export class BatchCallingController {
         });
       }
 
+      console.log('[Batch Calling Controller] Found batch call:', {
+        batch_call_id: batchCall.batch_call_id,
+        name: batchCall.name,
+        current_status: batchCall.status
+      });
+
       const result = await batchCallingService.retryBatchJob(jobId);
+
+      console.log('[Batch Calling Controller] ✅ Retry API call successful:', {
+        job_id: jobId,
+        new_status: result.status,
+        total_calls_scheduled: result.total_calls_scheduled,
+        total_calls_finished: result.total_calls_finished
+      });
 
       try {
         await BatchCall.updateOne(
           { batch_call_id: jobId },
           { $set: { status: result.status || 'in_progress', last_updated_at_unix: Math.floor(Date.now() / 1000) } }
         );
+        console.log('[Batch Calling Controller] ✅ Database status updated to:', result.status || 'in_progress');
       } catch (dbError: any) {
         console.warn('[Batch Calling Controller] ⚠️ Failed to update retried batch status in database:', dbError.message);
       }
 
       res.status(200).json(result);
     } catch (error) {
+      console.error('[Batch Calling Controller] ❌ Retry batch job error:', error);
       next(error);
     }
   }

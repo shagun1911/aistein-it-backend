@@ -797,6 +797,61 @@ export class BatchCallingController {
   }
 
   /**
+   * Retry batch job (failed and no-response recipients)
+   * POST /api/v1/batch-calling/:jobId/retry
+   */
+  async retryBatchJob(req: AuthRequest, res: Response, next: NextFunction) {
+    try {
+      const { jobId } = req.params;
+
+      if (!jobId) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'MISSING_JOB_ID', message: 'Job ID is required' }
+        });
+      }
+
+      const BatchCall = (await import('../models/BatchCall')).default;
+      const organizationId = await resolveOrganizationObjectId(req);
+
+      if (!organizationId) {
+        return res.status(401).json({
+          success: false,
+          error: "Unauthorized",
+          detail: "Organization ID or User ID not found"
+        });
+      }
+
+      const batchCall = await BatchCall.findOne({ batch_call_id: jobId, organizationId }).lean();
+
+      if (!batchCall) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: 'BATCH_CALL_NOT_FOUND',
+            message: 'Batch call not found or does not belong to your organization'
+          }
+        });
+      }
+
+      const result = await batchCallingService.retryBatchJob(jobId);
+
+      try {
+        await BatchCall.updateOne(
+          { batch_call_id: jobId },
+          { $set: { status: result.status || 'in_progress', last_updated_at_unix: Math.floor(Date.now() / 1000) } }
+        );
+      } catch (dbError: any) {
+        console.warn('[Batch Calling Controller] ⚠️ Failed to update retried batch status in database:', dbError.message);
+      }
+
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
    * Get all batch calls for the user's organization
    * GET /api/v1/batch-calling
    * Syncs status from Python API for each batch call

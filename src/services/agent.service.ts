@@ -89,6 +89,12 @@ export interface CreateAgentResponse {
   agent_id: string;
 }
 
+export interface HumanTransferRule {
+  condition: string;
+  phone_number: string;
+  transfer_type: string;
+}
+
 export interface UpdateAgentPromptRequest {
   first_message: string;
   system_prompt: string;
@@ -97,6 +103,9 @@ export interface UpdateAgentPromptRequest {
   voice_id?: string;
   escalationRules?: string[];
   knowledge_base_ids: string[];
+  built_in_tools?: { end_call?: boolean; language_detection?: boolean; voicemail_detection?: boolean };
+  enable_human_transfer?: boolean;
+  human_transfer_rules?: HumanTransferRule[];
   // tool_ids are automatically added from env variables, not required in request
 }
 
@@ -634,18 +643,40 @@ export class AgentService {
     const userPrompt = (data.system_prompt || '').trim();
     const systemPromptToSend = `${WOOCOMMERCE_MASTER_PROMPT}\n\n${userPrompt}${COLLECT_ONLY_INSTRUCTION}`;
 
+    // Build built_in_tools object — only include keys that are enabled
+    const builtInToolsConfig = data.built_in_tools ?? { end_call: true };
+    const builtInToolsPayload: Record<string, any> = {};
+    if (builtInToolsConfig.end_call !== false) {
+      builtInToolsPayload.end_call = { name: 'end_call', params: { system_tool_type: 'end_call' } };
+    }
+    if (builtInToolsConfig.language_detection) {
+      builtInToolsPayload.language_detection = { name: 'language_detection', params: { system_tool_type: 'language_detection' } };
+    }
+    if (builtInToolsConfig.voicemail_detection) {
+      builtInToolsPayload.voicemail_detection = { name: 'voicemail_detection', params: { system_tool_type: 'voicemail_detection' } };
+    }
+
     const requestBody: any = {
       first_message: firstMessageToSend,
       system_prompt: systemPromptToSend,
       language: data.language,
       knowledge_base_ids: validKnowledgeBaseIds,
       tool_ids: toolIds,
+      built_in_tools: builtInToolsPayload,
     };
 
     // CRITICAL: Always include voice_id if provided (even if empty string)
     // This ensures ElevenLabs gets the voice_id update
     if (data.voice_id !== undefined) {
       requestBody.voice_id = data.voice_id;
+    }
+
+    if (data.enable_human_transfer !== undefined) {
+      requestBody.enable_human_transfer = data.enable_human_transfer;
+    }
+
+    if (data.enable_human_transfer && data.human_transfer_rules && data.human_transfer_rules.length > 0) {
+      requestBody.human_transfer_rules = data.human_transfer_rules;
     }
 
     const logContext = (action: string) => ({
@@ -717,6 +748,9 @@ export class AgentService {
       agent.voice_id = data.voice_id;
 
       if (data.escalationRules !== undefined) agent.escalationRules = data.escalationRules;
+      if (data.built_in_tools !== undefined) agent.built_in_tools = data.built_in_tools;
+      if (data.enable_human_transfer !== undefined) agent.enable_human_transfer = data.enable_human_transfer;
+      if (data.human_transfer_rules !== undefined) agent.human_transfer_rules = data.human_transfer_rules;
 
       console.log('[Agent Service] 🎤 Saving voice_id to database:', {
         agent_id: agentId,

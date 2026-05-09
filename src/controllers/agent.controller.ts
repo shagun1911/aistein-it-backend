@@ -124,7 +124,10 @@ export class AgentController {
         voice_id,
         greeting_message,
         escalationRules,
-        knowledge_base_ids
+        knowledge_base_ids,
+        built_in_tools,
+        enable_human_transfer,
+        human_transfer_rules
       } = req.body;
 
       // Validation
@@ -167,7 +170,10 @@ export class AgentController {
         voice_id: voice_id?.trim(),
         greeting_message: greeting_message?.trim(),
         escalationRules: escalationRules,
-        knowledge_base_ids: filteredKnowledgeBaseIds
+        knowledge_base_ids: filteredKnowledgeBaseIds,
+        built_in_tools: built_in_tools,
+        enable_human_transfer: enable_human_transfer,
+        human_transfer_rules: human_transfer_rules
       });
 
       res.json(successResponse(agent, 'Agent prompt updated successfully'));

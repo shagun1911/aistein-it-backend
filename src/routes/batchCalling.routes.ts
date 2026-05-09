@@ -31,6 +31,9 @@ router.post('/:jobId/cancel', batchCallingController.cancelBatchJob);
 // POST /api/v1/batch-calling/:jobId/resume - Resume a paused/cancelled batch job
 router.post('/:jobId/resume', batchCallingController.resumeBatchJob);
 
+// POST /api/v1/batch-calling/:jobId/retry - Retry failed and no-response recipients
+router.post('/:jobId/retry', batchCallingController.retryBatchJob);
+
 // POST /api/v1/batch-calling/:jobId/sync - Manually sync batch call conversations
 router.post('/:jobId/sync', batchCallingController.syncBatchCallConversations);
 

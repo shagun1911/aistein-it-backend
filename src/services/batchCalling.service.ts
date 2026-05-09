@@ -205,6 +205,36 @@ export class BatchCallingService {
    * Cancel batch job
    * Calls Python /api/v1/batch-calling/{job_id}/cancel endpoint
    */
+  /**
+   * Retry batch job (failed and no-response recipients)
+   * Calls Python POST /api/v1/batch-calling/{batch_id}/retry
+   */
+  async retryBatchJob(jobId: string): Promise<BatchCallResponse> {
+    try {
+      const pythonUrl = `${COMM_API_URL}/api/v1/batch-calling/${jobId}/retry`;
+      console.log('[Batch Calling Service] Retrying batch job:', jobId);
+
+      const response = await axios.post<BatchCallResponse>(
+        pythonUrl,
+        {},
+        { timeout: 30000, headers: { 'Content-Type': 'application/json' } }
+      );
+
+      console.log('[Batch Calling Service] ✅ Batch job retry initiated successfully');
+      console.log('[Batch Calling Service] Response status:', response.status);
+      console.log('[Batch Calling Service] Response body:', JSON.stringify(response.data, null, 2));
+
+      return response.data;
+    } catch (error: any) {
+      console.error('[Batch Calling Service] ❌ Failed to retry batch job:', error.response?.data || error.message);
+      throw new AppError(
+        error.response?.status || 500,
+        'BATCH_CALL_ERROR',
+        error.response?.data?.message || error.response?.data?.detail || 'Failed to retry batch job'
+      );
+    }
+  }
+
   async cancelBatchJob(jobId: string): Promise<{ success: boolean; message: string }> {
     try {
       const pythonUrl = `${COMM_API_URL}/api/v1/batch-calling/${jobId}/cancel`;

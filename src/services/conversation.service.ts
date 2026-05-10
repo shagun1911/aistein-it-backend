@@ -3,6 +3,11 @@ import Conversation from '../models/Conversation';
 import Message from '../models/Message';
 import Customer from '../models/Customer';
 import { AppError } from '../middleware/error.middleware';
+
+/** Escape user input for safe use inside MongoDB $regex */
+function escapeRegex(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 import socialIntegrationService from './socialIntegration.service';
 import { trackUsage } from '../middleware/profileTracking.middleware';
 import { usageService } from './usage.service';
@@ -36,18 +41,57 @@ export class ConversationService {
     }
     if (filters.label) query.labels = filters.label;
 
-    if (filters.search) {
-      // CRITICAL: Filter customers by organizationId to prevent cross-tenant data leakage
+    if (filters.search && String(filters.search).trim()) {
+      const raw = String(filters.search).trim();
+      const pattern = escapeRegex(raw);
+      const safeRegex = { $regex: pattern, $options: 'i' };
+
+      // Match by customer (name / email / phone) within this org only
       const customerQuery: any = {
         organizationId: filters.organizationId,
         $or: [
-          { name: { $regex: filters.search, $options: 'i' } },
-          { email: { $regex: filters.search, $options: 'i' } },
-          { phone: { $regex: filters.search, $options: 'i' } }
+          { name: safeRegex },
+          { email: safeRegex },
+          { phone: safeRegex }
         ]
       };
-      const customers = await Customer.find(customerQuery);
-      query.customerId = { $in: customers.map(c => c._id) };
+      const customers = await Customer.find(customerQuery).select('_id').lean();
+      const customerIds = customers.map((c) => c._id);
+
+      // Match by message text (any message in the thread), scoped to this org’s conversations
+      const msgConvIds = await Message.find({
+        type: 'message',
+        text: safeRegex
+      })
+        .distinct('conversationId');
+
+      let conversationIdsFromMessages: mongoose.Types.ObjectId[] = [];
+      if (msgConvIds.length > 0) {
+        const convs = await Conversation.find({
+          organizationId: filters.organizationId,
+          _id: { $in: msgConvIds }
+        })
+          .select('_id')
+          .lean();
+        conversationIdsFromMessages = convs.map((c) => c._id as mongoose.Types.ObjectId);
+      }
+
+      const orBranches: any[] = [];
+      if (customerIds.length > 0) {
+        orBranches.push({ customerId: { $in: customerIds } });
+      }
+      if (conversationIdsFromMessages.length > 0) {
+        orBranches.push({ _id: { $in: conversationIdsFromMessages } });
+      }
+
+      if (orBranches.length === 0) {
+        query._id = { $in: [] };
+      } else if (orBranches.length === 1) {
+        Object.assign(query, orBranches[0]);
+      } else {
+        query.$and = query.$and || [];
+        query.$and.push({ $or: orBranches });
+      }
     }
 
     if (filters.dateFrom || filters.dateTo) {

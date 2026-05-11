@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { body } from 'express-validator';
 import { authController } from '../controllers/auth.controller';
 import { authenticate } from '../middleware/auth.middleware';
@@ -6,6 +6,20 @@ import { validate } from '../middleware/validation.middleware';
 import passport from '../config/passport';
 
 const router = Router();
+
+/** Logs shape of body before express-validator (reaches controller only if validation passes). */
+const logAuthHit =
+  (routeLabel: string) => (req: Request, _res: Response, next: NextFunction) => {
+    const b = req.body ?? {};
+    console.log(`0 - ${routeLabel} (pre-validation)`, {
+      hasEmail: !!b.email,
+      hasPassword: !!b.password,
+      hasCaptchaToken: !!b.captchaToken,
+      hasName: !!b.name,
+      contentType: req.headers['content-type']
+    });
+    next();
+  };
 
 // Validation rules
 const signupValidation = [
@@ -36,8 +50,18 @@ const refreshTokenValidation = [
 ];
 
 // Routes
-router.post('/signup', validate(signupValidation), authController.signup);
-router.post('/login', validate(loginValidation), authController.login);
+router.post(
+  '/signup',
+  logAuthHit('POST /signup'),
+  validate(signupValidation),
+  authController.signup
+);
+router.post(
+  '/login',
+  logAuthHit('POST /login'),
+  validate(loginValidation),
+  authController.login
+);
 router.post('/refresh', validate(refreshTokenValidation), authController.refreshToken);
 router.post('/logout', authenticate, authController.logout);
 router.get('/me', authenticate, authController.getCurrentUser);

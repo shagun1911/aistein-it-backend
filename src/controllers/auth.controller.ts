@@ -13,6 +13,7 @@ export class AuthController {
 
   signup = async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {
+      console.log('1 - signup request received');
       const { name, email, password, captchaToken } = req.body;
       const result = await this.authService.signup(name, email, password, captchaToken, req.ip);
       res.json(successResponse(result, 'Signup successful'));
@@ -23,6 +24,7 @@ export class AuthController {
 
   login = async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {
+      console.log('1 - login request received');
       const { email, password, captchaToken } = req.body;
       const result = await this.authService.login(email, password, captchaToken, req.ip);
       res.json(successResponse(result, 'Login successful'));

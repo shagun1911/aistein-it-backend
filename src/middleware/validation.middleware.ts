@@ -17,6 +17,10 @@ export const validate = (validations: ValidationChain[]) => {
       message: err.msg
     }));
 
+    if (req.path === '/login' || req.path === '/signup') {
+      console.log(`[Auth] validation failed ${req.method} ${req.path}`, extractedErrors);
+    }
+
     throw new AppError(400, 'VALIDATION_ERROR', 'Validation failed', extractedErrors);
   };
 };

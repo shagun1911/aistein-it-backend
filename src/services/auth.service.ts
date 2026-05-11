@@ -100,11 +100,12 @@ export class AuthService {
 
   // Signup
   async signup(name: string, email: string, password: string, captchaToken: string, remoteIp?: string) {
-    console.log('[Auth] Signup attempt:', { email, hasPassword: !!password });
     await verifyCaptchaToken(captchaToken, remoteIp);
 
-    // Check if user already exists
+    console.log('2 - signup before db query');
     const existingUser = await User.findOne({ email });
+    console.log('3 - signup after db query');
+
     if (existingUser) {
       console.log('[Auth] User already exists:', { email });
       throw new AppError(400, 'USER_EXISTS', 'User with this email already exists');
@@ -115,7 +116,7 @@ export class AuthService {
     const firstName = nameParts[0] || name;
     const lastName = nameParts.slice(1).join(' ') || '';
 
-    // Create new user
+    console.log('4 - signup before user save');
     const user = new User({
       email,
       password, // Will be hashed by pre-save hook
@@ -127,10 +128,10 @@ export class AuthService {
     });
 
     await user.save();
-
-    console.log('[Auth] Signup successful:', { email, userId: user._id });
+    console.log('5 - signup after user save');
 
     const userId = (user._id as any).toString();
+    console.log('6 - signup before token');
     const accessToken = this.generateAccessToken(userId);
     const refreshToken = this.generateRefreshToken(userId);
 
@@ -139,6 +140,8 @@ export class AuthService {
     // Update last active
     user.lastActiveAt = new Date();
     await user.save();
+
+    console.log('7 - signup success');
 
     return {
       token: accessToken,
@@ -160,10 +163,11 @@ export class AuthService {
 
   // Login
   async login(email: string, password: string, captchaToken: string, remoteIp?: string) {
-    console.log('[Auth] Login attempt:', { email, hasPassword: !!password });
     await verifyCaptchaToken(captchaToken, remoteIp);
 
+    console.log('2 - before db query');
     const user = await User.findOne({ email, status: 'active' });
+    console.log('3 - after db query');
 
     if (!user) {
       console.log('[Auth] User not found or inactive:', { email });
@@ -184,16 +188,17 @@ export class AuthService {
       throw new AppError(401, 'UNAUTHORIZED', `Please sign in with ${user.provider}`);
     }
 
+    console.log('4 - before password compare');
     const isPasswordValid = await user.comparePassword(password);
+    console.log('5 - after password compare');
 
     if (!isPasswordValid) {
       console.log('[Auth] Invalid password for user:', { email });
       throw new AppError(401, 'UNAUTHORIZED', 'Invalid credentials');
     }
 
-    console.log('[Auth] Login successful:', { email, userId: user._id });
-
     const userId = (user._id as any).toString();
+    console.log('6 - before token');
     const accessToken = this.generateAccessToken(userId);
     const refreshToken = this.generateRefreshToken(userId);
 
@@ -202,6 +207,8 @@ export class AuthService {
     // Update last active
     user.lastActiveAt = new Date();
     await user.save();
+
+    console.log('7 - login success');
 
     return {
       token: accessToken,

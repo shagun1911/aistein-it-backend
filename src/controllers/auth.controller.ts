@@ -70,11 +70,17 @@ export class AuthController {
       }
 
       const result = await this.authService.oauthLogin(user);
-      
-      // Redirect to frontend with tokens
+
+      // Redirect with tokens + user JSON so the SPA does not need a cross-origin /auth/me
+      // round-trip (avoids stuck OPTIONS/GET when API is cold, misconfigured CORS, or ad-blockers).
       const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-      const redirectUrl = `${frontendUrl}/auth/callback?token=${result.token}&refreshToken=${result.refreshToken}`;
-      
+      const userJson = encodeURIComponent(JSON.stringify(result.user));
+      const redirectUrl =
+        `${frontendUrl}/auth/callback` +
+        `?token=${encodeURIComponent(result.token)}` +
+        `&refreshToken=${encodeURIComponent(result.refreshToken)}` +
+        `&user=${userJson}`;
+
       res.redirect(redirectUrl);
     } catch (error) {
       next(error);

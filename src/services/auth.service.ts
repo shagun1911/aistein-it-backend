@@ -245,7 +245,7 @@ export class AuthService {
       refreshToken,
       expiresIn: 3600,
       user: {
-        id: user._id,
+        id: userId,
         email: user.email,
         name: `${user.firstName} ${user.lastName}`,
         firstName: user.firstName,
@@ -253,8 +253,10 @@ export class AuthService {
         avatar: user.avatar,
         role: user.role,
         isAdmin: user.role === 'admin',
-        organizationId: user.organizationId,
-        provider: user.provider
+        organizationId: user.organizationId ? String(user.organizationId) : '',
+        provider: user.provider,
+        status: user.status || 'active',
+        createdAt: user.createdAt ? new Date(user.createdAt).toISOString() : new Date().toISOString()
       }
     };
   }

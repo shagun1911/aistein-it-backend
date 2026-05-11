@@ -24,9 +24,11 @@ class PlanWarningsService {
       }
 
       const plan = org.planId as any;
+      // Fetch usage once and pass it to both the warning checks and the lock check
+      // to avoid computing it twice (previously caused a double full-aggregation).
       const usage = await usageTrackerService.getOrganizationUsage(organizationId);
       const warnings: PlanWarning[] = [];
-      const { locked, reason } = await usageTrackerService.isOrganizationLocked(organizationId);
+      const { locked, reason } = await usageTrackerService.isOrganizationLocked(organizationId, usage);
 
       // Check call minutes
       if (plan.features?.callMinutes !== -1) {

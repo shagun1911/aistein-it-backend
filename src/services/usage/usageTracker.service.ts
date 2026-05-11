@@ -16,18 +16,32 @@ import { getEffectiveFeatureLimits } from '../../config/planLimits';
  * - All counts derived from stored events/transcripts
  */
 
+/** In-process fallback cache used when Redis is unavailable. TTL = 60 s. */
+const localUsageCache = new Map<string, { value: any; expiresAt: number }>();
+const LOCAL_USAGE_TTL_MS = 60_000;
+
+function localCacheGet(key: string): any | null {
+  const entry = localUsageCache.get(key);
+  if (entry && entry.expiresAt > Date.now()) return entry.value;
+  if (entry) localUsageCache.delete(key);
+  return null;
+}
+
+function localCacheSet(key: string, value: any): void {
+  localUsageCache.set(key, { value, expiresAt: Date.now() + LOCAL_USAGE_TTL_MS });
+}
+
 export class UsageTrackerService {
   /**
-   * Calculate call minutes from actual phone conversations
-   * 
-   * Call minute = conversation with channel='phone' + actual transcript duration
+   * Calculate call minutes from actual phone conversations.
+   * Only fetches the fields needed for duration calculation — no full-document load.
    */
   async calculateCallMinutes(organizationId: string): Promise<number> {
     try {
       const conversations = await Conversation.find({
         organizationId,
         channel: 'phone'
-      }).lean();
+      }).select('transcript metadata createdAt updatedAt').lean();
 
       let totalMinutes = 0;
 
@@ -132,37 +146,35 @@ export class UsageTrackerService {
   }
 
   /**
-   * Calculate conversations count
-   * 
-   * Conversation = at least 1 user message + 1 bot/system reply
+   * Calculate conversations count.
+   * Conversation = has at least 2 messages (1 user + 1 bot/system reply).
+   *
+   * Uses a two-step count instead of a $lookup so MongoDB never materialises
+   * message arrays in memory — avoiding the previous minute-long stall.
    */
   async calculateConversations(organizationId: string): Promise<number> {
     try {
-      const conversations = await Conversation.aggregate([
-        {
-          $match: {
-            organizationId: new mongoose.Types.ObjectId(organizationId)
-          }
-        },
-        {
-          $lookup: {
-            from: 'messages',
-            localField: '_id',
-            foreignField: 'conversationId',
-            as: 'messages'
-          }
-        },
-        {
-          $match: {
-            'messages.1': { $exists: true } // At least 2 messages
-          }
-        },
-        {
-          $count: 'total'
-        }
+      const orgObjectId = new mongoose.Types.ObjectId(organizationId);
+
+      // Step 1: get all conversation IDs for this org (lightweight — IDs only)
+      const convDocs = await Conversation.find({ organizationId: orgObjectId })
+        .select('_id')
+        .lean();
+
+      if (convDocs.length === 0) return 0;
+
+      const convIds = convDocs.map((c) => c._id);
+
+      // Step 2: group messages by conversationId and count those with >= 2 messages.
+      // No document materialisation — only counts are produced.
+      const result = await Message.aggregate([
+        { $match: { conversationId: { $in: convIds } } },
+        { $group: { _id: '$conversationId', count: { $sum: 1 } } },
+        { $match: { count: { $gte: 2 } } },
+        { $count: 'total' }
       ]);
 
-      const count = conversations[0]?.total || 0;
+      const count = result[0]?.total || 0;
       logger.info(`[Usage Tracker] Org ${organizationId}: ${count} conversations`);
       return count;
 
@@ -214,14 +226,19 @@ export class UsageTrackerService {
   }
 
   /**
-   * Get comprehensive usage for an organization (with optional caching)
+   * Get comprehensive usage for an organization (with optional caching).
+   *
+   * Cache hierarchy:
+   *   1. Redis (shared across instances, 60 s TTL) — primary
+   *   2. In-process Map (per-instance, 60 s TTL) — fallback when Redis is down
+   *   3. Full recompute — only when both caches miss
    */
   async getOrganizationUsage(organizationId: string, useCache: boolean = true) {
     try {
       const cacheKey = `usage:org:${organizationId}`;
 
-      // Try to get from cache first
       if (useCache) {
+        // 1. Try Redis
         try {
           const { default: redisClient, isRedisAvailable } = await import('../../config/redis');
           if (isRedisAvailable()) {
@@ -231,7 +248,14 @@ export class UsageTrackerService {
             }
           }
         } catch (cacheError) {
-          logger.warn(`[Usage Tracker] Cache fetch failed for ${organizationId}:`, (cacheError as any).message);
+          logger.warn(`[Usage Tracker] Redis fetch failed for ${organizationId}:`, (cacheError as any).message);
+        }
+
+        // 2. Try in-process fallback cache
+        const localHit = localCacheGet(cacheKey);
+        if (localHit) {
+          logger.debug(`[Usage Tracker] Local cache hit for ${organizationId}`);
+          return localHit;
         }
       }
 
@@ -252,16 +276,19 @@ export class UsageTrackerService {
         calculatedAt: new Date()
       };
 
-      // Store in cache for 60 seconds (Near Real-Time)
       if (useCache) {
+        // Store in Redis (primary)
         try {
           const { default: redisClient, isRedisAvailable } = await import('../../config/redis');
           if (isRedisAvailable()) {
             await redisClient.setEx(cacheKey, 60, JSON.stringify(usageData));
           }
         } catch (cacheError) {
-          logger.warn(`[Usage Tracker] Cache store failed for ${organizationId}:`, (cacheError as any).message);
+          logger.warn(`[Usage Tracker] Redis store failed for ${organizationId}:`, (cacheError as any).message);
         }
+
+        // Always store in local fallback cache
+        localCacheSet(cacheKey, usageData);
       }
 
       return usageData;
@@ -288,9 +315,16 @@ export class UsageTrackerService {
   }
 
   /**
-   * Check if organization has exceeded plan limits
+   * Check if organization has exceeded plan limits.
+   * Pass `precomputedUsage` to skip a redundant getOrganizationUsage call when
+   * the caller already has fresh usage data (e.g. planWarnings service).
    */
-  async checkLimits(organizationId: string, plan: any, org?: { plan?: string } | null): Promise<{
+  async checkLimits(
+    organizationId: string,
+    plan: any,
+    org?: { plan?: string } | null,
+    precomputedUsage?: any
+  ): Promise<{
     exceeded: boolean;
     limits: {
       callMinutes: { used: number; limit: number; exceeded: boolean };
@@ -299,8 +333,7 @@ export class UsageTrackerService {
     };
   }> {
     try {
-      // Use cache for limit checks too, but maybe shorter? (currently uses default 60s)
-      const usage = await this.getOrganizationUsage(organizationId);
+      const usage = precomputedUsage ?? await this.getOrganizationUsage(organizationId);
 
       const features = getEffectiveFeatureLimits(org ?? { plan: plan?.slug }, plan);
 
@@ -335,10 +368,13 @@ export class UsageTrackerService {
   }
 
   /**
-   * Check if organization is "locked" due to limit exhaustion
-   * Especially strict for the free plan
+   * Check if organization is "locked" due to limit exhaustion.
+   * Pass `precomputedUsage` to skip a redundant getOrganizationUsage call.
    */
-  async isOrganizationLocked(organizationId: string): Promise<{ locked: boolean; reason: string | null }> {
+  async isOrganizationLocked(
+    organizationId: string,
+    precomputedUsage?: any
+  ): Promise<{ locked: boolean; reason: string | null }> {
     try {
       const Organization = mongoose.model('Organization');
       const org: any = await Organization.findById(organizationId).populate('planId').lean();
@@ -348,7 +384,7 @@ export class UsageTrackerService {
       }
 
       const plan = org.planId;
-      const { exceeded, limits } = await this.checkLimits(organizationId, plan, org);
+      const { exceeded, limits } = await this.checkLimits(organizationId, plan, org, precomputedUsage);
 
       if (exceeded) {
         let reason = 'Plan limits exceeded';

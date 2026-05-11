@@ -14,7 +14,7 @@ export class ConversationController {
 
   getAll = async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {
-      const { page = 1, limit = 100, ...filters } = req.query;
+      const { page = 1, limit = 25, ...filters } = req.query;
 
       // CRITICAL: ALWAYS filter by organization/user to ensure data isolation
       // Use organizationId if available, otherwise fallback to userId

@@ -58,22 +58,23 @@ export class ConversationService {
       const customers = await Customer.find(customerQuery).select('_id').lean();
       const customerIds = customers.map((c) => c._id);
 
-      // Match by message text (any message in the thread), scoped to this org’s conversations
-      const msgConvIds = await Message.find({
-        type: 'message',
-        text: safeRegex
-      })
-        .distinct('conversationId');
+      // Match by message text - scoped to this org's conversations only to avoid cross-tenant scans.
+      // Step 1: get conversation IDs for this org (IDs only, cheap with the org index).
+      const orgConvDocs = await Conversation.find({ organizationId: filters.organizationId })
+        .select('_id')
+        .lean();
+      const orgConvIds = orgConvDocs.map((c) => c._id);
 
+      // Step 2: search messages only within those conversation IDs.
       let conversationIdsFromMessages: mongoose.Types.ObjectId[] = [];
-      if (msgConvIds.length > 0) {
-        const convs = await Conversation.find({
-          organizationId: filters.organizationId,
-          _id: { $in: msgConvIds }
-        })
-          .select('_id')
-          .lean();
-        conversationIdsFromMessages = convs.map((c) => c._id as mongoose.Types.ObjectId);
+      if (orgConvIds.length > 0) {
+        const matchingIds = await Message.find({
+          conversationId: { $in: orgConvIds },
+          type: 'message',
+          text: safeRegex
+        }).distinct('conversationId');
+
+        conversationIdsFromMessages = matchingIds as mongoose.Types.ObjectId[];
       }
 
       const orBranches: any[] = [];
@@ -103,7 +104,9 @@ export class ConversationService {
     const skip = (page - 1) * limit;
     const total = await Conversation.countDocuments(query);
 
+    // Exclude the transcript field — it can be MBs per row and is never needed for the list view.
     const conversations = await Conversation.find(query)
+      .select('-transcript')
       .populate('customerId', 'name email phone avatar color')
       .populate('assignedOperatorId', 'firstName lastName avatar')
       .sort({ updatedAt: -1 })
@@ -198,39 +201,28 @@ export class ConversationService {
       throw new AppError(403, 'FORBIDDEN', 'You do not have access to this conversation');
     }
 
-    console.log(`[Conversation Service] Found conversation for customer: ${(conversation as any).customerId?.name}`);
-    console.log(`[Conversation Service] Has transcript: ${!!(conversation as any).transcript}`);
-    console.log(`[Conversation Service] Metadata:`, JSON.stringify((conversation as any).metadata, null, 2));
+    const MESSAGE_PAGE_SIZE = 50;
+    const totalMessageCount = await Message.countDocuments({
+      conversationId: (conversation as any)._id
+    });
 
-    // Query messages using both _id and string id to handle any format
+    // Load the most recent 50 messages and restore chronological order in JS.
+    // The frontend can request older pages via the dedicated /messages endpoint.
     const messages = await Message.find({
       conversationId: (conversation as any)._id
     })
       .populate('operatorId', 'firstName lastName avatar')
-      .sort({ timestamp: 1 })
+      .sort({ timestamp: -1 })
+      .limit(MESSAGE_PAGE_SIZE)
       .lean();
 
-    console.log(`[Conversation Service] Found ${messages.length} messages for conversation ${(conversation as any)._id}`);
-    if (messages.length > 0) {
-      console.log(`[Conversation Service] First message:`, {
-        sender: messages[0].sender,
-        textPreview: messages[0].text?.substring(0, 50),
-      });
-    } else {
-      // Debug: Check if any messages exist in the collection
-      const totalMessages = await Message.countDocuments({});
-      console.log(`[Conversation Service] ⚠️ No messages found. Total messages in DB: ${totalMessages}`);
-
-      // Check with string comparison
-      const messagesWithString = await Message.find({
-        conversationId: conversationId
-      }).lean();
-      console.log(`[Conversation Service] Messages found with string query: ${messagesWithString.length}`);
-    }
+    messages.reverse();
 
     return {
       ...conversation,
-      messages
+      messages,
+      hasMoreMessages: totalMessageCount > MESSAGE_PAGE_SIZE,
+      totalMessageCount
     };
   }
 
@@ -978,21 +970,22 @@ export class ConversationService {
                 'metadata.transcriptItemId': { $exists: true }
               });
 
-              for (const item of pythonData.transcript.items) {
-                if (item.type === 'message' || item.role) {
-                  await Message.create({
-                    conversationId: conversation._id,
-                    type: 'message',
-                    text: item.content || item.text || (Array.isArray(item.content) ? item.content.join(' ') : ''),
-                    sender: item.role === 'user' ? 'customer' : 'ai',
-                    timestamp: new Date(item.timestamp || Date.now()),
-                    metadata: {
-                      transcriptItemId: item.id,
-                      interrupted: item.interrupted,
-                      confidence: item.confidence
-                    }
-                  });
-                }
+              const messageDocs = pythonData.transcript.items
+                .filter((item: any) => item.type === 'message' || item.role)
+                .map((item: any) => ({
+                  conversationId: conversation._id,
+                  type: 'message',
+                  text: item.content || item.text || (Array.isArray(item.content) ? item.content.join(' ') : ''),
+                  sender: item.role === 'user' ? 'customer' : 'ai',
+                  timestamp: new Date(item.timestamp || Date.now()),
+                  metadata: {
+                    transcriptItemId: item.id,
+                    interrupted: item.interrupted,
+                    confidence: item.confidence
+                  }
+                }));
+              if (messageDocs.length > 0) {
+                await Message.insertMany(messageDocs, { ordered: false });
               }
             }
 
@@ -1064,23 +1057,24 @@ export class ConversationService {
         'metadata.transcriptItemId': { $exists: true }
       });
 
-      // Convert transcript items to messages
+      // Convert transcript items to messages using insertMany for efficiency
       if (callDocument.transcript && callDocument.transcript.items) {
-        for (const item of callDocument.transcript.items) {
-          if (item.type === 'message') {
-            await Message.create({
-              conversationId: conversation._id,
-              type: 'message',
-              text: item.content.join(' '),
-              sender: item.role === 'user' ? 'customer' : 'ai',
-              timestamp: new Date(),
-              metadata: {
-                transcriptItemId: item.id,
-                interrupted: item.interrupted,
-                confidence: item.transcript_confidence
-              }
-            });
-          }
+        const messageDocs = callDocument.transcript.items
+          .filter((item: any) => item.type === 'message')
+          .map((item: any) => ({
+            conversationId: conversation._id,
+            type: 'message',
+            text: Array.isArray(item.content) ? item.content.join(' ') : (item.content || ''),
+            sender: item.role === 'user' ? 'customer' : 'ai',
+            timestamp: new Date(),
+            metadata: {
+              transcriptItemId: item.id,
+              interrupted: item.interrupted,
+              confidence: item.transcript_confidence
+            }
+          }));
+        if (messageDocs.length > 0) {
+          await Message.insertMany(messageDocs, { ordered: false });
         }
       }
 

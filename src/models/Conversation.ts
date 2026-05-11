@@ -90,4 +90,12 @@ ConversationSchema.index({ channel: 1 });
 ConversationSchema.index({ assignedOperatorId: 1 });
 ConversationSchema.index({ createdAt: -1 });
 
+// Compound indexes for the hot list-query path:
+// find({ organizationId }).sort({ updatedAt: -1 }) — covers the default list view.
+ConversationSchema.index({ organizationId: 1, updatedAt: -1 });
+// Covers filtered queries (by status, channel, assignee) — avoids in-memory sort.
+ConversationSchema.index({ organizationId: 1, status: 1, updatedAt: -1 });
+ConversationSchema.index({ organizationId: 1, channel: 1, updatedAt: -1 });
+ConversationSchema.index({ organizationId: 1, assignedOperatorId: 1, updatedAt: -1 });
+
 export default mongoose.model<IConversation>('Conversation', ConversationSchema);

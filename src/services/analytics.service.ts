@@ -87,21 +87,32 @@ export class AnalyticsService {
       avgResponseTime = totalResponseTime / conversationsWithResponse.length;
     }
 
-    // Messages sent today
+    // Messages sent today — scoped to this organization.
+    // The global Redis counter (messages_today_count) is kept for backward compatibility
+    // but the DB fallback is now org-scoped to avoid a full collection scan.
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const messagesToday = await Message.countDocuments({
-      timestamp: { $gte: today }
-    });
 
-    // Get messages today from Redis (real-time counter)
+    // Org-scoped DB count: get today's conversation IDs first, then count messages within them.
+    const todayConvIds = await Conversation.find({ organizationId: orgId })
+      .select('_id')
+      .lean();
+    const todayConvIdArr = todayConvIds.map((c) => c._id);
+    const messagesToday = todayConvIdArr.length > 0
+      ? await Message.countDocuments({
+          conversationId: { $in: todayConvIdArr },
+          timestamp: { $gte: today }
+        })
+      : 0;
+
+    // Prefer the Redis real-time counter when available (still used as a fast approximation)
     let messagesTodayCount = messagesToday;
     if (isRedisAvailable()) {
       try {
         const messagesTodayRedis = await redisClient.get('messages_today_count');
         messagesTodayCount = messagesTodayRedis ? parseInt(messagesTodayRedis) : messagesToday;
       } catch (error) {
-        // Use database count if Redis fails
+        // Fall back to DB count
       }
     }
 

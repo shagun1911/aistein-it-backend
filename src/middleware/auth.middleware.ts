@@ -9,12 +9,20 @@ export interface AuthRequest extends Request {
   files?: Express.Multer.File[] | { [fieldname: string]: Express.Multer.File[] };
 }
 
-/** Avoids running heavy usage aggregation on every API call (especially with 15s FE polling). */
+/**
+ * Avoids running heavy usage aggregation on every API call.
+ * TTL is 5 minutes — lock status changes are rare events (plan upgrades / limit exhaustion).
+ * When lock status changes (e.g. user upgrades), call clearOrgLockCache(orgId) to evict.
+ */
 const orgLockCache = new Map<
   string,
   { at: number; locked: boolean; reason: string | null }
 >();
-const ORG_LOCK_CACHE_TTL_MS = 30_000;
+const ORG_LOCK_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+export function clearOrgLockCache(organizationId: string): void {
+  orgLockCache.delete(organizationId);
+}
 
 export const authenticate = async (
   req: AuthRequest,

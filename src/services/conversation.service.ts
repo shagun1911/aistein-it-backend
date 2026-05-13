@@ -96,9 +96,18 @@ export class ConversationService {
     }
 
     if (filters.dateFrom || filters.dateTo) {
-      query.createdAt = {};
-      if (filters.dateFrom) query.createdAt.$gte = new Date(filters.dateFrom);
-      if (filters.dateTo) query.createdAt.$lte = new Date(filters.dateTo);
+      query.updatedAt = {};
+      if (filters.dateFrom) query.updatedAt.$gte = new Date(filters.dateFrom);
+      if (filters.dateTo) query.updatedAt.$lte = new Date(filters.dateTo);
+    } else if (filters.dateRangeDays) {
+      // dateRangeDays is "last N days" expressed as an integer (capped at 365 server-side).
+      // We filter on updatedAt so long-running open tickets appear even when created earlier.
+      // When search is active the frontend sends dateRangeDays=365 to widen the window.
+      const days = Math.min(Math.max(1, Number(filters.dateRangeDays)), 365);
+      const since = new Date();
+      since.setDate(since.getDate() - days);
+      since.setHours(0, 0, 0, 0);
+      query.updatedAt = { $gte: since };
     }
 
     const skip = (page - 1) * limit;

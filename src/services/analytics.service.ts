@@ -16,27 +16,24 @@ export class AnalyticsService {
   async getDashboardMetrics(organizationId: string, dateFrom?: string, dateTo?: string, channel?: string) {
     const cacheKey = `dashboard_metrics:${organizationId}:${dateFrom}:${dateTo}:${channel}`;
 
-    // Try to get from cache (only if Redis is available)
+    // Check Redis cache first
     if (isRedisAvailable()) {
       try {
         const cached = await redisClient.get(cacheKey);
-        if (cached) {
-          return JSON.parse(cached);
-        }
-      } catch (error) {
-        // Continue without cache if Redis fails
-      }
+        if (cached) return JSON.parse(cached);
+      } catch (_) { /* fall through */ }
     }
 
     const orgId = new mongoose.Types.ObjectId(organizationId);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
     const dateQuery: any = { organizationId: orgId };
     if (dateFrom || dateTo) {
       dateQuery.createdAt = {};
       if (dateFrom) dateQuery.createdAt.$gte = new Date(dateFrom);
       if (dateTo) dateQuery.createdAt.$lte = new Date(dateTo);
     }
-
-    // Apply channel filter
     if (channel && channel !== 'all') {
       if (channel === 'instagram' || channel === 'facebook') {
         dateQuery.channel = 'social';
@@ -46,171 +43,135 @@ export class AnalyticsService {
       }
     }
 
-    // Total conversations
-    const totalConversations = await Conversation.countDocuments(dateQuery);
-
-    // Active conversations
-    const activeConversations = await Conversation.countDocuments({
-      ...dateQuery,
-      status: { $in: ['open', 'unread', 'support_request'] }
-    });
-
-    // Closed conversations
-    const closedConversations = await Conversation.countDocuments({
-      ...dateQuery,
-      status: 'closed'
-    });
-
-    // AI vs Human managed
-    const aiManagedCount = await Conversation.countDocuments({
-      ...dateQuery,
-      isAiManaging: true
-    });
-
-    const humanManagedCount = await Conversation.countDocuments({
-      ...dateQuery,
-      isAiManaging: false
-    });
-
-    // Average response time (in minutes)
-    const conversationsWithResponse = await Conversation.find({
-      ...dateQuery,
-      firstResponseAt: { $exists: true }
-    }).select('createdAt firstResponseAt').lean();
-
-    let avgResponseTime = 0;
-    if (conversationsWithResponse.length > 0) {
-      const totalResponseTime = conversationsWithResponse.reduce((sum, conv) => {
-        const responseTime = (conv.firstResponseAt!.getTime() - conv.createdAt.getTime()) / 1000 / 60;
-        return sum + responseTime;
-      }, 0);
-      avgResponseTime = totalResponseTime / conversationsWithResponse.length;
-    }
-
-    // Messages sent today — scoped to this organization.
-    // The global Redis counter (messages_today_count) is kept for backward compatibility
-    // but the DB fallback is now org-scoped to avoid a full collection scan.
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    // Org-scoped DB count: get today's conversation IDs first, then count messages within them.
-    const todayConvIds = await Conversation.find({ organizationId: orgId })
-      .select('_id')
-      .lean();
-    const todayConvIdArr = todayConvIds.map((c) => c._id);
-    const messagesToday = todayConvIdArr.length > 0
-      ? await Message.countDocuments({
-          conversationId: { $in: todayConvIdArr },
-          timestamp: { $gte: today }
-        })
-      : 0;
-
-    // Prefer the Redis real-time counter when available (still used as a fast approximation)
-    let messagesTodayCount = messagesToday;
-    if (isRedisAvailable()) {
-      try {
-        const messagesTodayRedis = await redisClient.get('messages_today_count');
-        messagesTodayCount = messagesTodayRedis ? parseInt(messagesTodayRedis) : messagesToday;
-      } catch (error) {
-        // Fall back to DB count
-      }
-    }
-
-    // Conversations by channel (separate Instagram and Facebook from social)
-    const conversationsByChannel = await Conversation.aggregate([
+    // Single $facet aggregation replaces 8+ separate Conversation queries
+    const [convFacetResult] = await Conversation.aggregate([
       { $match: dateQuery },
       {
-        $project: {
-          channel: {
-            $cond: {
-              if: { $eq: ['$channel', 'social'] },
-              then: {
-                $cond: {
-                  if: { $eq: ['$metadata.platform', 'instagram'] },
-                  then: 'instagram',
-                  else: {
-                    $cond: {
-                      if: { $eq: ['$metadata.platform', 'facebook'] },
-                      then: 'facebook',
-                      else: 'social'
-                    }
+        $facet: {
+          totals: [
+            {
+              $group: {
+                _id: null,
+                total: { $sum: 1 },
+                active: { $sum: { $cond: [{ $in: ['$status', ['open', 'unread', 'support_request']] }, 1, 0] } },
+                closed: { $sum: { $cond: [{ $eq: ['$status', 'closed'] }, 1, 0] } },
+                aiManaged: { $sum: { $cond: ['$isAiManaging', 1, 0] } },
+                humanManaged: { $sum: { $cond: [{ $not: '$isAiManaging' }, 1, 0] } },
+                reopened: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          { $in: ['$status', ['open', 'unread', 'support_request']] },
+                          { $ifNull: ['$resolvedAt', false] }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
                   }
                 }
-              },
-              else: '$channel'
+              }
             }
-          }
+          ],
+          avgResponseTime: [
+            { $match: { firstResponseAt: { $exists: true, $ne: null } } },
+            {
+              $group: {
+                _id: null,
+                avg: {
+                  $avg: {
+                    $divide: [{ $subtract: ['$firstResponseAt', '$createdAt'] }, 60000]
+                  }
+                }
+              }
+            }
+          ],
+          byStatus: [
+            { $group: { _id: '$status', count: { $sum: 1 } } }
+          ],
+          byChannel: [
+            {
+              $project: {
+                ch: {
+                  $cond: {
+                    if: { $eq: ['$channel', 'social'] },
+                    then: {
+                      $cond: {
+                        if: { $eq: ['$metadata.platform', 'instagram'] },
+                        then: 'instagram',
+                        else: { $cond: { if: { $eq: ['$metadata.platform', 'facebook'] }, then: 'facebook', else: 'social' } }
+                      }
+                    },
+                    else: '$channel'
+                  }
+                }
+              }
+            },
+            { $group: { _id: '$ch', count: { $sum: 1 } } }
+          ]
         }
-      },
-      { $group: { _id: '$channel', count: { $sum: 1 } } }
+      }
     ]);
 
-    const channelBreakdown = conversationsByChannel.reduce((acc, item) => {
-      acc[item._id] = item.count;
-      return acc;
+    const totals = convFacetResult?.totals?.[0] ?? {};
+    const avgResponseTime = Math.round(convFacetResult?.avgResponseTime?.[0]?.avg ?? 0);
+    const statusBreakdown = (convFacetResult?.byStatus ?? []).reduce((acc: any, item: any) => {
+      acc[item._id] = item.count; return acc;
+    }, {} as Record<string, number>);
+    const channelBreakdown = (convFacetResult?.byChannel ?? []).reduce((acc: any, item: any) => {
+      acc[item._id] = item.count; return acc;
     }, {} as Record<string, number>);
 
-    // Conversations by status
-    const conversationsByStatus = await Conversation.aggregate([
-      { $match: dateQuery },
-      { $group: { _id: '$status', count: { $sum: 1 } } }
+    // Messages today: use organizationId on Message directly when available; Redis counter as fast override
+    let messagesTodayCount = 0;
+    if (isRedisAvailable()) {
+      try {
+        const redisTodayCount = await redisClient.get('messages_today_count');
+        if (redisTodayCount) {
+          messagesTodayCount = parseInt(redisTodayCount);
+        }
+      } catch (_) { /* fall through to DB */ }
+    }
+    if (messagesTodayCount === 0) {
+      messagesTodayCount = await Message.countDocuments({
+        organizationId: orgId,
+        timestamp: { $gte: today }
+      });
+    }
+
+    // Wrong answers and links: query Message directly by organizationId
+    const msgDateFilter: any = {};
+    if (dateFrom || dateTo) {
+      msgDateFilter.timestamp = {};
+      if (dateFrom) msgDateFilter.timestamp.$gte = new Date(dateFrom);
+      if (dateTo) msgDateFilter.timestamp.$lte = new Date(dateTo);
+    }
+
+    const [wrongAnswers, linksClicked] = await Promise.all([
+      Message.countDocuments({
+        organizationId: orgId,
+        sender: 'ai',
+        ...msgDateFilter,
+        $or: [
+          { 'metadata.confidence': { $lt: 0.5 } },
+          { 'metadata.feedback': 'negative' },
+          { 'metadata.isWrongAnswer': true }
+        ]
+      }),
+      Message.countDocuments({
+        organizationId: orgId,
+        ...msgDateFilter,
+        text: { $regex: /https?:\/\/[^\s]+/i }
+      })
     ]);
 
-    const statusBreakdown = conversationsByStatus.reduce((acc, item) => {
-      acc[item._id] = item.count;
-      return acc;
-    }, {} as Record<string, number>);
-
-    // Reopened conversations (conversations that were closed then reopened)
-    const reopenedConversations = await Conversation.countDocuments({
-      ...dateQuery,
-      status: { $in: ['open', 'unread', 'support_request'] },
-      resolvedAt: { $exists: true } // Was resolved but now open again
-    });
-
-    // Wrong answers (messages with low confidence or negative feedback)
-    // Get conversation IDs first, then check messages
-    const conversationIds = await Conversation.find(dateQuery).select('_id').lean();
-    const convIds = conversationIds.map(c => c._id);
-
-    const wrongAnswersQuery: any = {
-      conversationId: { $in: convIds },
-      sender: 'ai'
-    };
-    if (dateFrom || dateTo) {
-      wrongAnswersQuery.timestamp = {};
-      if (dateFrom) wrongAnswersQuery.timestamp.$gte = new Date(dateFrom);
-      if (dateTo) wrongAnswersQuery.timestamp.$lte = new Date(dateTo);
-    }
-    wrongAnswersQuery.$or = [
-      { 'metadata.confidence': { $lt: 0.5 } },
-      { 'metadata.feedback': 'negative' },
-      { 'metadata.isWrongAnswer': true }
-    ];
-
-    const wrongAnswers = await Message.countDocuments(wrongAnswersQuery);
-
-    // Links clicked (messages containing URLs)
-    const linksClickedQuery: any = {
-      conversationId: { $in: convIds }
-    };
-    if (dateFrom || dateTo) {
-      linksClickedQuery.timestamp = {};
-      if (dateFrom) linksClickedQuery.timestamp.$gte = new Date(dateFrom);
-      if (dateTo) linksClickedQuery.timestamp.$lte = new Date(dateTo);
-    }
-    // Match messages containing URLs (http:// or https://)
-    linksClickedQuery.text = { $regex: /https?:\/\/[^\s]+/i };
-    // Count all messages with URLs (we'll track clicks separately if needed)
-    const linksClicked = await Message.countDocuments(linksClickedQuery);
-
-    // Use centralized analytics service for consistent calculations
-    const dateRange = dateFrom || dateTo ? {
+    // Use centralized analytics service for call/chat metrics
+    const dateRange = (dateFrom || dateTo) ? {
       dateFrom: dateFrom ? new Date(dateFrom) : undefined,
       dateTo: dateTo ? new Date(dateTo) : undefined
     } : undefined;
 
-    // Filter centralized metrics by channel if requested
     let totalCallMinutes = 0;
     let chatConversationsCount = 0;
 
@@ -218,11 +179,9 @@ export class AnalyticsService {
       if (channel === 'phone') {
         const callMetrics = await callMetricsService.getOrganizationCallMetrics(organizationId, dateRange);
         totalCallMinutes = callMetrics.totalCallMinutes;
-        chatConversationsCount = 0;
       } else {
         const chatMetrics = await chatMetricsService.getOrganizationChatMetrics(organizationId, dateRange, channel);
         chatConversationsCount = chatMetrics.totalConversations;
-        totalCallMinutes = 0;
       }
     } else {
       const orgMetrics = await centralizedAnalyticsService.getOrganizationMetrics(organizationId, dateRange);
@@ -231,28 +190,26 @@ export class AnalyticsService {
     }
 
     const metrics = {
-      totalConversations,
-      activeConversations,
-      closedConversations,
-      reopenedConversations,
+      totalConversations: totals.total ?? 0,
+      activeConversations: totals.active ?? 0,
+      closedConversations: totals.closed ?? 0,
+      reopenedConversations: totals.reopened ?? 0,
       wrongAnswers,
       linksClicked,
-      aiManaged: aiManagedCount,
-      humanManaged: humanManagedCount,
-      avgResponseTime: Math.round(avgResponseTime),
+      aiManaged: totals.aiManaged ?? 0,
+      humanManaged: totals.humanManaged ?? 0,
+      avgResponseTime,
       customerSatisfactionScore: null,
       messagesToday: messagesTodayCount,
       conversationsByChannel: channelBreakdown,
       conversationsByStatus: statusBreakdown,
-      totalCallMinutes: totalCallMinutes,
+      totalCallMinutes,
       totalChatConversations: chatConversationsCount
     };
 
-    // Cache for 5 minutes (only if Redis is available)
+    // Cache for 5 minutes
     if (isRedisAvailable()) {
-      try {
-        await redisClient.setEx(cacheKey, 300, JSON.stringify(metrics));
-      } catch (error) { }
+      try { await redisClient.setEx(cacheKey, 300, JSON.stringify(metrics)); } catch (_) { }
     }
 
     return metrics;
@@ -304,13 +261,16 @@ export class AnalyticsService {
       { $sort: { _id: 1 } }
     ]);
 
-    // Get conversation IDs for this organization in date range to filter messages
-    const organizationConversations = await Conversation.find(dateQuery).select('_id').lean();
-    const conversationIds = organizationConversations.map(c => c._id);
+    // Messages sent over time — query Message directly using organizationId (no conv-ID $in)
+    const msgDateFilter: any = { organizationId: orgId };
+    if (dateFrom || dateTo) {
+      msgDateFilter.timestamp = {};
+      if (dateFrom) msgDateFilter.timestamp.$gte = new Date(dateFrom);
+      if (dateTo) msgDateFilter.timestamp.$lte = new Date(dateTo);
+    }
 
-    // Messages sent over time
-    const messagesSent = conversationIds.length > 0 ? await Message.aggregate([
-      { $match: { conversationId: { $in: conversationIds } } },
+    const messagesSent = await Message.aggregate([
+      { $match: msgDateFilter },
       {
         $group: {
           _id: { $dateToString: { format: dateFormat[groupBy], date: '$timestamp' } },
@@ -318,7 +278,7 @@ export class AnalyticsService {
         }
       },
       { $sort: { _id: 1 } }
-    ]) : [];
+    ]);
 
     // Chat conversations over time (excluding phone)
     const chatConversations = await Conversation.aggregate([
@@ -404,25 +364,42 @@ export class AnalyticsService {
       { $sort: { _id: 1 } }
     ]);
 
-    // Get phone conversations for trend calculation
-    const phoneConversations = await Conversation.find({
-      ...dateQuery,
-      channel: 'phone'
-    }).select('transcript metadata createdAt updatedAt').lean();
+    // Call minutes trend — use stored callDurationSeconds field, no transcript loading
+    const callMinutesRaw = await Conversation.aggregate([
+      { $match: { ...dateQuery, channel: 'phone' } },
+      {
+        $project: {
+          period: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+          durationSeconds: {
+            $cond: {
+              if: { $and: [{ $gt: ['$callDurationSeconds', 0] }, { $lte: ['$callDurationSeconds', 7200] }] },
+              then: '$callDurationSeconds',
+              else: {
+                $cond: {
+                  if: {
+                    $and: [
+                      { $gt: [{ $subtract: ['$updatedAt', '$createdAt'] }, 0] },
+                      { $lte: [{ $subtract: ['$updatedAt', '$createdAt'] }, 7200000] }
+                    ]
+                  },
+                  then: { $divide: [{ $subtract: ['$updatedAt', '$createdAt'] }, 1000] },
+                  else: 0
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        $group: {
+          _id: '$period',
+          minutes: { $sum: { $ceil: { $divide: ['$durationSeconds', 60] } } }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
 
-    // Group call minutes by period in JS for consistency with CallMetricsService
-    const callMinutesByPeriod: Record<string, number> = {};
-    for (const conv of phoneConversations) {
-      const period = new Date(conv.createdAt).toISOString().split('T')[0]; // Simple day grouping for now
-      // Use the service logic
-      const duration = callMetricsService.getCallDuration(conv) || 0;
-      callMinutesByPeriod[period] = (callMinutesByPeriod[period] || 0) + duration;
-    }
-
-    const callMinutesTrend = Object.entries(callMinutesByPeriod).map(([_id, minutes]) => ({
-      _id,
-      minutes
-    }));
+    const callMinutesTrend = callMinutesRaw.map(r => ({ _id: r._id, minutes: r.minutes }));
 
     // Generate ALL periods in requested range to ensure continuous graphs
     const allPeriods: string[] = [];
@@ -659,56 +636,67 @@ export class AnalyticsService {
     };
   }
 
-  // Export Data
+  // Export Data — hard-capped at 2000 rows to prevent N+1 query bomb
   async exportData(organizationId: string, format: 'csv' | 'json', filters: any = {}) {
-    const query: any = { organizationId };
+    const EXPORT_LIMIT = 2000;
+    const orgId = new mongoose.Types.ObjectId(organizationId);
+    const query: any = { organizationId: orgId };
 
     if (filters.dateFrom || filters.dateTo) {
       query.createdAt = {};
       if (filters.dateFrom) query.createdAt.$gte = new Date(filters.dateFrom);
       if (filters.dateTo) query.createdAt.$lte = new Date(filters.dateTo);
     }
-
-    if (filters.status) {
-      query.status = filters.status;
-    }
-
-    if (filters.channel) {
-      query.channel = filters.channel;
-    }
+    if (filters.status) query.status = filters.status;
+    if (filters.channel) query.channel = filters.channel;
 
     const conversations = await Conversation.find(query)
       .populate('customerId', 'name email phone')
       .populate('assignedOperatorId', 'firstName lastName email')
       .sort({ createdAt: -1 })
+      .limit(EXPORT_LIMIT)
       .lean();
 
-    // Get messages for each conversation
-    const conversationsWithMessages = await Promise.all(
-      conversations.map(async (conv: any) => {
-        const messages = await Message.find({ conversationId: conv._id })
-          .sort({ timestamp: 1 })
-          .lean();
+    const convIds = conversations.map((c: any) => c._id);
 
-        return {
-          conversationId: conv._id,
-          customer: conv.customerId?.name || 'Unknown',
-          customerEmail: conv.customerId?.email || '',
-          customerPhone: conv.customerId?.phone || '',
-          channel: conv.channel,
-          status: conv.status,
-          assignedTo: conv.assignedOperatorId
-            ? `${conv.assignedOperatorId.firstName} ${conv.assignedOperatorId.lastName}`
-            : 'AI',
-          isAiManaged: conv.isAiManaging,
-          messageCount: messages.length,
-          firstMessage: messages[0]?.text || '',
-          lastMessage: messages[messages.length - 1]?.text || '',
-          createdAt: conv.createdAt,
-          resolvedAt: conv.resolvedAt || null
-        };
-      })
-    );
+    // Fetch first + last message per conversation in a single aggregation — no N+1
+    const msgSummaries = convIds.length > 0
+      ? await Message.aggregate([
+          { $match: { conversationId: { $in: convIds }, type: 'message' } },
+          { $sort: { conversationId: 1, timestamp: 1 } },
+          {
+            $group: {
+              _id: '$conversationId',
+              count: { $sum: 1 },
+              firstMessage: { $first: '$text' },
+              lastMessage: { $last: '$text' }
+            }
+          }
+        ])
+      : [];
+
+    const msgMap = new Map(msgSummaries.map((m: any) => [m._id.toString(), m]));
+
+    const conversationsWithMessages = conversations.map((conv: any) => {
+      const msgs = msgMap.get(conv._id.toString());
+      return {
+        conversationId: conv._id,
+        customer: conv.customerId?.name || 'Unknown',
+        customerEmail: conv.customerId?.email || '',
+        customerPhone: conv.customerId?.phone || '',
+        channel: conv.channel,
+        status: conv.status,
+        assignedTo: conv.assignedOperatorId
+          ? `${conv.assignedOperatorId.firstName} ${conv.assignedOperatorId.lastName}`
+          : 'AI',
+        isAiManaged: conv.isAiManaging,
+        messageCount: msgs?.count ?? 0,
+        firstMessage: msgs?.firstMessage ?? '',
+        lastMessage: msgs?.lastMessage ?? '',
+        createdAt: conv.createdAt,
+        resolvedAt: conv.resolvedAt || null
+      };
+    });
 
     if (format === 'json') {
       return {

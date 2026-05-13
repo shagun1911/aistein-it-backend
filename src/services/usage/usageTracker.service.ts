@@ -37,83 +37,56 @@ function localCacheSet(key: string, value: any): void {
 export class UsageTrackerService {
   /**
    * Calculate call minutes from actual phone conversations.
-   * Only fetches the fields needed for duration calculation — no full-document load.
+   *
+   * Uses the denormalized `callDurationSeconds` field when present (set at call-end),
+   * falling back to a createdAt→updatedAt difference for conversations that don't have it.
+   * Never loads transcript data into Node memory.
    */
   async calculateCallMinutes(organizationId: string): Promise<number> {
     try {
-      const conversations = await Conversation.find({
-        organizationId,
-        channel: 'phone'
-      }).select('transcript metadata createdAt updatedAt').lean();
-
-      let totalMinutes = 0;
-
-      for (const conv of conversations) {
-        let duration = 0;
-
-        // Method 1: Calculate from transcript items (most accurate)
-        const transcriptItems = Array.isArray(conv.transcript)
-          ? conv.transcript
-          : (conv.transcript as any)?.messages;
-
-        if (Array.isArray(transcriptItems)) {
-          const timestamps = transcriptItems
-            .map((item: any) => item.timestamp || item.time || item.created_at)
-            .filter(Boolean)
-            .map((ts: any) => new Date(ts).getTime())
-            .sort((a: number, b: number) => a - b);
-
-          if (timestamps.length >= 2) {
-            const firstTime = timestamps[0];
-            const lastTime = timestamps[timestamps.length - 1];
-            duration = Math.ceil((lastTime - firstTime) / 1000 / 60); // Round up to minutes
+      const result = await Conversation.aggregate([
+        {
+          $match: {
+            organizationId: new mongoose.Types.ObjectId(organizationId),
+            channel: 'phone'
           }
-        }
-
-        // Method 2: Use metadata duration fields if available
-        if (duration === 0 && conv.metadata) {
-          const meta = conv.metadata as any;
-          const rawDuration = meta.duration || meta.duration_seconds || meta.call_duration_secs || meta.call_duration_seconds;
-
-          if (rawDuration !== undefined && rawDuration !== null) {
-            const metaDuration = parseInt(String(rawDuration), 10);
-            if (!isNaN(metaDuration)) {
-              duration = Math.ceil(metaDuration / 60);
-            }
-          }
-
-          // Fallback: Calculate from metadata timestamps
-          if (duration === 0) {
-            const start = meta.callInitiated || meta.AcceptedAt || meta.accepted_time_unix_secs;
-            const end = meta.callCompletedAt || meta.CompletedAt || meta.end_time_unix_secs;
-
-            if (start && end) {
-              const startTime = typeof start === 'number' ? start * 1000 : new Date(start).getTime();
-              const endTime = typeof end === 'number' ? end * 1000 : new Date(end).getTime();
-              const diffSeconds = (endTime - startTime) / 1000;
-              if (diffSeconds > 0 && diffSeconds < 7200) {
-                duration = Math.ceil(diffSeconds / 60);
+        },
+        {
+          $project: {
+            // Prefer explicit stored duration; fall back to updatedAt-createdAt diff capped at 2 h
+            durationSeconds: {
+              $cond: {
+                if: { $and: [{ $gt: ['$callDurationSeconds', 0] }, { $lte: ['$callDurationSeconds', 7200] }] },
+                then: '$callDurationSeconds',
+                else: {
+                  $cond: {
+                    if: {
+                      $and: [
+                        { $gt: [{ $subtract: ['$updatedAt', '$createdAt'] }, 0] },
+                        { $lte: [{ $subtract: ['$updatedAt', '$createdAt'] }, 7200000] }
+                      ]
+                    },
+                    then: { $divide: [{ $subtract: ['$updatedAt', '$createdAt'] }, 1000] },
+                    else: 0
+                  }
+                }
               }
             }
           }
-        }
-
-        // Method 3: Calculate from createdAt to updatedAt (with reasonable cap)
-        if (duration === 0 && conv.createdAt && conv.updatedAt) {
-          const start = new Date(conv.createdAt).getTime();
-          const end = new Date(conv.updatedAt).getTime();
-          const diffSeconds = (end - start) / 1000;
-
-          // Only count if duration is reasonable (0s to 2 hours)
-          if (diffSeconds > 0 && diffSeconds < 7200) {
-            duration = Math.ceil(diffSeconds / 60);
+        },
+        {
+          $group: {
+            _id: null,
+            totalSeconds: { $sum: '$durationSeconds' },
+            count: { $sum: 1 }
           }
         }
+      ]);
 
-        totalMinutes += duration;
-      }
+      if (!result.length) return 0;
 
-      logger.info(`[Usage Tracker] Org ${organizationId}: ${totalMinutes} call minutes from ${conversations.length} phone conversations`);
+      const totalMinutes = Math.ceil(result[0].totalSeconds / 60);
+      logger.info(`[Usage Tracker] Org ${organizationId}: ${totalMinutes} call minutes from ${result[0].count} phone conversations`);
       return totalMinutes;
 
     } catch (error: any) {
@@ -123,15 +96,44 @@ export class UsageTrackerService {
   }
 
   /**
-   * Calculate total chat messages sent + received
-   * 
-   * Chat message = every message in non-phone channels
+   * Calculate total chat messages sent + received (non-phone channels).
+   *
+   * Queries Message directly using the denormalized organizationId field —
+   * no two-step conversation-ID lookup needed.
+   * Falls back to the two-step path for messages not yet backfilled (organizationId missing).
    */
   async calculateChatMessages(organizationId: string): Promise<number> {
     try {
-      // Find all conversation IDs for this organization that are NOT phone conversations
+      const orgObjectId = new mongoose.Types.ObjectId(organizationId);
+
+      // Fast path: messages that already carry organizationId (post-backfill)
+      const directCount = await Message.countDocuments({
+        organizationId: orgObjectId
+      });
+
+      if (directCount > 0) {
+        // Subtract phone-channel messages by joining through Conversation — still only one extra
+        // aggregation that only touches phone conversations, which are typically few.
+        const phoneConvIds = await Conversation.find({
+          organizationId: orgObjectId,
+          channel: 'phone'
+        }).distinct('_id');
+
+        const phoneMessageCount = phoneConvIds.length > 0
+          ? await Message.countDocuments({
+              organizationId: orgObjectId,
+              conversationId: { $in: phoneConvIds }
+            })
+          : 0;
+
+        const count = directCount - phoneMessageCount;
+        logger.info(`[Usage Tracker] Org ${organizationId}: ${count} chat messages (direct query)`);
+        return count;
+      }
+
+      // Fallback for orgs whose messages predate the backfill
       const nonPhoneConversations = await Conversation.find({
-        organizationId: new mongoose.Types.ObjectId(organizationId),
+        organizationId: orgObjectId,
         channel: { $ne: 'phone' }
       }).distinct('_id');
 
@@ -139,7 +141,7 @@ export class UsageTrackerService {
         conversationId: { $in: nonPhoneConversations }
       });
 
-      logger.info(`[Usage Tracker] Org ${organizationId}: ${count} chat messages from ${nonPhoneConversations.length} non-phone conversations`);
+      logger.info(`[Usage Tracker] Org ${organizationId}: ${count} chat messages (fallback query)`);
       return count;
 
     } catch (error: any) {
@@ -152,14 +154,28 @@ export class UsageTrackerService {
    * Calculate conversations count.
    * Conversation = has at least 2 messages (1 user + 1 bot/system reply).
    *
-   * Uses a two-step count instead of a $lookup so MongoDB never materialises
-   * message arrays in memory — avoiding the previous minute-long stall.
+   * Uses organizationId on Message directly when available (post-backfill),
+   * falling back to the two-step path otherwise.
    */
   async calculateConversations(organizationId: string): Promise<number> {
     try {
       const orgObjectId = new mongoose.Types.ObjectId(organizationId);
 
-      // Step 1: get all conversation IDs for this org (lightweight — IDs only)
+      // Fast path: aggregate directly on Message using denormalized organizationId
+      const sampleCheck = await Message.findOne({ organizationId: orgObjectId }).select('_id').lean();
+      if (sampleCheck) {
+        const result = await Message.aggregate([
+          { $match: { organizationId: orgObjectId } },
+          { $group: { _id: '$conversationId', count: { $sum: 1 } } },
+          { $match: { count: { $gte: 2 } } },
+          { $count: 'total' }
+        ]);
+        const count = result[0]?.total || 0;
+        logger.info(`[Usage Tracker] Org ${organizationId}: ${count} conversations (direct query)`);
+        return count;
+      }
+
+      // Fallback: two-step for orgs whose messages predate the backfill
       const convDocs = await Conversation.find({ organizationId: orgObjectId })
         .select('_id')
         .lean();
@@ -167,9 +183,6 @@ export class UsageTrackerService {
       if (convDocs.length === 0) return 0;
 
       const convIds = convDocs.map((c) => c._id);
-
-      // Step 2: group messages by conversationId and count those with >= 2 messages.
-      // No document materialisation — only counts are produced.
       const result = await Message.aggregate([
         { $match: { conversationId: { $in: convIds } } },
         { $group: { _id: '$conversationId', count: { $sum: 1 } } },
@@ -178,7 +191,7 @@ export class UsageTrackerService {
       ]);
 
       const count = result[0]?.total || 0;
-      logger.info(`[Usage Tracker] Org ${organizationId}: ${count} conversations`);
+      logger.info(`[Usage Tracker] Org ${organizationId}: ${count} conversations (fallback query)`);
       return count;
 
     } catch (error: any) {

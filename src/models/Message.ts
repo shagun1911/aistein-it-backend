@@ -2,6 +2,7 @@ import mongoose, { Schema, Document } from 'mongoose';
 
 export interface IMessage extends Document {
   conversationId: mongoose.Types.ObjectId;
+  organizationId?: mongoose.Types.ObjectId; // Denormalized for direct org-scoped queries — avoids two-step $in patterns
   sender: 'customer' | 'ai' | 'operator';
   operatorId?: mongoose.Types.ObjectId;
   text: string;
@@ -32,6 +33,11 @@ const MessageSchema = new Schema<IMessage>({
     type: Schema.Types.ObjectId,
     ref: 'Conversation',
     required: true
+  },
+  organizationId: {
+    type: Schema.Types.ObjectId,
+    ref: 'Organization',
+    index: true
   },
   sender: {
     type: String,
@@ -83,6 +89,9 @@ const MessageSchema = new Schema<IMessage>({
 });
 
 MessageSchema.index({ conversationId: 1, timestamp: -1 });
+// Compound indexes that enable direct org-scoped message queries without a prior conv-ID lookup
+MessageSchema.index({ organizationId: 1, timestamp: -1 });
+MessageSchema.index({ organizationId: 1, type: 1, timestamp: -1 });
 MessageSchema.index({ text: 'text' });
 MessageSchema.index({ messageId: 1 }); // Index for status updates lookup
 

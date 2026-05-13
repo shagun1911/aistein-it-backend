@@ -18,6 +18,8 @@ export interface IConversation extends Document {
     collection?: string;
     [key: string]: any;
   };
+  /** Stored at call-end so usage queries never need to load transcript data. */
+  callDurationSeconds?: number;
   firstResponseAt?: Date;
   resolvedAt?: Date;
   createdAt: Date;
@@ -79,6 +81,10 @@ const ConversationSchema = new Schema<IConversation>({
   metadata: {
     type: Schema.Types.Mixed,
     default: {}
+  },
+  callDurationSeconds: {
+    type: Number,
+    default: null
   },
   firstResponseAt: Date,
   resolvedAt: Date

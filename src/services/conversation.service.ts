@@ -246,6 +246,7 @@ export class ConversationService {
 
     const message = await Message.create({
       conversationId,
+      organizationId: conversation.organizationId, // Denormalize for direct org-scoped queries
       ...messageData,
       timestamp: new Date()
     });
@@ -320,6 +321,7 @@ export class ConversationService {
     // Create message in database
     const message = await Message.create({
       conversationId,
+      organizationId: (conversation as any).organizationId, // Denormalize for direct org-scoped queries
       sender: operatorId ? 'operator' : 'ai',
       text: messageText,
       type: 'message',
@@ -938,13 +940,12 @@ export class ConversationService {
             if (pythonData.status === 'completed' || pythonData.status === 'ended') {
               conversation.status = 'closed';
               
-              // Track voice minutes when call completes
-              // Get duration from Python API response or metadata
+              // Store duration on the conversation so usage queries never need to read transcripts
               const durationSeconds = pythonData.duration || pythonData.metadata?.duration;
               if (durationSeconds && durationSeconds > 0) {
-                const durationMinutes = Math.ceil(durationSeconds / 60); // Round up to minutes
-                
-                // Find user from organization to track usage
+                (conversation as any).callDurationSeconds = durationSeconds;
+
+                const durationMinutes = Math.ceil(durationSeconds / 60);
                 try {
                   const Organization = (await import('../models/Organization')).default;
                   const org = await Organization.findById(conversation.organizationId);
@@ -954,7 +955,6 @@ export class ConversationService {
                   }
                 } catch (usageError: any) {
                   console.warn('[Conversation Service] Failed to track voice minutes:', usageError.message);
-                  // Don't fail transcript update if usage tracking fails
                 }
               }
             }
@@ -976,6 +976,7 @@ export class ConversationService {
                 .filter((item: any) => item.type === 'message' || item.role)
                 .map((item: any) => ({
                   conversationId: conversation._id,
+                  organizationId: conversation.organizationId,
                   type: 'message',
                   text: item.content || item.text || (Array.isArray(item.content) ? item.content.join(' ') : ''),
                   sender: item.role === 'user' ? 'customer' : 'ai',
@@ -1049,6 +1050,14 @@ export class ConversationService {
         recording_url: callDocument.metadata?.recording_url || callDocument.recording_url || null
       };
 
+      // Store duration so usage queries never need to load transcript data
+      const rawDuration = callDocument.metadata?.duration_seconds
+        || callDocument.metadata?.call_duration_secs
+        || callDocument.metadata?.duration;
+      if (rawDuration && Number(rawDuration) > 0) {
+        (conversation as any).callDurationSeconds = Number(rawDuration);
+      }
+
       // CRITICAL: Don't update 'updatedAt' when refreshing transcript
       // This prevents conversation from jumping to top of list
       await conversation.save({ timestamps: false });
@@ -1065,6 +1074,7 @@ export class ConversationService {
           .filter((item: any) => item.type === 'message')
           .map((item: any) => ({
             conversationId: conversation._id,
+            organizationId: conversation.organizationId,
             type: 'message',
             text: Array.isArray(item.content) ? item.content.join(' ') : (item.content || ''),
             sender: item.role === 'user' ? 'customer' : 'ai',
@@ -1416,16 +1426,20 @@ export class ConversationService {
         }
       }
 
-      // Add messages
+      // Add messages — use insertMany for efficiency and stamp organizationId on each
       console.log('[Widget Conversation] Adding', data.messages.length, 'messages');
-      for (const msg of data.messages) {
-        await Message.create({
-          conversationId: conversation._id,
-          sender: msg.role === 'user' ? 'customer' : 'ai', // Valid values: 'customer', 'ai', 'operator'
-          text: msg.content, // Message model uses 'text' not 'content'
-          type: 'message', // Default message type
-          timestamp: msg.timestamp
-        });
+      if (data.messages.length > 0) {
+        await Message.insertMany(
+          data.messages.map((msg: any) => ({
+            conversationId: conversation._id,
+            organizationId: conversation.organizationId,
+            sender: msg.role === 'user' ? 'customer' : 'ai',
+            text: msg.content,
+            type: 'message',
+            timestamp: msg.timestamp
+          })),
+          { ordered: false }
+        );
       }
 
       // Update conversation updatedAt

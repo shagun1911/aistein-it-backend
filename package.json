@@ -12,6 +12,7 @@
     "seed:kb": "ts-node-dev --transpile-only src/scripts/seedKnowledgeBase.ts",
     "seed:lists": "ts-node-dev --transpile-only src/scripts/seedContactLists.ts",
     "migrate:multitenant": "ts-node-dev --transpile-only src/scripts/migrateToMultiTenant.ts",
+    "migrate:backfill-message-org-id": "ts-node-dev --transpile-only src/scripts/backfillMessageOrgId.ts",
     "create:user": "ts-node-dev --transpile-only src/scripts/createUser.ts",
     "create:admin": "ts-node-dev --transpile-only src/scripts/createAdmin.ts",
     "remove:admin-roles": "ts-node-dev --transpile-only src/scripts/removeAdminRoles.ts",

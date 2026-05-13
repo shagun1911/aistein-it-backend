@@ -8,6 +8,15 @@ import { AppError } from '../middleware/error.middleware';
 function escapeRegex(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+/** Parse `dateRangeDays` from query/body (string | string[] | number). Default 1. Cap 365. */
+function parseDateRangeDays(raw: unknown): number {
+  if (raw === undefined || raw === null || raw === '') return 1;
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(Math.floor(n), 365);
+}
 import socialIntegrationService from './socialIntegration.service';
 import { trackUsage } from '../middleware/profileTracking.middleware';
 import { usageService } from './usage.service';
@@ -99,15 +108,16 @@ export class ConversationService {
       query.updatedAt = {};
       if (filters.dateFrom) query.updatedAt.$gte = new Date(filters.dateFrom);
       if (filters.dateTo) query.updatedAt.$lte = new Date(filters.dateTo);
-    } else if (filters.dateRangeDays) {
-      // dateRangeDays is "last N days" expressed as an integer (capped at 365 server-side).
-      // We filter on updatedAt so long-running open tickets appear even when created earlier.
-      // When search is active the frontend sends dateRangeDays=365 to widen the window.
-      const days = Math.min(Math.max(1, Number(filters.dateRangeDays)), 365);
-      const since = new Date();
-      since.setDate(since.getDate() - days);
-      since.setHours(0, 0, 0, 0);
-      query.updatedAt = { $gte: since };
+    } else {
+      // Rolling calendar-day window on updatedAt (server local midnight).
+      // N=1 → start of *today* only (not "since yesterday").
+      // N>1 → inclusive N calendar days ending today: start = today 00:00 minus (N-1) days.
+      // Default when param is missing so older clients / proxies still get a bounded list.
+      const days = parseDateRangeDays(filters.dateRangeDays);
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      start.setDate(start.getDate() - (days - 1));
+      query.updatedAt = { $gte: start };
     }
 
     const skip = (page - 1) * limit;

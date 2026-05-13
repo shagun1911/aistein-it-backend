@@ -136,13 +136,13 @@ export class ConversationService {
 
     const skip = (page - 1) * limit;
 
-    // Fetch one extra row to detect hasNext without a countDocuments scan.
-    // countDocuments on a large matching set blocks the entire response — removing it
-    // is the single biggest performance win for large accounts.
+    // Single query — no extra round-trips.
+    // lastMessage is denormalized onto the Conversation document (updated on every addMessage call),
+    // so we never need a separate Message aggregate for the list view.
+    // assignedOperatorId is NOT populated here — the list card only needs the customer name/avatar.
     const rawConversations = await Conversation.find(query)
       .select('-transcript')
       .populate('customerId', 'name email phone avatar color')
-      .populate('assignedOperatorId', 'firstName lastName avatar')
       .sort({ updatedAt: -1 })
       .skip(skip)
       .limit(limit + 1)
@@ -152,37 +152,7 @@ export class ConversationService {
     // Drop the extra look-ahead row so we return exactly `limit` items.
     const conversations = hasNext ? rawConversations.slice(0, limit) : rawConversations;
 
-    const convIds = conversations.map((c: any) => c._id).filter(Boolean);
-    const lastByConvId = new Map<string, { id: unknown; text: string; sender: string; timestamp: Date }>();
-
-    if (convIds.length > 0) {
-      const lastRows = await Message.aggregate([
-        { $match: { conversationId: { $in: convIds }, type: 'message' } },
-        { $sort: { timestamp: -1 } },
-        {
-          $group: {
-            _id: '$conversationId',
-            id: { $first: '$_id' },
-            text: { $first: '$text' },
-            sender: { $first: '$sender' },
-            timestamp: { $first: '$timestamp' }
-          }
-        }
-      ]);
-
-      for (const row of lastRows) {
-        lastByConvId.set(String(row._id), {
-          id: row.id,
-          text: row.text ?? '',
-          sender: row.sender ?? 'customer',
-          timestamp: row.timestamp
-        });
-      }
-    }
-
     const conversationsWithLastMessage = conversations.map((conv: any) => {
-      const lastMessage = lastByConvId.get(String(conv._id)) ?? null;
-
       if (conv.customerId) {
         if (!conv.customerId.name || conv.customerId.name === '') {
           conv.customerId.name =
@@ -194,14 +164,7 @@ export class ConversationService {
         ...conv,
         transcript: conv.transcript || null,
         metadata: conv.metadata || {},
-        lastMessage: lastMessage
-          ? {
-              id: lastMessage.id,
-              text: lastMessage.text,
-              sender: lastMessage.sender,
-              timestamp: lastMessage.timestamp
-            }
-          : null
+        lastMessage: conv.lastMessage ?? null
       };
     });
 
@@ -289,10 +252,17 @@ export class ConversationService {
       timestamp: new Date()
     });
 
-    // Update conversation updated_at
+    // Update conversation metadata + denormalize lastMessage so findAll needs no extra query.
     conversation.updatedAt = new Date();
     if (messageData.sender === 'customer') {
       conversation.unread = true;
+    }
+    if (messageData.type !== 'internal_note') {
+      (conversation as any).lastMessage = {
+        text: messageData.text || '',
+        sender: messageData.sender,
+        timestamp: message.timestamp
+      };
     }
     await conversation.save();
 
@@ -632,10 +602,15 @@ export class ConversationService {
       });
     }
 
-    // Update conversation
+    // Update conversation + denormalize lastMessage for the list view.
     await Conversation.findByIdAndUpdate(conversationId, {
       updatedAt: new Date(),
-      unread: false
+      unread: false,
+      lastMessage: {
+        text: messageText,
+        sender: operatorId ? 'operator' : 'ai',
+        timestamp: message.timestamp
+      }
     });
 
     // Emit Socket.io events for real-time updates
@@ -1480,8 +1455,16 @@ export class ConversationService {
         );
       }
 
-      // Update conversation updatedAt
+      // Update conversation + denormalize lastMessage for fast list rendering.
       conversation.updatedAt = new Date();
+      if (data.messages.length > 0) {
+        const lastMsg = data.messages[data.messages.length - 1];
+        (conversation as any).lastMessage = {
+          text: lastMsg.content || '',
+          sender: lastMsg.role === 'user' ? 'customer' : 'ai',
+          timestamp: lastMsg.timestamp || new Date()
+        };
+      }
       await conversation.save();
 
       // Notify dashboard (Conversations list) to refetch

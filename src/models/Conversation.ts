@@ -22,6 +22,16 @@ export interface IConversation extends Document {
   callDurationSeconds?: number;
   firstResponseAt?: Date;
   resolvedAt?: Date;
+  /**
+   * Denormalized preview of the most recent message.
+   * Updated on every inbound/outbound message so the list query needs zero
+   * extra DB round-trips to render conversation cards.
+   */
+  lastMessage?: {
+    text: string;
+    sender: 'customer' | 'ai' | 'operator';
+    timestamp: Date;
+  };
   createdAt: Date;
   updatedAt: Date;
 }
@@ -87,7 +97,15 @@ const ConversationSchema = new Schema<IConversation>({
     default: null
   },
   firstResponseAt: Date,
-  resolvedAt: Date
+  resolvedAt: Date,
+  lastMessage: {
+    type: {
+      text: { type: String, default: '' },
+      sender: { type: String, enum: ['customer', 'ai', 'operator'] },
+      timestamp: { type: Date }
+    },
+    default: null
+  }
 }, { timestamps: true });
 
 ConversationSchema.index({ customerId: 1 });

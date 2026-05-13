@@ -136,18 +136,21 @@ export class ConversationService {
 
     const skip = (page - 1) * limit;
 
-    // Count + page fetch in parallel — first paint only needs this page (default 25 rows).
-    const [total, conversations] = await Promise.all([
-      Conversation.countDocuments(query),
-      Conversation.find(query)
-        .select('-transcript')
-        .populate('customerId', 'name email phone avatar color')
-        .populate('assignedOperatorId', 'firstName lastName avatar')
-        .sort({ updatedAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean()
-    ]);
+    // Fetch one extra row to detect hasNext without a countDocuments scan.
+    // countDocuments on a large matching set blocks the entire response — removing it
+    // is the single biggest performance win for large accounts.
+    const rawConversations = await Conversation.find(query)
+      .select('-transcript')
+      .populate('customerId', 'name email phone avatar color')
+      .populate('assignedOperatorId', 'firstName lastName avatar')
+      .sort({ updatedAt: -1 })
+      .skip(skip)
+      .limit(limit + 1)
+      .lean();
+
+    const hasNext = rawConversations.length > limit;
+    // Drop the extra look-ahead row so we return exactly `limit` items.
+    const conversations = hasNext ? rawConversations.slice(0, limit) : rawConversations;
 
     const convIds = conversations.map((c: any) => c._id).filter(Boolean);
     const lastByConvId = new Map<string, { id: unknown; text: string; sender: string; timestamp: Date }>();
@@ -207,9 +210,11 @@ export class ConversationService {
       pagination: {
         page,
         limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-        hasNext: page * limit < total,
+        // total is omitted — countDocuments is too expensive for large orgs.
+        // Use hasNext/hasPrev for pagination controls.
+        total: null as unknown as number,
+        totalPages: null as unknown as number,
+        hasNext,
         hasPrev: page > 1
       }
     };

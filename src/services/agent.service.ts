@@ -333,7 +333,7 @@ export class AgentService {
     return 'eleven_flash_v2';
   }
 
-  private buildSafePromptSyncBody(agent: any, toolIds: string[]): Record<string, any> {
+  private buildSafePromptSyncBody(agent: any, _toolIds: string[]): Record<string, any> {
     const dbFirst = typeof agent?.first_message === 'string' ? agent.first_message.trim() : '';
     const dbGreeting = typeof agent?.greeting_message === 'string' ? agent.greeting_message.trim() : '';
     const dbSystem = typeof agent?.system_prompt === 'string' ? agent.system_prompt.trim() : '';
@@ -350,7 +350,6 @@ export class AgentService {
       system_prompt: dbSystem + COLLECT_ONLY_INSTRUCTION,
       language: agent?.language || 'en',
       knowledge_base_ids: agent?.knowledge_base_ids || [],
-      tool_ids: toolIds,
       ...(agent?.voice_id ? { voice_id: agent.voice_id } : {})
     };
   }
@@ -366,7 +365,6 @@ export class AgentService {
     firstMessageToSend: string,
     systemPromptToSend: string,
     validKnowledgeBaseIds: string[],
-    toolIds: string[],
     persistedAgent: IAgent
   ): Promise<void> {
     const postCallWebhookUrl = process.env.POST_CALL_WEBHOOK_URL?.trim();
@@ -392,8 +390,7 @@ export class AgentService {
       knowledge_base_ids: validKnowledgeBaseIds,
       language: data.language,
       name: data.name,
-      system_prompt: systemPromptToSend,
-      tool_ids: toolIds
+      system_prompt: systemPromptToSend
     };
 
     if (postCallWebhookUrl) {
@@ -796,7 +793,6 @@ export class AgentService {
           firstMessageToSend,
           systemPromptToSend,
           validKnowledgeBaseIds,
-          toolIds,
           agent
         );
       } catch (error: any) {
@@ -962,7 +958,6 @@ export class AgentService {
       system_prompt: systemPromptToSend,
       language: data.language,
       knowledge_base_ids: validKnowledgeBaseIds,
-      tool_ids: toolIds,
       built_in_tools: builtInToolsPayload
     };
 

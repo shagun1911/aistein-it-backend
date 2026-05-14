@@ -82,6 +82,11 @@ export interface CreateAgentRequest {
   voice_id?: string;
   escalationRules?: string[];
   knowledge_base_ids: string[];
+  /** Optional; when omitted, defaults match Agent schema / normalizeBuiltInToolsForDb */
+  built_in_tools?: BuiltInToolsInput;
+  built_in_tool_details?: BuiltInToolDetails;
+  enable_human_transfer?: boolean;
+  human_transfer_rules?: HumanTransferRule[];
   // tool_ids are now automatically added from env variables, not required in request
 }
 
@@ -348,6 +353,74 @@ export class AgentService {
       tool_ids: toolIds,
       ...(agent?.voice_id ? { voice_id: agent.voice_id } : {})
     };
+  }
+
+  /**
+   * Immediately after Python POST /api/v1/agents, PATCH /api/v1/agents/{id}/prompt with the
+   * full prompt/tools/KB/built-ins payload. Includes post_call_webhook_url from POST_CALL_WEBHOOK_URL
+   * when set (separate from POST_CALL_WEBHOOK_ID on PATCH /agents/{id}).
+   */
+  private async patchAgentPromptImmediatelyAfterCreate(
+    agentId: string,
+    data: CreateAgentRequest,
+    firstMessageToSend: string,
+    systemPromptToSend: string,
+    validKnowledgeBaseIds: string[],
+    toolIds: string[],
+    persistedAgent: IAgent
+  ): Promise<void> {
+    const postCallWebhookUrl = process.env.POST_CALL_WEBHOOK_URL?.trim();
+
+    const builtInToolFlags = normalizeBuiltInToolsForDb(
+      data.built_in_tools,
+      (persistedAgent.built_in_tools as BuiltInTools | undefined) ?? null
+    );
+    const detailsForPayload =
+      data.built_in_tool_details !== undefined
+        ? data.built_in_tool_details
+        : ((persistedAgent as IAgent).built_in_tool_details as BuiltInToolDetails | undefined);
+    const mergedBuiltInInput = mergeBuiltInToolsInputForPython(
+      builtInToolFlags,
+      detailsForPayload ?? null,
+      data.built_in_tools
+    );
+    const builtInToolsPayload = buildBuiltInToolsPythonPayload(mergedBuiltInInput, builtInToolFlags);
+
+    const requestBody: Record<string, unknown> = {
+      built_in_tools: builtInToolsPayload,
+      first_message: firstMessageToSend,
+      knowledge_base_ids: validKnowledgeBaseIds,
+      language: data.language,
+      name: data.name,
+      system_prompt: systemPromptToSend,
+      tool_ids: toolIds
+    };
+
+    if (postCallWebhookUrl) {
+      requestBody.post_call_webhook_url = postCallWebhookUrl;
+    }
+
+    if (data.voice_id !== undefined && data.voice_id !== null && String(data.voice_id).trim() !== '') {
+      requestBody.voice_id = String(data.voice_id).trim();
+    }
+
+    if (data.enable_human_transfer !== undefined) {
+      requestBody.enable_human_transfer = data.enable_human_transfer;
+      requestBody.human_transfer_rules = data.enable_human_transfer
+        ? Array.isArray(data.human_transfer_rules)
+          ? data.human_transfer_rules
+          : []
+        : [];
+    }
+
+    const pythonUrl = `${PYTHON_API_BASE_URL}/api/v1/agents/${agentId}/prompt`;
+    console.log('[Agent Service] PATCH prompt immediately after create:', pythonUrl);
+    console.log('[Agent Service] post_call_webhook_url:', postCallWebhookUrl ? '(set)' : '(not set)');
+
+    await axios.patch(pythonUrl, requestBody, {
+      timeout: 30000,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 
   /**
@@ -704,10 +777,39 @@ export class AgentService {
         voice_id: data.voice_id,
         escalationRules: data.escalationRules || [],
         knowledge_base_ids: validKnowledgeBaseIds,
-        tool_ids: toolIds // Use the static tool IDs from env
+        tool_ids: toolIds, // Use the static tool IDs from env
+        ...(data.built_in_tools !== undefined ? { built_in_tools: normalizeBuiltInToolsForDb(data.built_in_tools, null) } : {}),
+        ...(data.built_in_tool_details !== undefined
+          ? { built_in_tool_details: sanitizeBuiltInToolDetails(data.built_in_tool_details) ?? data.built_in_tool_details }
+          : {}),
+        ...(data.enable_human_transfer !== undefined ? { enable_human_transfer: data.enable_human_transfer } : {}),
+        ...(data.human_transfer_rules !== undefined ? { human_transfer_rules: data.human_transfer_rules } : {})
       });
 
       console.log(`[Agent Service] Agent created successfully with ID: ${agent.agent_id}`);
+
+      // Full prompt PATCH (tools, KB, built-ins, optional post_call_webhook_url from env)
+      try {
+        await this.patchAgentPromptImmediatelyAfterCreate(
+          agent.agent_id,
+          data,
+          firstMessageToSend,
+          systemPromptToSend,
+          validKnowledgeBaseIds,
+          toolIds,
+          agent
+        );
+      } catch (error: any) {
+        console.error('[Agent Service] ⚠️ Failed PATCH /agents/{id}/prompt after create (non-fatal):', error.response?.data || error.message);
+      }
+
+      if (toolIds.length > 0) {
+        try {
+          await this.enableToolNodeForAgent(agent.agent_id);
+        } catch (error: any) {
+          console.error('[Agent Service] ⚠️ Failed to enable tool_node after create (non-fatal):', error.message);
+        }
+      }
 
       // CRITICAL: Update voice_id in conversation_config.tts
       // This ensures the voice is actually used in calls
@@ -720,20 +822,13 @@ export class AgentService {
         }
       }
 
-      // Attach POST_CALL_WEBHOOK_ID to the newly created agent
-      try {
-        await this.attachWebhookToAgent(agent.agent_id);
-      } catch (error: any) {
-        console.error('[Agent Service] ⚠️ Failed to attach webhook after agent creation (non-fatal):', error.message);
-      }
-
-      // Sync tools to ElevenLabs after agent creation
-      // This ensures tools are available in the agent runtime
-      try {
-        await this.syncAgentToolsToElevenLabs(agent);
-      } catch (error: any) {
-        console.error('[Agent Service] ⚠️ Failed to sync tools after agent creation (non-fatal):', error.message);
-        // Don't throw - agent creation succeeded, sync is a background operation
+      // Attach POST_CALL_WEBHOOK_ID only when not using URL on the prompt PATCH
+      if (!process.env.POST_CALL_WEBHOOK_URL?.trim()) {
+        try {
+          await this.attachWebhookToAgent(agent.agent_id);
+        } catch (error: any) {
+          console.error('[Agent Service] ⚠️ Failed to attach webhook after agent creation (non-fatal):', error.message);
+        }
       }
 
       return agent;

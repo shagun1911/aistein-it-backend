@@ -126,6 +126,7 @@ export class AgentController {
         escalationRules,
         knowledge_base_ids,
         built_in_tools,
+        built_in_tool_details,
         enable_human_transfer,
         human_transfer_rules
       } = req.body;
@@ -172,6 +173,7 @@ export class AgentController {
         escalationRules: escalationRules,
         knowledge_base_ids: filteredKnowledgeBaseIds,
         built_in_tools: built_in_tools,
+        built_in_tool_details,
         enable_human_transfer: enable_human_transfer,
         human_transfer_rules: human_transfer_rules
       });

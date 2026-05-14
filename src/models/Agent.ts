@@ -12,6 +12,13 @@ export interface BuiltInTools {
   voicemail_detection?: boolean;
 }
 
+/** User-editable copy for built-in tools (sent to voice provider as tool descriptions / params). */
+export interface BuiltInToolDetails {
+  end_call?: { description?: string };
+  language_detection?: { description?: string };
+  voicemail_detection?: { description?: string; voicemail_message?: string };
+}
+
 export interface IAgent extends Document {
   userId: mongoose.Types.ObjectId;
   agent_id: string; // From external Python API response
@@ -25,6 +32,7 @@ export interface IAgent extends Document {
   knowledge_base_ids: string[]; // Array of document IDs
   tool_ids: string[]; // Array of tool IDs
   built_in_tools?: BuiltInTools;
+  built_in_tool_details?: BuiltInToolDetails;
   enable_human_transfer?: boolean;
   human_transfer_rules?: HumanTransferRule[];
   createdAt: Date;
@@ -87,6 +95,21 @@ const AgentSchema = new Schema<IAgent>({
       voicemail_detection: { type: Boolean, default: false }
     },
     default: () => ({ end_call: true, language_detection: false, voicemail_detection: false })
+  },
+  built_in_tool_details: {
+    type: {
+      end_call: {
+        description: { type: String, default: '' }
+      },
+      language_detection: {
+        description: { type: String, default: '' }
+      },
+      voicemail_detection: {
+        description: { type: String, default: '' },
+        voicemail_message: { type: String, default: '' }
+      }
+    },
+    default: undefined
   },
   enable_human_transfer: {
     type: Boolean,

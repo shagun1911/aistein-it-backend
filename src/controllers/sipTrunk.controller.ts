@@ -293,13 +293,18 @@ export class SipTrunkController {
         agent_phone_number_id,
         to_number,
         customer_info,
-        sender_email: requestSenderEmail
+        dynamic_variables,
+        sender_email: requestSenderEmail,
+        omit_sender_email
       } = req.body;
 
       // Get sender email from request, or automatically fetch from connected Gmail
-      let sender_email = requestSenderEmail;
-      
-      if (!sender_email) {
+      let sender_email: string | undefined = requestSenderEmail;
+
+      if (omit_sender_email) {
+        sender_email = undefined;
+        console.log('[SIP Trunk Controller] omit_sender_email=true — skipping sender_email and Gmail auto-fetch');
+      } else if (!sender_email) {
         console.log('[SIP Trunk Controller] No sender_email provided, fetching from connected Gmail...');
         const organizationId = req.user?.organizationId || req.user?._id;
         
@@ -355,6 +360,8 @@ export class SipTrunkController {
         agent_phone_number_id,
         to_number,
         customer_info,
+        dynamic_variables: dynamic_variables ? '[provided]' : undefined,
+        omit_sender_email: !!omit_sender_email,
         sender_email: sender_email || 'not provided'
       });
 
@@ -464,6 +471,7 @@ export class SipTrunkController {
           agent_phone_number_id: phoneNumber.elevenlabs_phone_number_id,
           to_number,
           customer_info,
+          dynamic_variables,
           sender_email,
           // Include credentials if using phone number as ID (not a registered ElevenLabs ID)
           ...(phoneNumber.elevenlabs_phone_number_id?.startsWith('+') && {
@@ -489,6 +497,7 @@ export class SipTrunkController {
           agent_phone_number_id: phoneNumber.elevenlabs_phone_number_id,
           to_number,
           customer_info,
+          dynamic_variables,
           sender_email
         });
       }

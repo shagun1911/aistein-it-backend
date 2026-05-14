@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { AppError } from '../middleware/error.middleware';
-import Agent, { IAgent } from '../models/Agent';
+import Agent, { BuiltInToolDetails, BuiltInTools, IAgent } from '../models/Agent';
 import mongoose from 'mongoose';
 
 // Python API base URL - should match the one used for agents endpoint
@@ -95,6 +95,22 @@ export interface HumanTransferRule {
   transfer_type: string;
 }
 
+/** Per-tool payload accepted by Python / ElevenLabs-style agent prompt API */
+export interface BuiltInToolPromptPayload {
+  description?: string;
+  name: string;
+  params: Record<string, unknown>;
+}
+
+/** Client may send booleans (UI) or full tool specs (API / curl) per key */
+export type BuiltInToolInput = boolean | BuiltInToolPromptPayload;
+
+export interface BuiltInToolsInput {
+  end_call?: BuiltInToolInput;
+  language_detection?: BuiltInToolInput;
+  voicemail_detection?: BuiltInToolInput;
+}
+
 export interface UpdateAgentPromptRequest {
   first_message: string;
   system_prompt: string;
@@ -103,7 +119,9 @@ export interface UpdateAgentPromptRequest {
   voice_id?: string;
   escalationRules?: string[];
   knowledge_base_ids: string[];
-  built_in_tools?: { end_call?: boolean; language_detection?: boolean; voicemail_detection?: boolean };
+  built_in_tools?: BuiltInToolsInput;
+  /** Optional per-tool descriptions / voicemail message; persisted on the agent document */
+  built_in_tool_details?: BuiltInToolDetails;
   enable_human_transfer?: boolean;
   human_transfer_rules?: HumanTransferRule[];
   // tool_ids are automatically added from env variables, not required in request
@@ -114,6 +132,191 @@ export interface UpdateAgentPromptResponse {
   name: string;
   conversation_config?: any;
   [key: string]: any;
+}
+
+function toolInputEnabled(v: BuiltInToolInput | undefined, defaultIfMissing: boolean): boolean {
+  if (v === undefined) return defaultIfMissing;
+  if (typeof v === 'boolean') return v;
+  return true;
+}
+
+/** Normalize to boolean flags for MongoDB (schema stores booleans only). */
+function normalizeBuiltInToolsForDb(
+  input: BuiltInToolsInput | undefined,
+  previous?: BuiltInTools | null
+): BuiltInTools {
+  if (input === undefined) {
+    if (previous) {
+      return {
+        end_call: previous.end_call !== false,
+        language_detection: !!previous.language_detection,
+        voicemail_detection: !!previous.voicemail_detection
+      };
+    }
+    return { end_call: true, language_detection: false, voicemail_detection: false };
+  }
+  return {
+    end_call: toolInputEnabled(input.end_call, true),
+    language_detection: toolInputEnabled(input.language_detection, false),
+    voicemail_detection: toolInputEnabled(input.voicemail_detection, false)
+  };
+}
+
+const DEFAULT_VOICEMAIL_MESSAGE =
+  process.env.DEFAULT_VOICEMAIL_MESSAGE?.trim() ||
+  'Hi, this is support returning your call. Please call us back at your convenience.';
+
+const PYTHON_BUILTIN_TOOL_DEFAULTS: Record<
+  'end_call' | 'language_detection' | 'voicemail_detection',
+  BuiltInToolPromptPayload
+> = {
+  end_call: {
+    description: 'End the call when the user says goodbye or asks to hang up.',
+    name: 'end_call',
+    params: { system_tool_type: 'end_call' }
+  },
+  language_detection: {
+    description: 'Switch TTS language when the user speaks another language.',
+    name: 'language_detection',
+    params: { system_tool_type: 'language_detection' }
+  },
+  voicemail_detection: {
+    description: 'Use when you hear a voicemail greeting instead of a human.',
+    name: 'voicemail_detection',
+    params: {
+      system_tool_type: 'voicemail_detection',
+      voicemail_message: DEFAULT_VOICEMAIL_MESSAGE
+    }
+  }
+};
+
+function mergeBuiltinToolForPython(
+  key: 'end_call' | 'language_detection' | 'voicemail_detection',
+  input: BuiltInToolsInput | undefined,
+  enabled: boolean
+): BuiltInToolPromptPayload | null {
+  if (!enabled) return null;
+  const defaults = PYTHON_BUILTIN_TOOL_DEFAULTS[key];
+  const raw = input?.[key];
+  if (raw === undefined || typeof raw === 'boolean') {
+    return {
+      description: defaults.description,
+      name: defaults.name,
+      params: { ...defaults.params }
+    };
+  }
+  const user = raw as BuiltInToolPromptPayload;
+  return {
+    name: typeof user.name === 'string' && user.name.trim() ? user.name.trim() : defaults.name,
+    description:
+      typeof user.description === 'string' && user.description.trim()
+        ? user.description.trim()
+        : (defaults.description ?? ''),
+    params: {
+      ...defaults.params,
+      ...(user.params && typeof user.params === 'object' ? user.params : {})
+    }
+  };
+}
+
+function buildBuiltInToolsPythonPayload(
+  input: BuiltInToolsInput | undefined,
+  flags: BuiltInTools
+): Record<string, BuiltInToolPromptPayload> {
+  const out: Record<string, BuiltInToolPromptPayload> = {};
+  const end = mergeBuiltinToolForPython('end_call', input, flags.end_call !== false);
+  if (end) out.end_call = end;
+  const lang = mergeBuiltinToolForPython('language_detection', input, !!flags.language_detection);
+  if (lang) out.language_detection = lang;
+  const vm = mergeBuiltinToolForPython('voicemail_detection', input, !!flags.voicemail_detection);
+  if (vm) out.voicemail_detection = vm;
+  return out;
+}
+
+/** Merge boolean toggles from the client with stored/custom tool descriptions for the Python API. */
+function mergeBuiltInToolsInputForPython(
+  flags: BuiltInTools,
+  details: BuiltInToolDetails | null | undefined,
+  explicit?: BuiltInToolsInput
+): BuiltInToolsInput {
+  const result: BuiltInToolsInput = {};
+  const keys: Array<'end_call' | 'language_detection' | 'voicemail_detection'> = [
+    'end_call',
+    'language_detection',
+    'voicemail_detection'
+  ];
+
+  for (const key of keys) {
+    const enabled = key === 'end_call' ? flags.end_call !== false : !!flags[key];
+
+    const ex = explicit?.[key];
+    if (ex === false) {
+      result[key] = false;
+      continue;
+    }
+    if (typeof ex === 'object' && ex !== null) {
+      result[key] = ex as BuiltInToolPromptPayload;
+      continue;
+    }
+    if (!enabled) {
+      result[key] = false;
+      continue;
+    }
+
+    let desc = '';
+    let vm = '';
+    if (key === 'end_call') {
+      const e = details?.end_call;
+      desc = typeof e?.description === 'string' ? e.description.trim() : '';
+    } else if (key === 'language_detection') {
+      const e = details?.language_detection;
+      desc = typeof e?.description === 'string' ? e.description.trim() : '';
+    } else {
+      const e = details?.voicemail_detection;
+      desc = typeof e?.description === 'string' ? e.description.trim() : '';
+      vm = typeof e?.voicemail_message === 'string' ? e.voicemail_message.trim() : '';
+    }
+
+    if (desc || vm) {
+      result[key] = {
+        ...(desc ? { description: desc } : {}),
+        ...(vm ? { params: { voicemail_message: vm } } : {})
+      } as unknown as BuiltInToolPromptPayload;
+      continue;
+    }
+
+    if (typeof ex === 'boolean') {
+      result[key] = ex;
+      continue;
+    }
+
+    result[key] = true;
+  }
+
+  return result;
+}
+
+function sanitizeBuiltInToolDetails(raw: BuiltInToolDetails): BuiltInToolDetails | undefined {
+  const max = 4000;
+  const clip = (s?: string) => (typeof s === 'string' && s.trim() ? s.trim().slice(0, max) : undefined);
+
+  const endDesc = clip(raw.end_call?.description);
+  const langDesc = clip(raw.language_detection?.description);
+  const vmDesc = clip(raw.voicemail_detection?.description);
+  const vmMsg = clip(raw.voicemail_detection?.voicemail_message);
+
+  const out: BuiltInToolDetails = {};
+  if (endDesc) out.end_call = { description: endDesc };
+  if (langDesc) out.language_detection = { description: langDesc };
+  if (vmDesc || vmMsg) {
+    out.voicemail_detection = {
+      ...(vmDesc ? { description: vmDesc } : {}),
+      ...(vmMsg ? { voicemail_message: vmMsg } : {})
+    };
+  }
+
+  if (!out.end_call && !out.language_detection && !out.voicemail_detection) return undefined;
+  return out;
 }
 
 export class AgentService {
@@ -643,18 +846,21 @@ export class AgentService {
     const userPrompt = (data.system_prompt || '').trim();
     const systemPromptToSend = `${WOOCOMMERCE_MASTER_PROMPT}\n\n${userPrompt}${COLLECT_ONLY_INSTRUCTION}`;
 
-    // Build built_in_tools object — only include keys that are enabled
-    const builtInToolsConfig = data.built_in_tools ?? { end_call: true };
-    const builtInToolsPayload: Record<string, any> = {};
-    if (builtInToolsConfig.end_call !== false) {
-      builtInToolsPayload.end_call = { name: 'end_call', params: { system_tool_type: 'end_call' } };
-    }
-    if (builtInToolsConfig.language_detection) {
-      builtInToolsPayload.language_detection = { name: 'language_detection', params: { system_tool_type: 'language_detection' } };
-    }
-    if (builtInToolsConfig.voicemail_detection) {
-      builtInToolsPayload.voicemail_detection = { name: 'voicemail_detection', params: { system_tool_type: 'voicemail_detection' } };
-    }
+    // Effective flags: request overrides, else persisted agent settings
+    const builtInToolFlags = normalizeBuiltInToolsForDb(
+      data.built_in_tools,
+      (agent.built_in_tools as BuiltInTools | undefined) ?? null
+    );
+    const detailsForPayload =
+      data.built_in_tool_details !== undefined
+        ? data.built_in_tool_details
+        : ((agent as IAgent).built_in_tool_details as BuiltInToolDetails | undefined);
+    const mergedBuiltInInput = mergeBuiltInToolsInputForPython(
+      builtInToolFlags,
+      detailsForPayload ?? null,
+      data.built_in_tools
+    );
+    const builtInToolsPayload = buildBuiltInToolsPythonPayload(mergedBuiltInInput, builtInToolFlags);
 
     const requestBody: any = {
       first_message: firstMessageToSend,
@@ -662,7 +868,7 @@ export class AgentService {
       language: data.language,
       knowledge_base_ids: validKnowledgeBaseIds,
       tool_ids: toolIds,
-      built_in_tools: builtInToolsPayload,
+      built_in_tools: builtInToolsPayload
     };
 
     // CRITICAL: Always include voice_id if provided (even if empty string)
@@ -673,10 +879,11 @@ export class AgentService {
 
     if (data.enable_human_transfer !== undefined) {
       requestBody.enable_human_transfer = data.enable_human_transfer;
-    }
-
-    if (data.enable_human_transfer && data.human_transfer_rules && data.human_transfer_rules.length > 0) {
-      requestBody.human_transfer_rules = data.human_transfer_rules;
+      requestBody.human_transfer_rules = data.enable_human_transfer
+        ? Array.isArray(data.human_transfer_rules)
+          ? data.human_transfer_rules
+          : []
+        : [];
     }
 
     const logContext = (action: string) => ({
@@ -748,7 +955,13 @@ export class AgentService {
       agent.voice_id = data.voice_id;
 
       if (data.escalationRules !== undefined) agent.escalationRules = data.escalationRules;
-      if (data.built_in_tools !== undefined) agent.built_in_tools = data.built_in_tools;
+      if (data.built_in_tools !== undefined) {
+        agent.built_in_tools = builtInToolFlags;
+      }
+      if (data.built_in_tool_details !== undefined) {
+        const sanitized = sanitizeBuiltInToolDetails(data.built_in_tool_details);
+        (agent as IAgent).built_in_tool_details = sanitized;
+      }
       if (data.enable_human_transfer !== undefined) agent.enable_human_transfer = data.enable_human_transfer;
       if (data.human_transfer_rules !== undefined) agent.human_transfer_rules = data.human_transfer_rules;
 

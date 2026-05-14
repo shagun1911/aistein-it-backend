@@ -971,11 +971,6 @@ export class AgentService {
         : [];
     }
 
-    const postCallWebhookUrl = process.env.POST_CALL_WEBHOOK_URL?.trim();
-    if (postCallWebhookUrl) {
-      patchBody.post_call_webhook_url = postCallWebhookUrl;
-    }
-
     const logContext = (action: string) => ({
       action,
       agent_id: agentId,

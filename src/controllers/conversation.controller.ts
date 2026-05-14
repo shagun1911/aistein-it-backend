@@ -5,6 +5,16 @@ import { successResponse, paginatedResponse } from '../utils/response.util';
 import { gcsService } from '../services/gcs.service';
 import { AppError } from '../middleware/error.middleware';
 
+/**
+ * Per-org throttle for the background batch-call sync that runs after each
+ * conversations-list request. Without this, a user clicking through pages or
+ * filters would re-fire the BatchCall lookup + ElevenLabs round-trip every
+ * second. 60s is plenty — completed batches rarely change between calls and
+ * the WebSocket already pushes real-time updates when they do.
+ */
+const lastBatchSyncAt = new Map<string, number>();
+const BATCH_SYNC_THROTTLE_MS = 60_000;
+
 export class ConversationController {
   private conversationService: ConversationService;
 
@@ -26,7 +36,16 @@ export class ConversationController {
       // Trigger batch-call sync completely in the background — do not await anything
       // before serving the response. The DB query and sync work happen after the response
       // has already been sent, so they never add latency to the list page load.
-      setImmediate(() => {
+      // Throttled to once per org per BATCH_SYNC_THROTTLE_MS so list pagination /
+      // filter clicks don't repeatedly hit ElevenLabs.
+      const orgKeyForThrottle = organizationId.toString();
+      const lastRun = lastBatchSyncAt.get(orgKeyForThrottle) || 0;
+      const shouldRunBatchSync = Date.now() - lastRun > BATCH_SYNC_THROTTLE_MS;
+      if (shouldRunBatchSync) {
+        lastBatchSyncAt.set(orgKeyForThrottle, Date.now());
+      }
+
+      if (shouldRunBatchSync) setImmediate(() => {
         void (async () => {
           try {
             const BatchCall = (await import('../models/BatchCall')).default;

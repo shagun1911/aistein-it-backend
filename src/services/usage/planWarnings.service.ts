@@ -24,9 +24,20 @@ class PlanWarningsService {
       }
 
       const plan = org.planId as any;
-      // Fetch usage once and pass it to both the warning checks and the lock check
-      // to avoid computing it twice (previously caused a double full-aggregation).
-      const usage = await usageTrackerService.getOrganizationUsage(organizationId);
+      // Plan-warnings only reads callMinutes / chatMessages / automations — no need
+      // for the full conversations/$group aggregation or campaign sends. Use the
+      // same `profileOnly` cache key that /auth/me warms at login, and fall back
+      // to authInstant so the very first call returns immediately while the warm
+      // happens in the background (the next call serves real numbers from cache).
+      const usage = await usageTrackerService.getOrganizationUsage(organizationId, true, {
+        profileOnly: true,
+        authInstant: true,
+        authFallback: {
+          callMinutes: 0,
+          chatMessages: 0,
+          automations: 0
+        }
+      });
       const warnings: PlanWarning[] = [];
       const { locked, reason } = await usageTrackerService.isOrganizationLocked(organizationId, usage);
 
@@ -159,7 +170,12 @@ class PlanWarningsService {
       }
 
       const plan = org.planId as any;
-      const usage = await usageTrackerService.getOrganizationUsage(organizationId);
+      // canPerformAction also only needs profileOnly fields — share the cache
+      // with /auth/me and /plan-warnings so we don't pay for two different
+      // aggregation paths.
+      const usage = await usageTrackerService.getOrganizationUsage(organizationId, true, {
+        profileOnly: true
+      });
 
       switch (action) {
         case 'call':

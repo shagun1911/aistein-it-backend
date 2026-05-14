@@ -163,6 +163,19 @@ app.get('/', (req, res) => {
 // STEP 6: ENHANCED HEALTH ENDPOINT
 // Returns PID, PORT, uptime, environment for frontend verification
 // ============================================================================
+// Lightweight warmup endpoint — no DB, no module imports, no work.
+// The signin page pings this on mount so the server (and any sleeping
+// host like Render free tier) is awake by the time the user clicks Login.
+// Keeping this dependency-free is critical: /api/v1/health does dynamic
+// imports that themselves cost seconds on cold start.
+app.get('/api/v1/warmup', (req, res) => {
+  res.json({
+    ok: true,
+    pid: process.pid,
+    uptimeSec: Math.floor((Date.now() - SERVER_START_TIME) / 1000)
+  });
+});
+
 app.get('/api/v1/health', async (req, res) => {
   try {
     // Get batch call monitor status

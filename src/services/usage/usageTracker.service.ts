@@ -98,27 +98,25 @@ export class UsageTrackerService {
   /**
    * Calculate total chat messages sent + received (non-phone channels).
    *
-   * Queries Message directly using the denormalized organizationId field —
-   * no two-step conversation-ID lookup needed.
-   * Falls back to the two-step path for messages not yet backfilled (organizationId missing).
+   * Runs the count in parallel with the phone-conversation lookup so the two
+   * round-trips don't serialize. Uses the denormalized organizationId on
+   * Message (post-backfill) for an index-only count.
+   * Falls back to the two-step path for messages not yet backfilled.
    */
   async calculateChatMessages(organizationId: string): Promise<number> {
     try {
       const orgObjectId = new mongoose.Types.ObjectId(organizationId);
 
-      // Fast path: messages that already carry organizationId (post-backfill)
-      const directCount = await Message.countDocuments({
-        organizationId: orgObjectId
-      });
-
-      if (directCount > 0) {
-        // Subtract phone-channel messages by joining through Conversation — still only one extra
-        // aggregation that only touches phone conversations, which are typically few.
-        const phoneConvIds = await Conversation.find({
+      // Run both lookups in parallel — they have no dependency on each other.
+      const [directCount, phoneConvIds] = await Promise.all([
+        Message.countDocuments({ organizationId: orgObjectId }),
+        Conversation.find({
           organizationId: orgObjectId,
           channel: 'phone'
-        }).distinct('_id');
+        }).distinct('_id')
+      ]);
 
+      if (directCount > 0) {
         const phoneMessageCount = phoneConvIds.length > 0
           ? await Message.countDocuments({
               organizationId: orgObjectId,
@@ -126,20 +124,23 @@ export class UsageTrackerService {
             })
           : 0;
 
-        const count = directCount - phoneMessageCount;
+        const count = Math.max(0, directCount - phoneMessageCount);
         logger.info(`[Usage Tracker] Org ${organizationId}: ${count} chat messages (direct query)`);
         return count;
       }
 
-      // Fallback for orgs whose messages predate the backfill
+      // Fallback for orgs whose messages predate the backfill — derive non-phone
+      // conversation IDs from the data we already fetched above.
       const nonPhoneConversations = await Conversation.find({
         organizationId: orgObjectId,
         channel: { $ne: 'phone' }
       }).distinct('_id');
 
-      const count = await Message.countDocuments({
-        conversationId: { $in: nonPhoneConversations }
-      });
+      const count = nonPhoneConversations.length > 0
+        ? await Message.countDocuments({
+            conversationId: { $in: nonPhoneConversations }
+          })
+        : 0;
 
       logger.info(`[Usage Tracker] Org ${organizationId}: ${count} chat messages (fallback query)`);
       return count;

@@ -3246,12 +3246,18 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
       return false;
     }
 
+    // triggerData is spread FIRST so that computed context values (appointment,
+    // extracted, contact, conversation) always win over the stale trigger-time
+    // snapshot. Critically: triggerData.appointment is set from CSV columns at
+    // call dispatch time (usually { booked: false, date: '', time: '' }) and
+    // must NOT overwrite context.appointment which is updated by the extract
+    // node after the call transcript is analysed.
     const evaluationRoot: Record<string, any> = {
+      ...context.triggerData,
       contact: context.contact,
       appointment: context.appointment,
       extracted: context.extracted,
-      conversation: context.conversation,
-      ...context.triggerData
+      conversation: context.conversation
     };
 
     const fieldParts = String(field)

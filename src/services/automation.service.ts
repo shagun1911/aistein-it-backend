@@ -363,14 +363,22 @@ export function applyAppointmentSafetyValidation(
   }
 
   if (parsed.appointment_booked === true && (!slot.hasDate || !slot.hasTime)) {
-    // Customer-only lines lack a recognisable date/time, but this doesn't
-    // necessarily mean the booking is invalid. A very common Italian (and
-    // English) pattern is: agent proposes a specific slot → customer
-    // confirms with "sì / va bene / confermo / yes / ok". In that case:
-    //   • The date+time exists somewhere in the full transcript (agent turn).
-    //   • The LLM correctly extracts it with high confidence.
-    //   • The customer's last turns contain a clear positive confirmation.
-    // We should trust the LLM in that scenario instead of killing the booking.
+    // Customer-only lines lack a date or time, but this alone doesn't mean
+    // the booking is invalid. Two very common Italian patterns:
+    //
+    //   Pattern B1 — agent offers options, customer chooses one:
+    //     Agent: "La troviamo in casa alle undici o alle quindici?"
+    //     Customer: "alle 11"          ← time is in customer lines, date only in agent
+    //
+    //   Pattern B2 — agent confirms the full slot, customer echoes yes:
+    //     Agent: "La confermo domani alle undici."
+    //     Customer: "sì, grazie"       ← neither date nor time in customer lines
+    //
+    // In both cases the LLM correctly extracts booked=true with high confidence.
+    // The right gate is: does the full transcript (all speakers) contain BOTH
+    // a recognisable date AND time, AND is the LLM confident enough?
+    // If yes → trust the LLM. The LLM is specifically prompted not to treat
+    // street/building numbers as times, so false-positive risk is low.
     const confRaw = parsed.confidence;
     const confNum =
       typeof confRaw === 'number' && !Number.isNaN(confRaw)
@@ -380,9 +388,10 @@ export function applyAppointmentSafetyValidation(
           : NaN;
     const highConfidence = Number.isFinite(confNum) && confNum >= 0.80;
 
-    // Check the full transcript (all speakers) for date+time.
+    // Check the full transcript (all speakers) for date+time presence.
     const fullSlot = customerProvidedDateAndTime(transcriptText, now);
-    // Also consider the LLM's own extracted date/time strings as evidence.
+    // Also treat the LLM's own extracted values as confirmation that
+    // it found concrete date/time in the transcript.
     const llmHasDate =
       parsed.date != null &&
       String(parsed.date).trim() !== '' &&
@@ -394,17 +403,16 @@ export function applyAppointmentSafetyValidation(
     const transcriptHasDateTime =
       (fullSlot.hasDate && fullSlot.hasTime) || (llmHasDate && llmHasTime);
 
-    const customerConfirmed = customerPositiveConfirmationInLastTurns(transcriptText);
-
-    if (highConfidence && transcriptHasDateTime && customerConfirmed) {
-      // Agent proposed the slot; customer confirmed — trust the LLM.
-      // Fill date/time from the full transcript if the LLM left them empty.
+    if (highConfidence && transcriptHasDateTime) {
+      // Full transcript has a concrete date+time and the LLM is confident →
+      // trust the LLM. Fill any missing date/time from the full-transcript
+      // resolver (e.g. "domani" said by the agent resolves to an ISO date).
       if (!parsed.date && fullSlot.resolvedDate) parsed.date = fullSlot.resolvedDate;
       if (!parsed.time && fullSlot.resolvedTime) parsed.time = fullSlot.resolvedTime;
       parsed.reason =
         typeof parsed.reason === 'string' && parsed.reason.trim()
-          ? `${parsed.reason.trim()} [agent-proposed slot confirmed by customer]`
-          : '[agent-proposed slot confirmed by customer]';
+          ? `${parsed.reason.trim()} [date/time confirmed across transcript]`
+          : '[date/time confirmed across transcript]';
       return; // Keep appointment_booked = true
     }
 

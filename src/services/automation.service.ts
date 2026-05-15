@@ -180,22 +180,51 @@ function resolveTimeFromTranscript(transcriptText: string): string | null {
     }
   }
 
+  // Italian word-based times: "mezzogiorno" (noon) and "mezzanotte" (midnight).
+  if (/\bmezzogiorno\b/.test(normalized)) return '12:00';
+  if (/\bmezzanotte\b/.test(normalized)) return '00:00';
+
   const italianHours: Record<string, number> = {
     zero: 0, una: 1, uno: 1, due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9, dieci: 10,
     undici: 11, dodici: 12, tredici: 13, quattordici: 14, quindici: 15, sedici: 16, diciassette: 17, diciotto: 18,
     diciannove: 19, venti: 20, ventuno: 21, ventidue: 22, ventitre: 23
   };
-  const wordMatches = [...normalized.matchAll(/\b(?:alle|ore)\s+(zero|una|uno|due|tre|quattro|cinque|sei|sette|otto|nove|dieci|undici|dodici|tredici|quattordici|quindici|sedici|diciassette|diciotto|diciannove|venti|ventuno|ventidue|ventitre)\b/g)];
+  // Also match "le <word>" (northern Italian variant of "alle <word>").
+  const wordMatches = [...normalized.matchAll(/\b(?:alle|ore|le)\s+(zero|una|uno|due|tre|quattro|cinque|sei|sette|otto|nove|dieci|undici|dodici|tredici|quattordici|quindici|sedici|diciassette|diciotto|diciannove|venti|ventuno|ventidue|ventitre)\b/g)];
   if (wordMatches.length > 0) {
     const w = wordMatches[wordMatches.length - 1][1];
     const hour = italianHours[w];
-    if (hour != null) return `${String(hour).padStart(2, '0')}:00`;
+    if (hour != null) {
+      // Check for "e mezzo/mezza" (half past) immediately after the hour word.
+      const afterWord = normalized.slice(wordMatches[wordMatches.length - 1].index! + wordMatches[wordMatches.length - 1][0].length);
+      const halfPast = /^\s+e\s+mezz[ao]\b/.test(afterWord);
+      return `${String(hour).padStart(2, '0')}:${halfPast ? '30' : '00'}`;
+    }
   }
+
+  // Handle numeric "alle/ore/le X" followed by "e mezzo/mezza" for :30.
+  const numericHalfMatches = [...normalized.matchAll(/\b(?:alle|ore|le)\s+(\d{1,2})\s+e\s+mezz[ao]\b/g)];
+  if (numericHalfMatches.length > 0) {
+    const last = numericHalfMatches[numericHalfMatches.length - 1];
+    const hour = Number(last[1]);
+    if (Number.isFinite(hour) && hour >= 0 && hour <= 23) {
+      return `${String(hour).padStart(2, '0')}:30`;
+    }
+  }
+
   return null;
 }
 
 const HARD_NEGATIVE_CUSTOMER_RE =
   /\b(non\s+mi\s+interessa|non\s+sono\s+interessat[oa]|non\s+interessat[oa]|non\s+confermo|non\s+prenotare|richiamami|devo\s+pensarci|forse\s+piu\s+tardi|magari\s+piu\s+tardi|not\s+interested|no\s+thanks|don'?t\s+call|call\s+me\s+back\s+later|maybe\s+later)\b/i;
+
+/**
+ * Italian and English positive confirmation signals.
+ * Used to detect: agent proposed date/time → customer said "yes/ok/confirmed".
+ * Kept intentionally broad but anchored to avoid matching mid-sentence fragments.
+ */
+const POSITIVE_CONFIRMATION_RE =
+  /\b(si|va\s+bene|perfetto|confermo|d'accordo|certo|ovviamente|assolutamente|esatto|ottimo|benissimo|ok|okay|yes|sure|great|perfect|confirmed|correct|sounds\s+good|that'?s\s+fine|capito|ho\s+capito|concordo|procediamo|prenotiamo|prenoto)\b/i;
 
 const CUSTOMER_MONTH_DATE_RE =
   /\b\d{1,2}\s+(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre|january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
@@ -239,13 +268,39 @@ export function customerProvidedDateAndTime(customerText: string, now: Date): Cu
   };
 }
 
+function normalizeAccents(s: string): string {
+  return s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
 function customerHardNegativeInLastTurns(transcriptText: string): boolean {
   const customerLines = transcriptText
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => /^Customer:/i.test(l));
   const last = customerLines.slice(-3);
-  return last.some((line) => HARD_NEGATIVE_CUSTOMER_RE.test(line.replace(/^Customer:\s*/i, '')));
+  // Normalize accents so "più tardi" matches the regex's "piu tardi".
+  return last.some((line) =>
+    HARD_NEGATIVE_CUSTOMER_RE.test(normalizeAccents(line.replace(/^Customer:\s*/i, '')))
+  );
+}
+
+/**
+ * Returns true when the customer's last 3 turns contain an explicit positive
+ * confirmation (Italian or English). Used to allow bookings where the agent
+ * proposed the date/time and the customer said "sì / va bene / confermo".
+ */
+function customerPositiveConfirmationInLastTurns(transcriptText: string): boolean {
+  const customerLines = transcriptText
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => /^Customer:/i.test(l));
+  const last = customerLines.slice(-3);
+  return last.some((line) =>
+    POSITIVE_CONFIRMATION_RE.test(normalizeAccents(line.replace(/^Customer:\s*/i, '')))
+  );
 }
 
 export function buildAppointmentExtractionSystemPrompt(
@@ -254,17 +309,23 @@ export function buildAppointmentExtractionSystemPrompt(
 ): string {
   return `You are a multilingual appointment extraction AI (Italian and English phone/chat transcripts).
 
-BOOKING RULE — appointment_booked = true ONLY when the CUSTOMER provides BOTH:
-1. A concrete DATE (calendar date, weekday, or relative day like oggi/domani/tomorrow/Monday), AND
-2. A concrete CLOCK TIME (HH:MM, "alle 15", "2pm", "at three", etc.)
+BOOKING RULE — appointment_booked = true when the conversation ends with a confirmed slot. There are two valid patterns:
 
-The date and time may appear in separate customer turns (e.g. agent asks date → customer answers → agent asks time → customer answers).
+PATTERN A — Customer states date AND time independently:
+  The customer explicitly provides both a concrete DATE and a concrete CLOCK TIME at any point in the conversation.
+  e.g. "Martedì alle 10" / "Lunedì 20 maggio alle 15:30" / "Monday at 2pm"
+
+PATTERN B — Agent proposes a slot → Customer confirms:
+  The agent offers a specific date AND time, and the customer responds with a positive confirmation
+  (Italian: sì, va bene, confermo, d'accordo, certo, perfetto, ottimo, prenotiamo;
+   English: yes, ok, sure, great, confirmed, sounds good, that's fine).
+  The date and time may appear in separate turns.
 
 Set appointment_booked = FALSE when:
-- Customer is not interested or declines (Italian: non mi interessa, forse, richiamami; English: not interested, call back later).
-- Customer gives only a date OR only a time, never both.
-- Only the agent states date/time (e.g. reading an address with numbers) and the customer never supplies scheduling details.
-- Time is vague only ("pomeriggio", "morning") without an hour.
+- Customer declines (Italian: non mi interessa, non confermo, richiamami, devo pensarci; English: not interested, call back later).
+- Customer gives only a date OR only a time, and never confirms a full slot.
+- Only the agent mentions numbers (e.g. reading a street address) and the customer never engages with scheduling.
+- Time is vague only ("pomeriggio", "morning") without a specific hour.
 - You are uncertain (confidence below 0.75 → must be false).
 
 Do NOT treat street/building numbers as times (e.g. "Viale Roma 19" is NOT 19:00).
@@ -302,6 +363,51 @@ export function applyAppointmentSafetyValidation(
   }
 
   if (parsed.appointment_booked === true && (!slot.hasDate || !slot.hasTime)) {
+    // Customer-only lines lack a recognisable date/time, but this doesn't
+    // necessarily mean the booking is invalid. A very common Italian (and
+    // English) pattern is: agent proposes a specific slot → customer
+    // confirms with "sì / va bene / confermo / yes / ok". In that case:
+    //   • The date+time exists somewhere in the full transcript (agent turn).
+    //   • The LLM correctly extracts it with high confidence.
+    //   • The customer's last turns contain a clear positive confirmation.
+    // We should trust the LLM in that scenario instead of killing the booking.
+    const confRaw = parsed.confidence;
+    const confNum =
+      typeof confRaw === 'number' && !Number.isNaN(confRaw)
+        ? confRaw
+        : typeof confRaw === 'string'
+          ? parseFloat(confRaw)
+          : NaN;
+    const highConfidence = Number.isFinite(confNum) && confNum >= 0.80;
+
+    // Check the full transcript (all speakers) for date+time.
+    const fullSlot = customerProvidedDateAndTime(transcriptText, now);
+    // Also consider the LLM's own extracted date/time strings as evidence.
+    const llmHasDate =
+      parsed.date != null &&
+      String(parsed.date).trim() !== '' &&
+      String(parsed.date).toLowerCase() !== 'null';
+    const llmHasTime =
+      parsed.time != null &&
+      String(parsed.time).trim() !== '' &&
+      String(parsed.time).toLowerCase() !== 'null';
+    const transcriptHasDateTime =
+      (fullSlot.hasDate && fullSlot.hasTime) || (llmHasDate && llmHasTime);
+
+    const customerConfirmed = customerPositiveConfirmationInLastTurns(transcriptText);
+
+    if (highConfidence && transcriptHasDateTime && customerConfirmed) {
+      // Agent proposed the slot; customer confirmed — trust the LLM.
+      // Fill date/time from the full transcript if the LLM left them empty.
+      if (!parsed.date && fullSlot.resolvedDate) parsed.date = fullSlot.resolvedDate;
+      if (!parsed.time && fullSlot.resolvedTime) parsed.time = fullSlot.resolvedTime;
+      parsed.reason =
+        typeof parsed.reason === 'string' && parsed.reason.trim()
+          ? `${parsed.reason.trim()} [agent-proposed slot confirmed by customer]`
+          : '[agent-proposed slot confirmed by customer]';
+      return; // Keep appointment_booked = true
+    }
+
     parsed.appointment_booked = false;
     parsed.date = null;
     parsed.time = null;

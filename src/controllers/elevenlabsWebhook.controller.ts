@@ -439,40 +439,97 @@ export class ElevenLabsWebhookController {
   /**
    * When ElevenLabs fires post_call_transcription for an outbound (batch) call the full
    * transcript array is already in the webhook payload. We use it directly to:
-   *   1. Find the matching batch (by conv_id or phone).
-   *   2. Create/update the Conversation + Messages in Mongo.
-   *   3. Trigger automation immediately — no polling delay, no extra API call needed.
+   *   1. Identify the batch via data.metadata.batch_call.batch_call_id (direct DB lookup).
+   *   2. Get dynamic_variables from data.conversation_initiation_client_data.dynamic_variables.
+   *   3. Create/update the Conversation + Messages in Mongo.
+   *   4. Trigger automation immediately — no polling delay, no getBatchJobStatus call.
    *
-   * The 30-second poll / BatchCallMonitor still run as a safety net. Because the phone
-   * number is added to automation_triggered_phones before returning, those jobs simply
-   * skip it on their next tick.
+   * Gate: only run the fast path when data.status === "done". ElevenLabs sets this only
+   * after transcript generation is complete, making it the most reliable signal.
+   * Webhooks with status "in-progress" or "failed" fall through to the poll/sync path.
    *
-   * Falls back to the old full-sync approach only when the webhook transcript is empty
-   * (e.g. zero-second hangup) or no matching batch can be identified.
+   * Falls back to the full-sync approach when:
+   *   - status is not "done"
+   *   - batch_call_id is absent from webhook metadata
+   *   - direct batch DB lookup finds nothing
    */
   private async processBatchCallWebhook(webhookBody: any) {
     const data = webhookBody?.data;
     const phoneNumber: string | undefined = data?.metadata?.phone_call?.external_number || data?.user_id;
     const elevenLabsConvId: string | undefined = data?.conversation_id;
+    const callStatus: string = String(data?.status || '').toLowerCase();
 
     if (!phoneNumber) {
       console.log('[ElevenLabs Webhook] Outbound webhook missing phoneNumber – skipping');
       return;
     }
 
-    // The post_call_transcription payload already contains the transcript.
     const webhookTranscript: any[] = Array.isArray(data?.transcript) ? data.transcript : [];
     const duration: number = data?.metadata?.call_duration_secs || 0;
-    const hasContent = webhookTranscript.length > 0 || duration > 0;
 
     console.log(
       `[ElevenLabs Webhook] 📞 Outbound call for ${phoneNumber}` +
       (elevenLabsConvId ? ` (conv: ${elevenLabsConvId})` : '') +
-      ` – transcript turns: ${webhookTranscript.length}, duration: ${duration}s`
+      ` – status: ${callStatus}, transcript turns: ${webhookTranscript.length}, duration: ${duration}s`
     );
 
     const BatchCall = (await import('../models/BatchCall')).default;
-    const { batchCallingService } = await import('../services/batchCalling.service');
+
+    // ── FAST PATH: status=done + batch_call_id in metadata ────────────────────
+    // ElevenLabs sets status="done" only after transcript generation completes,
+    // so this is the most reliable gate. batch_call_id and dynamic_variables are
+    // both available directly in the webhook — no getBatchJobStatus call needed.
+    if (callStatus === 'done') {
+      const elevenLabsBatchId: string | undefined = data?.metadata?.batch_call?.batch_call_id;
+      const webhookDynamicVars: Record<string, any> =
+        data?.conversation_initiation_client_data?.dynamic_variables || {};
+
+      if (elevenLabsBatchId) {
+        const batch = await BatchCall.findOne({ batch_call_id: elevenLabsBatchId }).lean();
+        if (batch) {
+          const orgId =
+            (batch as any).organizationId?.toString() ||
+            (batch as any).userId?.toString();
+
+          if (orgId) {
+            try {
+              const processed = await this.processOutboundRecipientFromWebhook({
+                batch,
+                organizationId: orgId,
+                phoneNumber,
+                elevenLabsConvId: elevenLabsConvId || '',
+                webhookTranscript,
+                duration,
+                dynamicVars: webhookDynamicVars,
+                webhookData: data
+              });
+
+              if (processed) {
+                console.log(
+                  `[ElevenLabs Webhook] ✅ Per-call automation done for ${phoneNumber} (batch: ${elevenLabsBatchId})`
+                );
+                return;
+              }
+            } catch (err: any) {
+              console.error(
+                `[ElevenLabs Webhook] ⚠️ Per-call processing failed for ${phoneNumber} (batch: ${elevenLabsBatchId}):`,
+                err.message
+              );
+            }
+          }
+        }
+      }
+    }
+
+    // ── FALLBACK: status not done, batch_call_id missing, or direct path failed ─
+    if (callStatus !== 'done') {
+      console.log(
+        `[ElevenLabs Webhook] ⏭️ Status "${callStatus}" (not done) – falling back to batch sync`
+      );
+    }
+
+    // Give ElevenLabs 5s to update recipient status before querying batch API.
+    await new Promise(resolve => setTimeout(resolve, 5000));
 
     const normalizePhone = (p: string) => {
       const digits = String(p || '').replace(/\D/g, '');
@@ -491,61 +548,11 @@ export class ElevenLabsWebhookController {
       .lean();
 
     if (activeBatches.length === 0) {
-      console.log('[ElevenLabs Webhook] No active batch found – skipping');
+      console.log('[ElevenLabs Webhook] No active batch found – skipping fallback sync');
       return;
     }
 
-    // ── FAST PATH: transcript in webhook → process per-call directly ──────────
-    if (hasContent) {
-      for (const batch of activeBatches) {
-        const batchId = (batch as any).batch_call_id;
-        const orgId =
-          (batch as any).organizationId?.toString() ||
-          (batch as any).userId?.toString();
-        if (!orgId || !batchId) continue;
-
-        try {
-          const status = await batchCallingService.getBatchJobStatus(batchId);
-          const recipients = status.recipients || [];
-          const recipient = recipients.find((r: any) => {
-            if (elevenLabsConvId && r.conversation_id === elevenLabsConvId) return true;
-            return normalizePhone(r.phone_number) === phoneNorm;
-          });
-          if (!recipient) continue;
-
-          const dynamicVars =
-            recipient.conversation_initiation_client_data?.dynamic_variables || {};
-
-          const processed = await this.processOutboundRecipientFromWebhook({
-            batch,
-            organizationId: orgId,
-            phoneNumber,
-            elevenLabsConvId: elevenLabsConvId || recipient.conversation_id || '',
-            webhookTranscript,
-            duration,
-            dynamicVars,
-            webhookData: data
-          });
-
-          if (processed) {
-            console.log(
-              `[ElevenLabs Webhook] ✅ Per-call automation done for ${phoneNumber} (batch: ${batchId})`
-            );
-            return;
-          }
-        } catch (err: any) {
-          console.error(
-            `[ElevenLabs Webhook] ⚠️ Per-call processing failed for batch ${(batch as any).batch_call_id}:`,
-            err.message
-          );
-        }
-      }
-    }
-
-    // ── FALLBACK: no content or no batch matched → full batch sync ─────────────
-    // Give ElevenLabs 5s to update recipient status before we query it.
-    await new Promise(resolve => setTimeout(resolve, 5000));
-
+    const { batchCallingService } = await import('../services/batchCalling.service');
     let synced = 0;
     for (const batch of activeBatches) {
       const batchId = (batch as any).batch_call_id;

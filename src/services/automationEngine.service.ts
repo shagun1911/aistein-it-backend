@@ -152,30 +152,17 @@ export class AutomationEngine {
     const ex: Record<string, any> = context.extracted || {};
     const appt: Record<string, any> = context.appointment || {};
 
-    // Pull date/time from every possible alias in extracted/appointment so
-    // {{appointment.date}} / {{date}} always resolve to the same value.
+    // Appointment date/time: only from extract-data (appointment_date / appointment_time).
     const exAppt = ex.appointment && typeof ex.appointment === 'object' ? ex.appointment : {};
     const dateCandidates = [
-      appt.date,
-      (exAppt as any).date,
-      ex.date,
-      ex.preferred_date,
       ex.appointment_date,
-      ex.scheduled_date,
-      ex.meeting_date,
-      ex.slot_date,
-      ex.booking_date
+      appt.date,
+      (exAppt as any).date
     ].filter((v) => v != null && String(v).trim() !== '' && String(v).toLowerCase() !== 'null');
     const timeCandidates = [
-      appt.time,
-      (exAppt as any).time,
-      ex.time,
-      ex.preferred_time,
       ex.appointment_time,
-      ex.scheduled_time,
-      ex.meeting_time,
-      ex.slot_time,
-      ex.booking_time
+      appt.time,
+      (exAppt as any).time
     ].filter((v) => v != null && String(v).trim() !== '' && String(v).toLowerCase() !== 'null');
     const mergedDate = dateCandidates.length > 0 ? String(dateCandidates[0]) : '';
     const mergedTime = timeCandidates.length > 0 ? String(timeCandidates[0]) : '';
@@ -195,8 +182,8 @@ export class AutomationEngine {
       (contactName
         ? String(contactName).trim().split(/\s+/).slice(1).join(' ')
         : '');
-    const mergedAppointmentDate = mergedDate || context.triggerData?.dynamic_variables?.appointment_date || '';
-    const mergedAppointmentTime = mergedTime || context.triggerData?.dynamic_variables?.appointment_time || '';
+    const mergedAppointmentDate = mergedDate;
+    const mergedAppointmentTime = mergedTime;
     const mergedAppointmentDateTime =
       [mergedAppointmentDate, mergedAppointmentTime].filter(Boolean).join(' ').trim();
     const parsedNow = context.now ? new Date(context.now) : new Date();
@@ -360,8 +347,10 @@ export class AutomationEngine {
 
     const extractedBlock = {
       ...ex,
-      date: ex.date || (exAppt as any).date || mergedDate,
-      time: ex.time || (exAppt as any).time || mergedTime,
+      appointment_date: ex.appointment_date || mergedDate,
+      appointment_time: ex.appointment_time || mergedTime,
+      date: ex.appointment_date || mergedDate,
+      time: ex.appointment_time || mergedTime,
       appointment: {
         ...((ex.appointment && typeof ex.appointment === 'object' ? ex.appointment : {}) as Record<string, unknown>),
         booked:
@@ -1009,103 +998,39 @@ export class AutomationEngine {
               extraction_prompt && json_example ? { extraction_prompt, json_example } : undefined
             );
 
-        // Reuse the same merge/normalize logic as aistein_extract_appointment
-        const ed: Record<string, any> = (result.extracted_data || {}) as Record<string, any>;
-        const cleanStr = (v: any) => {
-          if (v == null) return '';
-          const s = String(v).trim();
-          return s && s.toLowerCase() !== 'null' ? s : '';
-        };
-        let finalDate =
-          cleanStr(ed.date) ||
-          cleanStr(ed.preferred_date) ||
-          cleanStr(ed.appointment_date) ||
-          cleanStr(ed.scheduled_date) ||
-          cleanStr(ed.meeting_date) ||
-          cleanStr(ed.slot_date) ||
-          cleanStr(ed.booking_date) ||
-          cleanStr(result.date);
-        let finalTime =
-          cleanStr(ed.time) ||
-          cleanStr(ed.preferred_time) ||
-          cleanStr(ed.appointment_time) ||
-          cleanStr(ed.scheduled_time) ||
-          cleanStr(ed.meeting_time) ||
-          cleanStr(ed.slot_time) ||
-          cleanStr(ed.booking_time) ||
-          cleanStr(result.time);
-
-        // Normalize Google/Excel serial date-time values (e.g. 46091.95833)
-        // into user-friendly date/time strings before downstream actions.
-        const serialLike = /^-?\d+(\.\d+)?$/;
-        const toIsoPartsFromSerial = (raw: string): { date: string; time: string } | null => {
-          if (!serialLike.test(raw)) return null;
-          const n = Number(raw);
-          // Reasonable spreadsheet serial range (year ~1954 to ~2064).
-          if (!Number.isFinite(n) || n < 20000 || n > 70000) return null;
-          const excelEpochUtc = Date.UTC(1899, 11, 30);
-          const ms = excelEpochUtc + n * 24 * 60 * 60 * 1000;
-          const d = new Date(ms);
-          if (isNaN(d.getTime())) return null;
-          const yyyy = d.getUTCFullYear();
-          const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-          const dd = String(d.getUTCDate()).padStart(2, '0');
-          const hh = String(d.getUTCHours()).padStart(2, '0');
-          const min = String(d.getUTCMinutes()).padStart(2, '0');
-          return { date: `${yyyy}-${mm}-${dd}`, time: `${hh}:${min}` };
-        };
-        const fromDateSerial = finalDate ? toIsoPartsFromSerial(finalDate) : null;
-        if (fromDateSerial) {
-          finalDate = fromDateSerial.date;
-          if (!finalTime) finalTime = fromDateSerial.time;
-        }
-        const fromTimeSerial = finalTime ? toIsoPartsFromSerial(finalTime) : null;
-        if (fromTimeSerial) {
-          if (!finalDate) finalDate = fromTimeSerial.date;
-          finalTime = fromTimeSerial.time;
-        }
-
-        const apptBookedRaw =
-          ed.appointment_booked != null ? ed.appointment_booked : result.appointment_booked;
-        const { resolveFinalAppointmentBooked } = await import('./automation.service');
-        const finalBooked = resolveFinalAppointmentBooked(apptBookedRaw, finalDate, finalTime);
-        const resolvedTime = finalBooked ? finalTime : '';
-
-        if (!finalBooked) {
-          finalDate = '';
-          finalTime = '';
-        }
-
-        const extractionConfidence =
-          (result as { confidence?: number }).confidence ?? ed.confidence;
+        const { buildNormalizedExtractionContext } = await import('./automation.service');
+        const normalized = buildNormalizedExtractionContext(result, json_example);
+        const { finalDate, finalTime, finalBooked, extractionConfidence, extracted_data } = normalized;
 
         context.appointment = {
           booked: finalBooked,
           date: finalDate || undefined,
-          time: resolvedTime || undefined,
+          time: finalTime || undefined,
           confidence: extractionConfidence
         };
 
         context.extracted = {
-          ...(result.extracted_data || {}),
           ...(context.extracted || {}),
-          date: finalDate || undefined,
-          time: resolvedTime || undefined,
-          appointment_booked: finalBooked,
+          ...extracted_data,
           appointment: {
             booked: finalBooked,
             date: finalDate || undefined,
-            time: resolvedTime || undefined
+            time: finalTime || undefined
           },
           interested: finalBooked || !!(result.extracted_data as any)?.interested
         };
 
         console.log(
-          `[Automation Engine] 📋 Extraction summary: booked=${finalBooked} date="${finalDate}" time="${resolvedTime}" ` +
-          `(extracted_data keys: ${Object.keys(result.extracted_data || {}).join(', ') || 'none'})`
+          `[Automation Engine] 📋 Extraction summary: booked=${finalBooked} appointment_date="${finalDate}" appointment_time="${finalTime}"`
         );
 
-        return result;
+        return {
+          ...result,
+          appointment_booked: finalBooked,
+          date: finalDate || null,
+          time: finalTime || null,
+          extracted_data
+        };
       }
     });
 
@@ -1805,7 +1730,11 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           config.json_example && typeof config.json_example === 'object' ? config.json_example : undefined;
 
         console.log(
-          `[Automation Engine] 🧠 Extracting appointment via Python extract-data API: ${resolvedConvId}`
+          `[Automation Engine] 🧠 Extracting via Python extract-data API: ${resolvedConvId}`,
+          {
+            extraction_prompt: extraction_prompt || '(default)',
+            json_example_keys: json_example ? Object.keys(json_example) : []
+          }
         );
 
         try {
@@ -1816,111 +1745,49 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
             { extraction_type, extraction_prompt, json_example }
           );
 
-          console.log(`[Automation Engine] ✅ Extraction result:`, result.success ? (result.extracted_data || { appointment_booked: result.appointment_booked, date: result.date, time: result.time }) : result.error);
+          const { buildNormalizedExtractionContext } = await import('./automation.service');
+          const normalized = buildNormalizedExtractionContext(result, json_example);
+          const { finalDate, finalTime, finalBooked, extractionConfidence, extracted_data } = normalized;
 
-          // ── Pull date/time from EVERY field the LLM might use (legacy + dynamic) ──
-          const ed: Record<string, any> = (result.extracted_data || {}) as Record<string, any>;
-          const cleanStr = (v: any) => {
-            if (v == null) return '';
-            const s = String(v).trim();
-            return s && s.toLowerCase() !== 'null' ? s : '';
-          };
-          let finalDate =
-            cleanStr(ed.date) ||
-            cleanStr(ed.preferred_date) ||
-            cleanStr(ed.appointment_date) ||
-            cleanStr(ed.scheduled_date) ||
-            cleanStr(ed.meeting_date) ||
-            cleanStr(ed.slot_date) ||
-            cleanStr(ed.booking_date) ||
-            cleanStr(result.date);
-          let finalTime =
-            cleanStr(ed.time) ||
-            cleanStr(ed.preferred_time) ||
-            cleanStr(ed.appointment_time) ||
-            cleanStr(ed.scheduled_time) ||
-            cleanStr(ed.meeting_time) ||
-            cleanStr(ed.slot_time) ||
-            cleanStr(ed.booking_time) ||
-            cleanStr(result.time);
+          console.log(
+            `[Automation Engine] ✅ Extraction result:`,
+            result.success
+              ? {
+                  appointment_booked: finalBooked,
+                  appointment_date: finalDate || null,
+                  appointment_time: finalTime || null
+                }
+              : result.error
+          );
 
-          // Normalize Google/Excel serial date-time values (e.g. 46091.95833)
-          // into user-friendly date/time strings before downstream actions.
-          const serialLike = /^-?\d+(\.\d+)?$/;
-          const toIsoPartsFromSerial = (raw: string): { date: string; time: string } | null => {
-            if (!serialLike.test(raw)) return null;
-            const n = Number(raw);
-            if (!Number.isFinite(n) || n < 20000 || n > 70000) return null;
-            const excelEpochUtc = Date.UTC(1899, 11, 30);
-            const ms = excelEpochUtc + n * 24 * 60 * 60 * 1000;
-            const d = new Date(ms);
-            if (isNaN(d.getTime())) return null;
-            const yyyy = d.getUTCFullYear();
-            const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-            const dd = String(d.getUTCDate()).padStart(2, '0');
-            const hh = String(d.getUTCHours()).padStart(2, '0');
-            const min = String(d.getUTCMinutes()).padStart(2, '0');
-            return { date: `${yyyy}-${mm}-${dd}`, time: `${hh}:${min}` };
-          };
-          const fromDateSerial = finalDate ? toIsoPartsFromSerial(finalDate) : null;
-          if (fromDateSerial) {
-            finalDate = fromDateSerial.date;
-            if (!finalTime) finalTime = fromDateSerial.time;
-          }
-          const fromTimeSerial = finalTime ? toIsoPartsFromSerial(finalTime) : null;
-          if (fromTimeSerial) {
-            if (!finalDate) finalDate = fromTimeSerial.date;
-            finalTime = fromTimeSerial.time;
-          }
-
-          const apptBookedRaw =
-            ed.appointment_booked != null ? ed.appointment_booked : result.appointment_booked;
-          const { resolveFinalAppointmentBooked } = await import('./automation.service');
-          const finalBooked = resolveFinalAppointmentBooked(apptBookedRaw, finalDate, finalTime);
-          const resolvedTime = finalBooked ? finalTime : '';
-
-          if (!finalBooked) {
-            finalDate = '';
-            finalTime = '';
-          }
-
-          const extractionConfidence =
-            (result as { confidence?: number }).confidence ?? ed.confidence;
-
-          // ── Update both context.appointment AND context.extracted with merged values ──
           context.appointment = {
             booked: finalBooked,
             date: finalDate || undefined,
-            time: resolvedTime || undefined,
+            time: finalTime || undefined,
             confidence: extractionConfidence
           };
 
           context.extracted = {
             ...(context.extracted || {}),
-            ...(result.extracted_data || {}),
-            date: finalDate || undefined,
-            time: resolvedTime || undefined,
-            appointment_booked: finalBooked,
-            // Nested mirror for conditions + templates: {{extracted.appointment.date}}
+            ...extracted_data,
             appointment: {
               booked: finalBooked,
               date: finalDate || undefined,
-              time: resolvedTime || undefined
+              time: finalTime || undefined
             },
             interested: finalBooked || !!(result.extracted_data as any)?.interested
           };
 
           console.log(
-            `[Automation Engine] 📋 Extraction summary: booked=${finalBooked} date="${finalDate}" time="${resolvedTime}" ` +
-            `(extracted_data keys: ${Object.keys(result.extracted_data || {}).join(', ') || 'none'})`
+            `[Automation Engine] 📋 Extraction summary: booked=${finalBooked} appointment_date="${finalDate}" appointment_time="${finalTime}"`
           );
 
           return {
             success: true,
             appointment_booked: finalBooked,
             date: finalDate || null,
-            time: resolvedTime || null,
-            extracted_data: result.extracted_data,
+            time: finalTime || null,
+            extracted_data,
             confidence: extractionConfidence ?? 0,
             reason: result.error
           };
@@ -1991,18 +1858,14 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
         let resolvedStart = await this.resolveTemplate(startTime || '', context);
         let resolvedEnd = await this.resolveTemplate(endTime || '', context);
         const fallbackDate = String(
+          context.extracted?.appointment_date ||
           context.appointment?.date ||
-          context.extracted?.date ||
-          context.triggerData?.appointment?.date ||
-          context.triggerData?.dynamic_variables?.appointment_date ||
           ''
         ).trim();
         const fallbackTime = String(
+          context.extracted?.appointment_time ||
           context.appointment?.time ||
-          context.extracted?.time ||
-          context.triggerData?.appointment?.time ||
-          context.triggerData?.dynamic_variables?.appointment_time ||
-          '09:00'
+          ''
         ).trim();
 
         const hasUnresolvedToken = (v: string): boolean => String(v || '').includes('{{');

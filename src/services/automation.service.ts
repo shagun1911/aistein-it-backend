@@ -11,12 +11,13 @@ const PYTHON_API_BASE_URL =
 
 /** Tested appointment extraction schema (Python /api/v1/automation/extract-data). */
 export const DEFAULT_APPOINTMENT_EXTRACTION_PROMPT =
-  'Extract whether a person booked an apppoinment or not';
+  'Extract whether a person booked an appointment or not';
 
-export const DEFAULT_APPOINTMENT_JSON_EXAMPLE: Record<string, string> = {
-  appointment_booked: 'True',
-  appointment_date: '2026-05-20',
-  appointment_time: '14:30'
+/** Shape hint for Python extract-data — no real dates/times (LLM fills from transcript). */
+export const DEFAULT_APPOINTMENT_JSON_EXAMPLE: Record<string, string | boolean> = {
+  appointment_booked: false,
+  appointment_date: '',
+  appointment_time: ''
 };
 
 export type ExtractConversationResult = {
@@ -534,6 +535,170 @@ function applyAppointmentPostProcess(
   }
 }
 
+export function cleanExtractedString(v: unknown): string {
+  if (v == null) return '';
+  const s = String(v).trim();
+  return s && s.toLowerCase() !== 'null' ? s : '';
+}
+
+/** Resolve which keys in extracted_data hold date/time/booked per the node's json_example schema. */
+export function resolveAppointmentFieldKeys(jsonExample?: Record<string, any>): {
+  dateKey: string;
+  timeKey: string;
+  bookedKey: string;
+} {
+  const keys = jsonExample ? Object.keys(jsonExample) : [];
+  return {
+    dateKey: keys.includes('appointment_date')
+      ? 'appointment_date'
+      : keys.includes('date')
+        ? 'date'
+        : 'appointment_date',
+    timeKey: keys.includes('appointment_time')
+      ? 'appointment_time'
+      : keys.includes('time')
+        ? 'time'
+        : 'appointment_time',
+    bookedKey: keys.includes('appointment_booked')
+      ? 'appointment_booked'
+      : keys.includes('booked')
+        ? 'booked'
+        : 'appointment_booked'
+  };
+}
+
+/**
+ * Strip placeholder sample values from json_example before POST to Python extract-data.
+ * The API uses this object as a shape hint — not as data to return verbatim.
+ */
+export function jsonExampleForExtractApi(example: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [key, val] of Object.entries(example)) {
+    if (val === null) {
+      out[key] = null;
+    } else if (typeof val === 'boolean') {
+      out[key] = false;
+    } else if (typeof val === 'number') {
+      out[key] = 0;
+    } else if (typeof val === 'string') {
+      const s = val.trim();
+      if (s === 'True' || s === 'true') out[key] = true;
+      else if (s === 'False' || s === 'false') out[key] = false;
+      else out[key] = '';
+    } else if (Array.isArray(val)) {
+      out[key] = [];
+    } else if (typeof val === 'object') {
+      out[key] = jsonExampleForExtractApi(val as Record<string, any>);
+    } else {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+
+/**
+ * Canonical appointment fields from POST /api/v1/automation/extract-data,
+ * using the automation node's json_example key names.
+ */
+export function resolveCanonicalAppointmentFromExtractResult(
+  result: ExtractConversationResult,
+  jsonExample?: Record<string, any>
+): {
+  finalDate: string;
+  finalTime: string;
+  bookedRaw: unknown;
+} {
+  const ed = result.extracted_data || {};
+  const { dateKey, timeKey, bookedKey } = resolveAppointmentFieldKeys(jsonExample);
+  return {
+    finalDate: cleanExtractedString(ed[dateKey]),
+    finalTime: cleanExtractedString(ed[timeKey]),
+    bookedRaw: ed[bookedKey] ?? ed.appointment_booked ?? result.appointment_booked
+  };
+}
+
+/** Normalize Google/Excel serial values (e.g. 46091.95833) into YYYY-MM-DD and HH:mm. */
+export function normalizeExcelSerialDateTime(
+  finalDate: string,
+  finalTime: string
+): { date: string; time: string } {
+  let date = finalDate;
+  let time = finalTime;
+  const serialLike = /^-?\d+(\.\d+)?$/;
+  const toIsoPartsFromSerial = (raw: string): { date: string; time: string } | null => {
+    if (!serialLike.test(raw)) return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 20000 || n > 70000) return null;
+    const excelEpochUtc = Date.UTC(1899, 11, 30);
+    const ms = excelEpochUtc + n * 24 * 60 * 60 * 1000;
+    const d = new Date(ms);
+    if (isNaN(d.getTime())) return null;
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const min = String(d.getUTCMinutes()).padStart(2, '0');
+    return { date: `${yyyy}-${mm}-${dd}`, time: `${hh}:${min}` };
+  };
+  const fromDateSerial = date ? toIsoPartsFromSerial(date) : null;
+  if (fromDateSerial) {
+    date = fromDateSerial.date;
+    if (!time) time = fromDateSerial.time;
+  }
+  const fromTimeSerial = time ? toIsoPartsFromSerial(time) : null;
+  if (fromTimeSerial) {
+    if (!date) date = fromTimeSerial.date;
+    time = fromTimeSerial.time;
+  }
+  return { date, time };
+}
+
+export function buildNormalizedExtractionContext(
+  result: ExtractConversationResult,
+  jsonExample?: Record<string, any>
+): {
+  finalDate: string;
+  finalTime: string;
+  finalBooked: boolean;
+  extractionConfidence?: number;
+  extracted_data: Record<string, any>;
+} {
+  let { finalDate, finalTime, bookedRaw } = resolveCanonicalAppointmentFromExtractResult(
+    result,
+    jsonExample
+  );
+  const normalized = normalizeExcelSerialDateTime(finalDate, finalTime);
+  finalDate = normalized.date;
+  finalTime = normalized.time;
+
+  const finalBooked = resolveFinalAppointmentBooked(bookedRaw, finalDate, finalTime);
+  const resolvedTime = finalBooked ? finalTime : '';
+  if (!finalBooked) {
+    finalDate = '';
+    finalTime = '';
+  }
+
+  const ed = result.extracted_data || {};
+  const extractionConfidence = (result as { confidence?: number }).confidence ?? ed.confidence;
+
+  const extracted_data: Record<string, any> = {
+    ...ed,
+    appointment_booked: finalBooked,
+    appointment_date: finalDate || null,
+    appointment_time: resolvedTime || null,
+    date: finalDate || null,
+    time: resolvedTime || null
+  };
+
+  return {
+    finalDate,
+    finalTime: resolvedTime,
+    finalBooked,
+    extractionConfidence,
+    extracted_data
+  };
+}
+
 export function resolveFinalAppointmentBooked(
   apptBookedRaw: unknown,
   finalDate: string | undefined | null,
@@ -819,7 +984,9 @@ export class AutomationService {
   ): Promise<ExtractConversationResult> {
     const url = `${PYTHON_API_BASE_URL.replace(/\/$/, '')}/api/v1/automation/extract-data`;
     const extraction_prompt = options?.extraction_prompt?.trim() || DEFAULT_APPOINTMENT_EXTRACTION_PROMPT;
-    const json_example = options?.json_example ?? DEFAULT_APPOINTMENT_JSON_EXAMPLE;
+    const json_example = jsonExampleForExtractApi(
+      options?.json_example ?? DEFAULT_APPOINTMENT_JSON_EXAMPLE
+    );
 
     const body = {
       conversation_id: conversationId,
@@ -828,10 +995,7 @@ export class AutomationService {
       json_example
     };
 
-    console.log('[Automation Service] POST Python extract-data:', url, {
-      conversation_id: conversationId,
-      extraction_type: body.extraction_type
-    });
+    console.log('[Automation Service] POST Python extract-data:', url, JSON.stringify(body, null, 2));
 
     try {
       const response = await axios.post(url, body, {
@@ -841,17 +1005,10 @@ export class AutomationService {
       const data = response.data || {};
       const extracted_data: Record<string, any> = data.extracted_data || {};
 
-      const bookedRaw = extracted_data.appointment_booked ?? data.appointment_booked;
-      const dateRaw =
-        extracted_data.appointment_date ??
-        extracted_data.date ??
-        data.date ??
-        null;
-      const timeRaw =
-        extracted_data.appointment_time ??
-        extracted_data.time ??
-        data.time ??
-        null;
+      const { dateKey, timeKey, bookedKey } = resolveAppointmentFieldKeys(json_example);
+      const bookedRaw = extracted_data[bookedKey] ?? extracted_data.appointment_booked ?? data.appointment_booked;
+      const dateRaw = extracted_data[dateKey] ?? null;
+      const timeRaw = extracted_data[timeKey] ?? null;
 
       return {
         success: data.success !== false,
@@ -886,8 +1043,19 @@ export class AutomationService {
     options?: { extraction_prompt?: string; json_example?: Record<string, any>; extraction_type?: string }
   ): Promise<ExtractConversationResult> {
     const extractionType = options?.extraction_type || 'appointment';
+    const hasNodeConfig =
+      !!options?.extraction_prompt?.trim() &&
+      options?.json_example &&
+      typeof options.json_example === 'object';
+
     const prompt = options?.extraction_prompt?.trim() || DEFAULT_APPOINTMENT_EXTRACTION_PROMPT;
     const jsonExample = options?.json_example ?? DEFAULT_APPOINTMENT_JSON_EXAMPLE;
+
+    if (!hasNodeConfig) {
+      console.warn(
+        '[Automation Service] extractAppointmentForAutomation: no extraction_prompt/json_example on node — using defaults'
+      );
+    }
 
     try {
       return await this.extractConversationDataViaPythonApi(conversationId, extractionType, {
@@ -1102,17 +1270,11 @@ Respond ONLY with valid JSON matching the above keys. No extra keys, no explanat
           const customerSlot = customerProvidedDateAndTime(customerText, now);
           const fillDate = customerSlot.resolvedDate || resolvedRelativeDate;
           const fillTime = customerSlot.resolvedTime || resolvedRelativeTime;
-          if (fillDate) {
-            const dateLikeKeys = ['date', 'appointment_date', 'preferred_date', 'appointmentDate', 'preferredDate'];
-            for (const k of dateLikeKeys) {
-              if (k in extracted_data) extracted_data[k] = fillDate;
-            }
+          if (fillDate && 'appointment_date' in extracted_data) {
+            extracted_data.appointment_date = fillDate;
           }
-          if (fillTime) {
-            const timeLikeKeys = ['time', 'appointment_time', 'preferred_time', 'appointmentTime', 'preferredTime'];
-            for (const k of timeLikeKeys) {
-              if (k in extracted_data) extracted_data[k] = fillTime;
-            }
+          if (fillTime && 'appointment_time' in extracted_data) {
+            extracted_data.appointment_time = fillTime;
           }
         }
         // If we have city and country, remove separate address field (city + country is our address)

@@ -781,18 +781,6 @@ export class BatchCallingService {
           // ── Trigger automation ─────────────────────────────────────────────
           try {
             const { automationService } = await import('./automation.service');
-            const appointmentDate =
-              vars.appointment_date ||
-              vars.preferred_date ||
-              vars.scheduled_date ||
-              vars.date ||
-              '';
-            const appointmentTime =
-              vars.appointment_time ||
-              vars.preferred_time ||
-              vars.scheduled_time ||
-              vars.time ||
-              '';
             const recordingUrl = resolvedRecordingUrl;
             const csvOrCallAddress =
               vars.address ||
@@ -811,11 +799,6 @@ export class BatchCallingService {
               audio_url: recordingUrl,
               dynamic_variables: vars,
               selected_dynamic_variable_keys: batchCall.selected_dynamic_variable_keys || [],
-              appointment: {
-                booked: Boolean(appointmentDate || appointmentTime),
-                date: appointmentDate,
-                time: appointmentTime
-              },
               freshContactData: {
                 name,
                 first_name: firstName || '',

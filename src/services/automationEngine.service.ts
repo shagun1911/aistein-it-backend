@@ -2481,14 +2481,24 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
     const userId = externalContext?.userId || (await this.resolveUserId(organizationId)) || '';
     const execution = await AutomationExecution.create({ automationId, status: 'pending', triggerData });
 
-    console.log(`\n${'='.repeat(80)}`);
-    console.log(`[Automation Engine] 🚀 STARTING AUTOMATION EXECUTION`);
-    console.log(`[Automation Engine] Automation: ${automation.name}`);
-    console.log(`[Automation Engine] Automation ID: ${automationId}`);
-    console.log(`[Automation Engine] Execution ID: ${execution._id}`);
-    console.log(`[Automation Engine] Organization: ${organizationId}`);
-    console.log(`[Automation Engine] Trigger Data:`, JSON.stringify(triggerData, null, 2));
-    console.log(`${'='.repeat(80)}\n`);
+    const isBatchCallExecution = String(triggerData?.event || '').trim() === 'batch_call_completed';
+    const batchContactName = triggerData?.freshContactData?.name || 'Unknown';
+    const batchContactPhone = triggerData?.freshContactData?.phone || '';
+
+    if (isBatchCallExecution) {
+      console.log(
+        `[Automation Engine] Running workflow "${automation.name}" | contact: ${batchContactName} | phone: ${batchContactPhone} | execution: ${execution._id}`
+      );
+    } else {
+      console.log(`\n${'='.repeat(80)}`);
+      console.log(`[Automation Engine] 🚀 STARTING AUTOMATION EXECUTION`);
+      console.log(`[Automation Engine] Automation: ${automation.name}`);
+      console.log(`[Automation Engine] Automation ID: ${automationId}`);
+      console.log(`[Automation Engine] Execution ID: ${execution._id}`);
+      console.log(`[Automation Engine] Organization: ${organizationId}`);
+      console.log(`[Automation Engine] Trigger Data:`, JSON.stringify(triggerData, null, 2));
+      console.log(`${'='.repeat(80)}\n`);
+    }
 
     try {
       const serviceLabel = (service: string): string => {
@@ -2907,33 +2917,56 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
       execution.status = 'success';
       await execution.save();
 
-      console.log(`\n${'='.repeat(80)}`);
-      console.log(`[Automation Engine] ✅ AUTOMATION EXECUTION COMPLETED SUCCESSFULLY`);
-      console.log(`[Automation Engine] Execution ID: ${execution._id}`);
-      console.log(`[Automation Engine] Status: ${execution.status}`);
-      console.log(`${'='.repeat(80)}\n`);
+      if (isBatchCallExecution) {
+        console.log(
+          `[Automation Engine] ✅ Workflow finished | contact: ${batchContactName} | phone: ${batchContactPhone} | workflow: ${automation.name} | execution: ${execution._id}`
+        );
+      } else {
+        console.log(`\n${'='.repeat(80)}`);
+        console.log(`[Automation Engine] ✅ AUTOMATION EXECUTION COMPLETED SUCCESSFULLY`);
+        console.log(`[Automation Engine] Execution ID: ${execution._id}`);
+        console.log(`[Automation Engine] Status: ${execution.status}`);
+        console.log(`${'='.repeat(80)}\n`);
+      }
 
     } catch (err: any) {
       execution.status = 'failed';
       execution.errorMessage = err.message;
       await execution.save();
 
-      console.log(`\n${'='.repeat(80)}`);
-      console.log(`[Automation Engine] ❌ AUTOMATION EXECUTION FAILED`);
-      console.log(`[Automation Engine] Execution ID: ${execution._id}`);
-      console.log(`[Automation Engine] Error: ${err.message}`);
-      console.log(`[Automation Engine] Stack:`, err.stack);
-      console.log(`${'='.repeat(80)}\n`);
+      if (isBatchCallExecution) {
+        console.error(
+          `[Automation Engine] ❌ Workflow failed | contact: ${batchContactName} | phone: ${batchContactPhone} | workflow: ${automation.name} |`,
+          err.message
+        );
+      } else {
+        console.log(`\n${'='.repeat(80)}`);
+        console.log(`[Automation Engine] ❌ AUTOMATION EXECUTION FAILED`);
+        console.log(`[Automation Engine] Execution ID: ${execution._id}`);
+        console.log(`[Automation Engine] Error: ${err.message}`);
+        console.log(`[Automation Engine] Stack:`, err.stack);
+        console.log(`${'='.repeat(80)}\n`);
+      }
 
       throw err;
     }
   }
 
   async triggerByEvent(event: string, eventData: any, context?: any) {
-    console.log(`\n${'━'.repeat(80)}`);
-    console.log(`[Automation Engine] 🎯 EVENT TRIGGERED: ${event}`);
-    console.log(`[Automation Engine] Event Data:`, JSON.stringify(eventData, null, 2));
-    console.log(`${'━'.repeat(80)}\n`);
+    const isBatchCall = event === 'batch_call_completed';
+    const batchContact = eventData?.freshContactData;
+    if (isBatchCall) {
+      const contactLabel = batchContact?.name || 'Unknown';
+      const contactPhone = batchContact?.phone || eventData?.dynamic_variables?.phone || '';
+      console.log(
+        `[Automation Engine] batch_call_completed dispatch | contact: ${contactLabel} | phone: ${contactPhone} | batch: ${eventData?.batch_id || 'n/a'}`
+      );
+    } else {
+      console.log(`\n${'━'.repeat(80)}`);
+      console.log(`[Automation Engine] 🎯 EVENT TRIGGERED: ${event}`);
+      console.log(`[Automation Engine] Event Data:`, JSON.stringify(eventData, null, 2));
+      console.log(`${'━'.repeat(80)}\n`);
+    }
 
     const query: any = { isActive: true };
     const organizationId = context?.organizationId || eventData?.organizationId;
@@ -2981,11 +3014,25 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
       }
     }
 
-    console.log(`\n[Automation Engine] 📊 Trigger Summary: ${results.length} automation(s) triggered`);
-    if (results.length > 0) {
-      results.forEach(r => console.log(`[Automation Engine]    ✅ ${r.name}`));
+    if (isBatchCall) {
+      const contactLabel = batchContact?.name || 'Unknown';
+      const contactPhone = batchContact?.phone || '';
+      if (results.length > 0) {
+        console.log(
+          `[Automation Engine] batch_call_completed queued | contact: ${contactLabel} | phone: ${contactPhone} | workflow(s): ${results.map((r) => r.name).join(', ')}`
+        );
+      } else {
+        console.log(
+          `[Automation Engine] batch_call_completed — no matching active workflow | contact: ${contactLabel} | phone: ${contactPhone}`
+        );
+      }
+    } else {
+      console.log(`\n[Automation Engine] 📊 Trigger Summary: ${results.length} automation(s) triggered`);
+      if (results.length > 0) {
+        results.forEach(r => console.log(`[Automation Engine]    ✅ ${r.name}`));
+      }
+      console.log(`${'━'.repeat(80)}\n`);
     }
-    console.log(`${'━'.repeat(80)}\n`);
 
     // Trigger external webhooks for batch_call_completed events
     if (event === 'batch_call_completed') {

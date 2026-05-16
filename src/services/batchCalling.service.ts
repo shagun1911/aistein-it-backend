@@ -367,6 +367,19 @@ export class BatchCallingService {
     'canceled'
   ]);
 
+  /** Match phones across CSV, DB, and ElevenLabs (+91… vs 91… vs spaces). */
+  private normalizePhoneKey(phone: string): string {
+    const digits = String(phone || '').replace(/\D/g, '');
+    if (digits.length >= 10) return digits.slice(-10);
+    return digits;
+  }
+
+  private isAutomationDoneForPhone(automationDoneKeys: Set<string>, phone: string): boolean {
+    const key = this.normalizePhoneKey(phone);
+    if (!key) return false;
+    return automationDoneKeys.has(key);
+  }
+
   private isBatchFullyDone(batch: BatchCallResponse): boolean {
     const s = String(batch.status || '').toLowerCase();
     if (s === 'completed' || s === 'done' || s === 'finished') return true;
@@ -500,7 +513,9 @@ export class BatchCallingService {
       // Track which phones have had automation successfully triggered (source of truth for dedup).
       // We use this instead of processed_call_ids because processed_call_ids can get corrupted
       // by stale data from previous server runs / code versions.
-      const automationDone = new Set<string>(batchCall.automation_triggered_phones || []);
+      const automationDoneKeys = new Set<string>(
+        (batchCall.automation_triggered_phones || []).map((p: string) => this.normalizePhoneKey(p))
+      );
 
       // ── STEP 1: Get batch status with recipients list from Python API ──────
       let batchStatus: BatchCallResponse;
@@ -548,21 +563,21 @@ export class BatchCallingService {
       for (const recipient of recipients) {
         const phone = recipient.phone_number;
         const recipientStatus = recipient.status;
-        const elevenLabsConvId = recipient.conversation_id;
+        let elevenLabsConvId = recipient.conversation_id;
 
         try {
-          if (!automationDone.has(phone)) {
+          if (!this.isAutomationDoneForPhone(automationDoneKeys, phone)) {
             try {
               const latest = await BatchCall.findOne(
                 { batch_call_id: jobId },
                 { automation_triggered_phones: 1 }
               ).lean();
               for (const p of (latest?.automation_triggered_phones || [])) {
-                automationDone.add(p);
+                automationDoneKeys.add(this.normalizePhoneKey(p));
               }
             } catch (_) { /* best-effort */ }
           }
-          if (automationDone.has(phone)) {
+          if (this.isAutomationDoneForPhone(automationDoneKeys, phone)) {
             skipped++;
             continue;
           }
@@ -658,8 +673,9 @@ export class BatchCallingService {
           const { ready, duration, transcriptItems } = this.conversationHasCallableContent(convDetail);
           const endReason = convDetail?.metadata?.termination_reason || (convDetail?.analysis?.call_successful ? 'completed' : '');
 
-          if (!ready) {
-            if (batchFullyDone && !this.isCompletedLikeRecipientStatus(recipientStatus || '')) {
+          const statusSaysDone = this.isCompletedLikeRecipientStatus(recipientStatus || '');
+          if (!ready && !statusSaysDone) {
+            if (batchFullyDone) {
               terminalWithoutConversation++;
               skipped++;
               continue;
@@ -676,13 +692,26 @@ export class BatchCallingService {
           const name = fullName || vars.name || vars.customer_name || 'Unknown';
           const email = vars.email || vars.customer_email;
 
-          // Check if conversation already exists in our DB
-          const existing = await Conversation.findOne({
-            organizationId: orgObjectId,
-            channel: 'phone',
-            'metadata.batch_call_id': jobId,
-            'metadata.phone_number': phone
-          });
+          let existing: any = null;
+          if (elevenLabsConvId) {
+            existing = await Conversation.findOne({
+              organizationId: orgObjectId,
+              channel: 'phone',
+              'metadata.batch_call_id': jobId,
+              'metadata.conversation_id': elevenLabsConvId
+            });
+          }
+          if (!existing) {
+            const phoneKey = this.normalizePhoneKey(phone);
+            const batchConversations = await Conversation.find({
+              organizationId: orgObjectId,
+              channel: 'phone',
+              'metadata.batch_call_id': jobId
+            }).lean();
+            existing = batchConversations.find(
+              (c: any) => this.normalizePhoneKey(c?.metadata?.phone_number) === phoneKey
+            ) || null;
+          }
 
           let conversationId: string;
           let contactId: string;
@@ -812,7 +841,10 @@ export class BatchCallingService {
               vars.customer_address ||
               vars.home_address ||
               '';
-            await automationService.triggerByEvent('batch_call_completed', {
+            console.log(
+              `[Batch Calling Service] Call completed — triggering automation | contact: ${name} | phone: ${phone} | batch: ${jobId}`
+            );
+            const triggerResults = await automationService.triggerByEvent('batch_call_completed', {
               event: 'batch_call_completed',
               batch_id: jobId,
               conversation_id: conversationId,
@@ -832,18 +864,25 @@ export class BatchCallingService {
                 address: csvOrCallAddress
               }
             }, { userId, organizationId });
+            const workflowNames = (triggerResults || [])
+              .map((r: any) => r?.name)
+              .filter(Boolean)
+              .join(', ') || 'none';
             console.log(
-              `[Batch Calling Service] Automation ran for ${phone} (${name}) — batch ${jobId}, conv ${elevenLabsConvId}`
+              `[Batch Calling Service] ✅ AUTOMATION TRIGGERED | contact: ${name} | phone: ${phone} | batch: ${jobId} | conv: ${elevenLabsConvId} | workflow(s): ${workflowNames}`
             );
           } catch (err: any) {
-            console.error(`[Batch Calling Service] Automation failed for ${phone}:`, err.message);
+            console.error(
+              `[Batch Calling Service] ❌ AUTOMATION FAILED | contact: ${name} | phone: ${phone} | batch: ${jobId} |`,
+              err.message
+            );
             continue; // don't mark processed – retry next tick
           }
 
           // Mark done ONLY after automation succeeds.
           // Persist immediately so a parallel sync can't re-fire it.
           automationTriggered.push(phone);
-          automationDone.add(phone);
+          automationDoneKeys.add(this.normalizePhoneKey(phone));
           try {
             await BatchCall.updateOne(
               { batch_call_id: jobId },
@@ -862,10 +901,13 @@ export class BatchCallingService {
           { batch_call_id: jobId },
           { $addToSet: { automation_triggered_phones: { $each: automationTriggered } } }
         );
+        console.log(
+          `[Batch Calling Service] Batch ${jobId}: automation triggered this cycle for ${automationTriggered.length} contact(s): ${automationTriggered.join(', ')}`
+        );
       }
 
       // ── Mark batch fully done ──────────────────────────────────────────────
-      const totalResolvedRecipients = automationDone.size + terminalWithoutConversation;
+      const totalResolvedRecipients = automationDoneKeys.size + terminalWithoutConversation;
       const allDone = waiting === 0 && totalResolvedRecipients >= recipients.length;
       if (allDone) {
         await BatchCall.updateOne(

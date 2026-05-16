@@ -545,7 +545,20 @@ export class BatchCallingController {
               if (enqueued) {
                 console.log('[Batch Calling Controller] 🚀 Background polling started for batch:', chunk.result.id);
               } else {
-                console.log('[Batch Calling Controller] ℹ️  Queue not available - batch will rely on BatchCallMonitor fallback');
+                const { batchCallingService } = await import('../services/batchCalling.service');
+                const runSync = () => {
+                  void batchCallingService
+                    .syncBatchCallConversations(chunk.result.id, organizationIdStr)
+                    .catch((err: any) => {
+                      console.error(
+                        `[Batch Calling Controller] Sync failed for ${chunk.result.id}:`,
+                        err?.message || err
+                      );
+                    });
+                };
+                runSync();
+                setTimeout(runSync, 20_000);
+                setTimeout(runSync, 50_000);
               }
             } catch (queueError: any) {
               console.warn('[Batch Calling Controller] ⚠️  Failed to enqueue batch poll:', queueError.message);

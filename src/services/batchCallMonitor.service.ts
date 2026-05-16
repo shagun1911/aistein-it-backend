@@ -1,5 +1,4 @@
 import { batchCallingService } from '../services/batchCalling.service';
-import mongoose from 'mongoose';
 
 /**
  * Background monitor that checks for completed batch calls
@@ -15,11 +14,8 @@ export class BatchCallMonitor {
    */
   start() {
     if (this.isRunning) {
-      console.log('[Batch Call Monitor] Already running');
       return;
     }
-
-    console.log(`[Batch Call Monitor] ✅ Started – checking every ${this.checkIntervalMs / 1000}s`);
 
     this.isRunning = true;
     
@@ -41,7 +37,6 @@ export class BatchCallMonitor {
       this.intervalId = null;
     }
     this.isRunning = false;
-    console.log('[Batch Call Monitor] ⏹️  Stopped');
   }
 
   /**
@@ -70,32 +65,25 @@ export class BatchCallMonitor {
       .lean();
 
       if (activeBatches.length === 0) {
-        // Uncomment below line if you want heartbeat logs even when idle:
-        // console.log(`[Batch Call Monitor] 💤 No active batches – next check in ${this.checkIntervalMs / 1000}s`);
         return;
       }
-
-      console.log(`[Batch Call Monitor] 🔄 Found ${activeBatches.length} active batch(es) – syncing now`);
 
       for (const batch of activeBatches) {
         const batchId = batch.batch_call_id;
         const orgId = (batch as any).organizationId?.toString();
         if (!orgId) {
-          console.warn(`[Batch Call Monitor] ⚠️ Batch ${batchId} has no organizationId – skipping`);
           continue;
         }
 
-        console.log(`[Batch Call Monitor] 🔍 Syncing batch ${batchId} (status: ${(batch as any).status})`);
         try {
           await batchCallingService.syncBatchCallConversations(batchId, orgId);
-          console.log(`[Batch Call Monitor] ✅ Sync cycle done for ${batchId} – next check in ${this.checkIntervalMs / 1000}s`);
         } catch (error: any) {
-          console.error(`[Batch Call Monitor] ❌ Failed to sync ${batchId}:`, error.message);
+          console.error(`[Batch Call Monitor] Failed to sync ${batchId}:`, error.message);
         }
       }
 
     } catch (error: any) {
-      console.error('[Batch Call Monitor] ❌ Error during sync check:', error.message);
+      console.error('[Batch Call Monitor] Error during sync check:', error.message);
     }
   }
 
@@ -103,7 +91,6 @@ export class BatchCallMonitor {
    * Manually trigger a sync check (for testing)
    */
   async triggerSync() {
-    console.log('[Batch Call Monitor] 🔄 Manual sync triggered');
     await this.checkAndSyncBatchCalls();
   }
 

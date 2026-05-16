@@ -76,20 +76,6 @@ export class BatchCallingService {
     try {
       const pythonUrl = `${COMM_API_URL}/api/v1/batch-calling/submit`;
 
-      console.log('[Batch Calling Service] ===== SUBMITTING BATCH CALL =====');
-      console.log('[Batch Calling Service] Python API URL:', pythonUrl);
-      console.log('[Batch Calling Service] Request payload:', {
-        agent_id: data.agent_id,
-        call_name: data.call_name,
-        phone_number_id: data.phone_number_id,
-        recipients_count: data.recipients.length,
-        retry_count: data.retry_count ?? null,
-        scheduled_at: data.scheduled_at ?? null,
-        timezone: data.timezone ?? null,
-        target_concurrency_limit: data.target_concurrency_limit ?? null,
-        has_sender_email: Boolean(data.sender_email)
-      });
-
       // Validate phone_number_id is provided and is a non-empty string
       if (!data.phone_number_id || typeof data.phone_number_id !== 'string' || data.phone_number_id.trim() === '') {
         console.error('[Batch Calling Service] ❌ phone_number_id validation failed:', {
@@ -133,25 +119,6 @@ export class BatchCallingService {
       if (data.target_concurrency_limit !== undefined) payload.target_concurrency_limit = data.target_concurrency_limit;
       if (data.sender_email) payload.sender_email = data.sender_email;
 
-      // Log summary first
-      console.log('[Batch Calling Service] 🚀 Submitting batch:', {
-        recipients_count: payload.recipients.length,
-        agent_id: payload.agent_id,
-        phone_number_id: payload.phone_number_id,
-        call_name: payload.call_name,
-        retry_count: payload.retry_count ?? null,
-        scheduled_at: payload.scheduled_at ?? null,
-        timezone: payload.timezone ?? null,
-        target_concurrency_limit: payload.target_concurrency_limit ?? null,
-        has_sender_email: Boolean(payload.sender_email)
-      });
-
-      // Debug: print exact payload so it can be replayed directly in provider docs/tools.
-      console.log('[Batch Calling Service] Exact submit payload JSON:', JSON.stringify(payload, null, 2));
-
-      // Make the request
-      console.log('[Batch Calling Service] Making POST request to:', pythonUrl);
-
       const response = await axios.post<BatchCallResponse>(
         pythonUrl,
         payload,
@@ -163,11 +130,10 @@ export class BatchCallingService {
         }
       );
 
-      console.log('[Batch Calling Service] ✅ Batch call submitted successfully', {
-        status: response.status,
-        batch_id: response.data?.id,
-        batch_status: response.data?.status
-      });
+      console.log(
+        `[Batch Calling Service] Batch call started: "${data.call_name}" → ${response.data?.id} ` +
+        `(${payload.recipients.length} recipient(s), status: ${response.data?.status || 'pending'})`
+      );
 
       return response.data;
     } catch (error: any) {
@@ -387,26 +353,134 @@ export class BatchCallingService {
       return response.data;
     } catch (error: any) {
       if (error.response?.status === 404) return null;
-      console.error(`[Batch Calling Service] ⚠️ Failed to fetch conversation ${conversationId}:`, error.message);
       return null;
     }
+  }
+
+  private static readonly TERMINAL_RECIPIENT_STATUSES = new Set([
+    'failed',
+    'busy',
+    'no_answer',
+    'no-answer',
+    'voicemail',
+    'cancelled',
+    'canceled'
+  ]);
+
+  private isBatchFullyDone(batch: BatchCallResponse): boolean {
+    const s = String(batch.status || '').toLowerCase();
+    if (s === 'completed' || s === 'done' || s === 'finished') return true;
+    const scheduled = batch.total_calls_scheduled ?? 0;
+    const finished = batch.total_calls_finished ?? 0;
+    return scheduled > 0 && Number.isFinite(finished) && finished >= scheduled;
+  }
+
+  private isCompletedLikeRecipientStatus(status: string): boolean {
+    const raw = String(status || '').toLowerCase().trim();
+    return (
+      raw === 'completed' ||
+      raw === 'complete' ||
+      raw === 'done' ||
+      raw === 'finished' ||
+      raw === 'success' ||
+      raw === 'successful'
+    );
+  }
+
+  private recipientLooksInFlight(status: string): boolean {
+    const s = String(status || '')
+      .toLowerCase()
+      .replace(/_/g, ' ')
+      .replace(/-/g, ' ')
+      .trim();
+    if (!s) return false;
+    return (
+      s === 'pending' ||
+      s === 'queued' ||
+      s === 'scheduled' ||
+      s === 'initiated' ||
+      s.includes('in progress') ||
+      s.includes('ringing') ||
+      s.includes('dialing') ||
+      s.includes('calling') ||
+      s.includes('processing')
+    );
+  }
+
+  /**
+   * Decide whether to fetch conversation detail and attempt automation for a recipient.
+   * Mirrors batch UI outcome logic — do not rely on recipient.status === "completed" alone.
+   */
+  private resolveRecipientSyncAction(
+    recipient: BatchRecipientStatus,
+    batchFullyDone: boolean
+  ): 'process' | 'wait' | 'terminal_no_call' {
+    const normalized = String(recipient.status || '').toLowerCase().trim();
+
+    // Status can lag (e.g. no_answer → completed). If we have a conversation id, always verify.
+    if (recipient.conversation_id) {
+      return 'process';
+    }
+    if (this.isCompletedLikeRecipientStatus(recipient.status || '')) {
+      return 'wait';
+    }
+    if (BatchCallingService.TERMINAL_RECIPIENT_STATUSES.has(normalized)) {
+      return batchFullyDone ? 'terminal_no_call' : 'wait';
+    }
+    if (batchFullyDone && !this.recipientLooksInFlight(recipient.status || '')) {
+      return 'terminal_no_call';
+    }
+    return 'wait';
+  }
+
+  private conversationHasCallableContent(convDetail: any): {
+    ready: boolean;
+    duration: number;
+    transcriptItems: any[];
+  } {
+    const hasMessages = (t: any): boolean =>
+      t != null && (
+        (Array.isArray(t) && t.length > 0) ||
+        (typeof t === 'string' && t.trim().length > 0) ||
+        (t.messages && Array.isArray(t.messages) && t.messages.length > 0) ||
+        (t.items && Array.isArray(t.items) && t.items.length > 0)
+      );
+
+    const transcript = convDetail?.transcript;
+    const duration =
+      convDetail?.metadata?.call_duration_secs ??
+      convDetail?.call_duration_secs ??
+      convDetail?.metadata?.call_duration_seconds ??
+      0;
+    const transcriptItems =
+      transcript?.items ||
+      transcript?.messages ||
+      (Array.isArray(transcript) ? transcript : []);
+    const liveStatus = String(convDetail?.status || convDetail?.conversation_status || '').toLowerCase();
+    const liveDone =
+      liveStatus === 'done' ||
+      liveStatus === 'completed' ||
+      liveStatus === 'finished';
+    const ready =
+      hasMessages(transcript) ||
+      Number(duration) >= 1 ||
+      liveDone ||
+      convDetail?.analysis?.call_successful === true;
+
+    return { ready, duration: Number(duration) || 0, transcriptItems };
   }
 
   /**
    * Production-grade batch call sync.
    *
    * Flow:
-   *   1. GET batch status → get recipients[] with per-recipient status + conversation_id
-   *   2. For each recipient:
-   *      - Already in processed_call_ids? → skip
-   *      - recipient.status === "completed"? → fetch transcript via conversation_id
-   *        → create/update conversation, save messages, trigger automation, mark done
-   *      - recipient.status !== "completed"? → skip, check again next tick
-   *   3. When all recipients are processed → conversations_synced = true, stop polling
+   *   1. GET batch status → recipients with status + conversation_id
+   *   2. For each recipient: if conversation exists (or call evidence), fetch transcript
+   *      → create/update conversation → trigger automation (even if API status lags)
+   *   3. When all recipients resolved → conversations_synced = true, stop polling
    */
   async syncBatchCallConversations(jobId: string, organizationId: string): Promise<void> {
     if (this.syncLocks.has(jobId)) {
-      console.log(`[Batch Calling Service] ⏳ Sync already running for ${jobId}, skipping`);
       return;
     }
     this.syncLocks.add(jobId);
@@ -420,7 +494,6 @@ export class BatchCallingService {
         return;
       }
       if (batchCall.status === 'cancelled') {
-        console.log('[Batch Calling Service] ⏭️ Skipping cancelled batch:', jobId);
         return;
       }
 
@@ -428,8 +501,6 @@ export class BatchCallingService {
       // We use this instead of processed_call_ids because processed_call_ids can get corrupted
       // by stale data from previous server runs / code versions.
       const automationDone = new Set<string>(batchCall.automation_triggered_phones || []);
-
-      console.log(`[Batch Calling Service] 📋 Automation already done for ${automationDone.size} phone(s): [${[...automationDone].join(', ')}]`);
 
       // ── STEP 1: Get batch status with recipients list from Python API ──────
       let batchStatus: BatchCallResponse;
@@ -442,7 +513,6 @@ export class BatchCallingService {
 
       const recipients = batchStatus.recipients || [];
       if (recipients.length === 0) {
-        console.warn(`[Batch Calling Service] ⚠️ No recipients in batch status for ${jobId}`);
         return;
       }
 
@@ -456,7 +526,6 @@ export class BatchCallingService {
             total_calls_finished: batchStatus.total_calls_finished
           }
         });
-        console.log(`[Batch Calling Service] 🔄 Status refreshed: ${batchCall.status} → ${batchStatus.status}`);
       }
 
       // ── STEP 2: Process each recipient ────────────────────────────────────
@@ -469,30 +538,12 @@ export class BatchCallingService {
       const orgObjectId = new mongoose.Types.ObjectId(organizationId);
       const userId = batchCall.userId?.toString() || organizationId;
 
-      const hasMessages = (t: any): boolean =>
-        t != null && (
-          (Array.isArray(t) && t.length > 0) ||
-          (typeof t === 'string' && t.trim().length > 0) ||
-          (t.messages && Array.isArray(t.messages) && t.messages.length > 0) ||
-          (t.items && Array.isArray(t.items) && t.items.length > 0)
-        );
-
       let created = 0;
       let skipped = 0;
       let waiting = 0;
       let terminalWithoutConversation = 0;
       const automationTriggered: string[] = [];
-      const terminalRecipientStatuses = new Set([
-        'failed',
-        'busy',
-        'no_answer',
-        'no-answer',
-        'voicemail',
-        'cancelled',
-        'canceled'
-      ]);
-
-      console.log(`[Batch Calling Service] 📋 Processing ${recipients.length} recipients for batch ${jobId} (batch status: ${batchStatus.status})`);
+      const batchFullyDone = this.isBatchFullyDone(batchStatus);
 
       for (const recipient of recipients) {
         const phone = recipient.phone_number;
@@ -500,9 +551,6 @@ export class BatchCallingService {
         const elevenLabsConvId = recipient.conversation_id;
 
         try {
-          // 1. Automation already triggered for this phone? skip.
-          //    Re-fetch the latest persisted set to defend against a parallel
-          //    sync cycle that may have triggered the same phone milliseconds ago.
           if (!automationDone.has(phone)) {
             try {
               const latest = await BatchCall.findOne(
@@ -516,41 +564,23 @@ export class BatchCallingService {
           }
           if (automationDone.has(phone)) {
             skipped++;
-            console.log(`[Batch Calling Service] ⏭️ ${phone} – automation already triggered, skipping`);
             continue;
           }
 
-          // 2. Terminal non-success statuses never produce a conversation/transcript.
-          // Mark them resolved so polling can eventually stop.
-          const normalizedRecipientStatus = String(recipientStatus || '').toLowerCase().trim();
-          if (terminalRecipientStatuses.has(normalizedRecipientStatus)) {
+          const syncAction = this.resolveRecipientSyncAction(recipient, batchFullyDone);
+          if (syncAction === 'terminal_no_call') {
             terminalWithoutConversation++;
             skipped++;
-            console.log(`[Batch Calling Service] ⏭️ ${phone} – recipient terminal status "${recipientStatus}", no conversation expected`);
             continue;
           }
-
-          // 3. Recipient NOT completed yet? keep polling until terminal/completed.
-          if (recipientStatus !== 'completed') {
+          if (syncAction === 'wait') {
             waiting++;
-            console.log(`[Batch Calling Service] ⏳ ${phone} – recipient status: "${recipientStatus}", waiting for completed`);
             continue;
           }
 
-          // 4. Recipient completed but no conversation_id yet? keep waiting – it may arrive.
-          if (!elevenLabsConvId) {
-            waiting++;
-            console.log(`[Batch Calling Service] ⏳ ${phone} – completed but no conversation_id yet, will retry`);
-            continue;
-          }
-
-          // 5. Recipient completed + has conversation_id → fetch transcript
-          console.log(`[Batch Calling Service] 🔍 ${phone} – recipient completed, fetching transcript from conv: ${elevenLabsConvId}`);
-
-          const convDetail = await this.getConversationDetail(elevenLabsConvId);
+          const convDetail = await this.getConversationDetail(elevenLabsConvId!);
           if (!convDetail) {
             waiting++;
-            console.log(`[Batch Calling Service] ⏳ ${phone} – conversation ${elevenLabsConvId} not available yet, will retry`);
             continue;
           }
 
@@ -622,22 +652,21 @@ export class BatchCallingService {
             convDetail?.analysis?.recording_url,
             convDetail?.analysis?.audio_url
           );
-          const resolvedRecordingUrl = normalizeRecordingUrl(rawRecordingUrl, elevenLabsConvId);
+          const resolvedRecordingUrl = normalizeRecordingUrl(rawRecordingUrl, elevenLabsConvId!);
 
           const transcript = convDetail?.transcript;
-          const ready = hasMessages(transcript);
-          const duration = convDetail?.metadata?.call_duration_secs || convDetail?.call_duration_secs || 0;
+          const { ready, duration, transcriptItems } = this.conversationHasCallableContent(convDetail);
           const endReason = convDetail?.metadata?.termination_reason || (convDetail?.analysis?.call_successful ? 'completed' : '');
 
-          const transcriptItems = transcript?.items || transcript?.messages || (Array.isArray(transcript) ? transcript : []);
-
           if (!ready) {
+            if (batchFullyDone && !this.isCompletedLikeRecipientStatus(recipientStatus || '')) {
+              terminalWithoutConversation++;
+              skipped++;
+              continue;
+            }
             waiting++;
-            console.log(`[Batch Calling Service] ⏳ ${phone} – transcript not ready yet (conv: ${elevenLabsConvId}), will retry`);
             continue;
           }
-
-          console.log(`[Batch Calling Service] ✅ ${phone} – transcript ready (${transcriptItems.length} items, ${duration}s)`);
 
           // ── Recipient completed + transcript ready → process + trigger automation ──
           const vars = recipient.conversation_initiation_client_data?.dynamic_variables || {};
@@ -646,8 +675,6 @@ export class BatchCallingService {
           const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
           const name = fullName || vars.name || vars.customer_name || 'Unknown';
           const email = vars.email || vars.customer_email;
-
-          console.log(`[Batch Calling Service] ✅ ${phone} (${name}) – completed, transcript ready (${transcriptItems.length} items, ${duration}s)`);
 
           // Check if conversation already exists in our DB
           const existing = await Conversation.findOne({
@@ -697,7 +724,6 @@ export class BatchCallingService {
               }
               if (msgs.length > 0) {
                 await Message.insertMany(msgs);
-                console.log(`[Batch Calling Service] ✅ Saved ${msgs.length} messages for existing conversation ${conversationId}`);
               }
             }
             skipped++;
@@ -749,7 +775,6 @@ export class BatchCallingService {
 
             conversationId = conversation._id.toString();
 
-            console.log(`[Batch Calling Service] ✅ Conversation ${conversationId} created for ${name} (${phone})`);
             try { emitToOrganization(organizationId, 'conversation:new', { conversationId, channel: 'phone', source: 'batch', customerId: contactId, customerName: name }); } catch (_) {}
 
             // ── Save messages ────────────────────────────────────────────────
@@ -771,7 +796,6 @@ export class BatchCallingService {
               }
               if (msgs.length > 0) {
                 await Message.insertMany(msgs);
-                console.log(`[Batch Calling Service] ✅ Saved ${msgs.length} messages for ${conversationId}`);
               }
             }
 
@@ -808,9 +832,11 @@ export class BatchCallingService {
                 address: csvOrCallAddress
               }
             }, { userId, organizationId });
-            console.log(`[Batch Calling Service] 🚀 Automation triggered for ${phone} (${name})`);
+            console.log(
+              `[Batch Calling Service] Automation ran for ${phone} (${name}) — batch ${jobId}, conv ${elevenLabsConvId}`
+            );
           } catch (err: any) {
-            console.error(`[Batch Calling Service] ⚠️ Automation failed for ${phone}:`, err.message);
+            console.error(`[Batch Calling Service] Automation failed for ${phone}:`, err.message);
             continue; // don't mark processed – retry next tick
           }
 
@@ -823,16 +849,10 @@ export class BatchCallingService {
               { batch_call_id: jobId },
               { $addToSet: { automation_triggered_phones: phone } }
             );
-          } catch (persistErr: any) {
-            console.warn(
-              `[Batch Calling Service] ⚠️ Could not persist automation_triggered phone ${phone} immediately:`,
-              persistErr.message
-            );
-          }
-          console.log(`[Batch Calling Service] ✅ ${phone} fully processed (conversation + automation done)`);
+          } catch (_) { /* best-effort persist */ }
 
         } catch (err: any) {
-          console.error(`[Batch Calling Service] ❌ Failed to process ${phone}:`, err.message);
+          console.error(`[Batch Calling Service] Failed to process ${phone}:`, err.message);
         }
       }
 
@@ -842,27 +862,16 @@ export class BatchCallingService {
           { batch_call_id: jobId },
           { $addToSet: { automation_triggered_phones: { $each: automationTriggered } } }
         );
-        console.log(`[Batch Calling Service] 💾 Saved ${automationTriggered.length} phone(s) as automation-triggered: [${automationTriggered.join(', ')}]`);
       }
 
       // ── Mark batch fully done ──────────────────────────────────────────────
-      // ONLY mark done when:
-      //   1. Batch status is "completed" (all calls dispatched)
-      //   2. No recipients still waiting (everyone is either automation-done or skipped)
-      //   3. Total phones with automation triggered matches total recipients
-      const totalAutomationDone = automationDone.size + automationTriggered.length;
-      const totalResolvedRecipients = totalAutomationDone + terminalWithoutConversation;
-      const allDone = waiting === 0
-        && batchStatus.status === 'completed'
-        && totalResolvedRecipients >= recipients.length;
+      const totalResolvedRecipients = automationDone.size + terminalWithoutConversation;
+      const allDone = waiting === 0 && totalResolvedRecipients >= recipients.length;
       if (allDone) {
         await BatchCall.updateOne(
           { batch_call_id: jobId },
           { $set: { conversations_synced: true }, $unset: { syncErrorCount: '' } }
         );
-        console.log(`[Batch Calling Service] ✅ Batch ${jobId} ALL DONE – ${created} created, ${automationTriggered.length} automations triggered, ${terminalWithoutConversation} terminal-without-conversation, ${skipped} already done`);
-      } else {
-        console.log(`[Batch Calling Service] 📊 Batch ${jobId}: ${created} created, ${automationTriggered.length} automations triggered, ${terminalWithoutConversation} terminal-without-conversation, ${skipped} already done, ${waiting} still waiting – will check again`);
       }
 
       if (created > 0 || automationTriggered.length > 0) {
@@ -870,7 +879,7 @@ export class BatchCallingService {
       }
 
     } catch (error: any) {
-      console.error('[Batch Calling Service] ❌ Sync error:', error.message);
+      console.error('[Batch Calling Service] Sync error:', error.message);
       await BatchCall.updateOne({ batch_call_id: jobId }, { $inc: { syncErrorCount: 1 } });
       throw error;
     } finally {

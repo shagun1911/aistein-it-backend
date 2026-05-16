@@ -453,38 +453,74 @@ export class ElevenLabsWebhookController {
       return;
     }
 
-    console.log(`[ElevenLabs Webhook] 📞 Outbound call completed for ${phoneNumber} – will trigger batch sync in 5s`);
+    const conversationId: string | undefined = data?.conversation_id;
+    console.log(
+      `[ElevenLabs Webhook] 📞 Outbound call completed for ${phoneNumber}` +
+      (conversationId ? ` (conv: ${conversationId})` : '') +
+      ' – will trigger batch sync in 5s'
+    );
 
     const BatchCall = (await import('../models/BatchCall')).default;
+    const { batchCallingService } = await import('../services/batchCalling.service');
 
-    // Find the most recent active (not fully synced) batch
-    const activeBatch = await BatchCall.findOne({
+    const normalizePhone = (p: string) => String(p || '').replace(/\D/g, '');
+    const phoneNorm = normalizePhone(phoneNumber);
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    const activeBatches = await BatchCall.find({
       conversations_synced: { $ne: true },
-      status: { $in: ['pending', 'in_progress', 'completed'] }
-    }).sort({ createdAt: -1 }).lean() as any;
+      status: { $nin: ['cancelled', 'canceled', 'failed'] },
+      createdAt: { $gte: oneDayAgo }
+    })
+      .sort({ createdAt: -1 })
+      .limit(15)
+      .lean();
 
-    if (!activeBatch) {
+    if (activeBatches.length === 0) {
       console.log('[ElevenLabs Webhook] No active batch found – skipping');
       return;
     }
 
-    const orgId = activeBatch.organizationId?.toString() || activeBatch.userId?.toString();
-    if (!orgId) {
-      console.log('[ElevenLabs Webhook] No organizationId on batch – skipping');
-      return;
-    }
-
-    // Wait 5s for ElevenLabs to update the recipient status to "completed"
-    // and make the conversation transcript available via their API.
     await new Promise(resolve => setTimeout(resolve, 5000));
 
-    try {
-      const { batchCallingService } = await import('../services/batchCalling.service');
-      console.log(`[ElevenLabs Webhook] 🔄 Triggering sync for batch: ${activeBatch.batch_call_id}`);
-      await batchCallingService.syncBatchCallConversations(activeBatch.batch_call_id, orgId);
-      console.log(`[ElevenLabs Webhook] ✅ Sync complete for: ${activeBatch.batch_call_id}`);
-    } catch (err: any) {
-      console.error(`[ElevenLabs Webhook] ⚠️ Sync failed for ${activeBatch.batch_call_id}:`, err.message);
+    let synced = 0;
+    for (const batch of activeBatches) {
+      const batchId = (batch as any).batch_call_id;
+      const orgId =
+        (batch as any).organizationId?.toString() ||
+        (batch as any).userId?.toString();
+      if (!orgId || !batchId) continue;
+
+      try {
+        const status = await batchCallingService.getBatchJobStatus(batchId);
+        const recipients = status.recipients || [];
+        const matches = recipients.some((r: any) => {
+          if (conversationId && r.conversation_id === conversationId) return true;
+          return normalizePhone(r.phone_number) === phoneNorm;
+        });
+        if (!matches) continue;
+
+        console.log(`[ElevenLabs Webhook] 🔄 Triggering sync for batch: ${batchId}`);
+        await batchCallingService.syncBatchCallConversations(batchId, orgId);
+        synced++;
+      } catch (err: any) {
+        console.error(`[ElevenLabs Webhook] ⚠️ Sync failed for ${batchId}:`, err.message);
+      }
+    }
+
+    if (synced === 0) {
+      const fallback = activeBatches[0] as any;
+      const orgId = fallback.organizationId?.toString() || fallback.userId?.toString();
+      if (orgId && fallback.batch_call_id) {
+        console.log(`[ElevenLabs Webhook] 🔄 No phone match – syncing latest batch: ${fallback.batch_call_id}`);
+        try {
+          await batchCallingService.syncBatchCallConversations(fallback.batch_call_id, orgId);
+        } catch (err: any) {
+          console.error(`[ElevenLabs Webhook] ⚠️ Fallback sync failed:`, err.message);
+        }
+      }
+    } else {
+      console.log(`[ElevenLabs Webhook] ✅ Synced ${synced} batch(es) for ${phoneNumber}`);
     }
   }
 }

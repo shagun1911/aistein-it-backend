@@ -6,6 +6,9 @@ import mongoose from 'mongoose';
 // Python API base URL - should match the one used for agents endpoint
 const PYTHON_API_BASE_URL = process.env.PYTHON_API_URL || 'https://elvenlabs-voiceagent.onrender.com';
 
+/** Log POST_CALL_WEBHOOK_ID missing warning once per process (bulk sync touches many agents). */
+let postCallWebhookMissingWarned = false;
+
 /** Appended when sending prompt to Python so agent only collects what user instructed (no extra time/date/year, no "there is an issue"). */
 const COLLECT_ONLY_INSTRUCTION = `
 
@@ -510,7 +513,7 @@ export class AgentService {
       });
       if (!quiet) console.log(`[Agent Service] ✅ Enabled tool_node for agent ${agentId}`);
     } catch (error: any) {
-      console.warn(`[Agent Service] ⚠️ Could not enable tool_node for ${agentId}:`, error.message);
+      if (!quiet) console.warn(`[Agent Service] ⚠️ Could not enable tool_node for ${agentId}:`, error.message);
       // Non-fatal - tools may still work on some ElevenLabs versions
     }
   }
@@ -524,7 +527,10 @@ export class AgentService {
       const postCallWebhookId = process.env.POST_CALL_WEBHOOK_ID?.trim();
 
       if (!postCallWebhookId) {
-        console.warn(`[Agent Service] ⚠️ POST_CALL_WEBHOOK_ID not configured in environment`);
+        if (!quiet && !postCallWebhookMissingWarned) {
+          postCallWebhookMissingWarned = true;
+          console.warn(`[Agent Service] ⚠️ POST_CALL_WEBHOOK_ID not configured in environment`);
+        }
         return;
       }
 
@@ -549,7 +555,9 @@ export class AgentService {
 
       if (!quiet) console.log(`[Agent Service] ✅ Successfully attached POST_CALL_WEBHOOK_ID to agent ${agentId}`);
     } catch (error: any) {
-      console.error(`[Agent Service] ❌ Failed to attach webhook to agent ${agentId}:`, error.response?.data || error.message);
+      if (!quiet) {
+        console.error(`[Agent Service] ❌ Failed to attach webhook to agent ${agentId}:`, error.response?.data || error.message);
+      }
       // Non-fatal - webhook attachment failure shouldn't block agent operations
     }
   }
@@ -595,20 +603,23 @@ export class AgentService {
   /**
    * Sync agent tools to ElevenLabs runtime.
    * This ensures tool_ids are patched into the agent so they can be invoked.
-   * 
+   *
    * @param agent - Agent document or IAgent object with agent_id, tool_ids, and system_prompt
+   * @param options.quiet - Suppress per-agent console output (use for bulk startup resync)
    */
-  async syncAgentToolsToElevenLabs(agent: IAgent | any): Promise<void> {
+  async syncAgentToolsToElevenLabs(
+    agent: IAgent | any,
+    options?: { quiet?: boolean }
+  ): Promise<{ ok: boolean; error?: string }> {
+    const quiet = options?.quiet ?? false;
     try {
       const agentId = agent.agent_id;
       const toolIds = agent.tool_ids || [];
 
       if (!agentId) {
-        console.warn('[ElevenLabs Sync] Agent missing agent_id, skipping sync');
-        return;
+        if (!quiet) console.warn('[ElevenLabs Sync] Agent missing agent_id, skipping sync');
+        return { ok: false, error: 'missing agent_id' };
       }
-
-      console.log('[ElevenLabs Sync] Agent:', agentId, 'Tools:', toolIds);
 
       const pythonUrl = `${PYTHON_API_BASE_URL}/api/v1/agents/${agentId}/prompt`;
 
@@ -622,24 +633,31 @@ export class AgentService {
 
       // Enable tool_node if there are tools
       if (toolIds.length > 0) {
-        await this.enableToolNodeForAgent(agentId);
+        await this.enableToolNodeForAgent(agentId, quiet);
       }
 
       // Attach POST_CALL_WEBHOOK_ID to agent
-      await this.attachWebhookToAgent(agentId);
+      await this.attachWebhookToAgent(agentId, quiet);
 
       // CRITICAL: Update voice_id in conversation_config.tts
       if (agent.voice_id) {
         try {
-          await this.updateVoiceInConversationConfig(agentId, agent.voice_id, agent.language);
+          await this.updateVoiceInConversationConfig(agentId, agent.voice_id, agent.language, quiet);
         } catch (error: any) {
-          console.error('[ElevenLabs Sync] ⚠️ Failed to update voice_id (non-fatal):', error.message);
+          if (!quiet) {
+            console.error('[ElevenLabs Sync] ⚠️ Failed to update voice_id (non-fatal):', error.message);
+          }
         }
       }
 
+      return { ok: true };
     } catch (error: any) {
-      console.error(`[ElevenLabs Sync] ⚠️ Failed to sync agent ${agent.agent_id} to ElevenLabs:`, error.message);
+      const msg = error.message || 'sync failed';
+      if (!quiet) {
+        console.error(`[ElevenLabs Sync] ⚠️ Failed to sync agent ${agent.agent_id} to ElevenLabs:`, msg);
+      }
       // Don't throw - this is a background sync, shouldn't block operations
+      return { ok: false, error: msg };
     }
   }
 

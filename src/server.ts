@@ -465,18 +465,21 @@ const startServer = async () => {
       
       if (agentsWithTools.length > 0) {
         logger.info(`[ElevenLabs Sync] Resyncing ${agentsWithTools.length} agents with tools on startup...`);
-        
-        // Sync all agents in parallel (but with error handling per agent)
-        const syncPromises = agentsWithTools.map(async (agent: any) => {
-          try {
-            await agentService.syncAgentToolsToElevenLabs(agent);
-          } catch (error: any) {
-            logger.warn(`[ElevenLabs Sync] Failed to sync agent ${agent.agent_id} on startup:`, error.message);
-          }
-        });
-        
-        await Promise.allSettled(syncPromises);
-        logger.info(`[ElevenLabs Sync] ✅ Startup resync completed for ${agentsWithTools.length} agents`);
+
+        const results = await Promise.all(
+          agentsWithTools.map((agent: any) =>
+            agentService.syncAgentToolsToElevenLabs(agent, { quiet: true })
+          )
+        );
+        const succeeded = results.filter((r) => r.ok).length;
+        const failed = results.length - succeeded;
+        if (failed > 0) {
+          logger.info(
+            `[ElevenLabs Sync] Startup resync done: ${succeeded} succeeded, ${failed} failed (stale or removed agents are normal)`
+          );
+        } else {
+          logger.info(`[ElevenLabs Sync] ✅ Startup resync completed for ${succeeded} agents`);
+        }
       } else {
         logger.info('[ElevenLabs Sync] No agents with tools found, skipping startup resync');
       }
@@ -539,21 +542,6 @@ const startServer = async () => {
         console.log(`   Custom WhatsApp Webhook URL: http://localhost:${PORT_NUMBER}/api/v1/webhooks/whatsapp`);
       }
 
-      // Resync agents with tools in background (do not block startup)
-      setTimeout(async () => {
-        try {
-          const { agentService } = await import('./services/agent.service');
-          const Agent = (await import('./models/Agent')).default;
-          const allAgents = await Agent.find({ tool_ids: { $exists: true } }).lean();
-          const agentsWithTools = allAgents.filter((a: any) => a.tool_ids?.length > 0);
-          if (agentsWithTools.length === 0) return;
-          logger.info(`[ElevenLabs Sync] Resyncing ${agentsWithTools.length} agents in background...`);
-          await Promise.allSettled(agentsWithTools.map((agent: any) => agentService.syncAgentToolsToElevenLabs(agent)));
-          logger.info(`[ElevenLabs Sync] ✅ Startup resync completed for ${agentsWithTools.length} agents`);
-        } catch (err: any) {
-          logger.warn('[ElevenLabs Sync] Startup resync failed:', err.message);
-        }
-      }, 2000);
     });
 
     // ============================================================================

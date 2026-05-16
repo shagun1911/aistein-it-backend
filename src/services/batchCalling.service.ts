@@ -674,6 +674,43 @@ export class BatchCallingService {
           const endReason = convDetail?.metadata?.termination_reason || (convDetail?.analysis?.call_successful ? 'completed' : '');
 
           const statusSaysDone = this.isCompletedLikeRecipientStatus(recipientStatus || '');
+
+          // Transcript content guard — must come BEFORE the ready/statusSaysDone gate.
+          //
+          // ElevenLabs marks a call "completed" in the batch recipients list before
+          // the transcript is written. If we let execution proceed immediately with
+          // an empty conversation (no transcript items, zero duration), the
+          // appointment extraction always returns "no appointment booked", the phone
+          // is permanently added to automation_triggered_phones, and it is never
+          // retried — so only the recipient(s) whose transcript happened to be ready
+          // on the first sync ever have their appointment booking automation run.
+          //
+          // Fix: if both transcript items and duration are zero, keep the recipient
+          // in the waiting bucket and retry on the next poll cycle. After 3 retries
+          // (≈90 s) we accept that the call genuinely produced no transcript.
+          const transcriptMissing = transcriptItems.length === 0 && Number(duration) === 0;
+          if (transcriptMissing) {
+            if (!batchFullyDone) {
+              waiting++;
+              continue;
+            }
+            // Batch is fully done but transcript still empty: retry up to 3
+            // poll cycles before giving up.
+            const retryKey = `transcript_pending_${this.normalizePhoneKey(phone)}`;
+            const retryCount: number = (batchCall as any)[retryKey] || 0;
+            if (retryCount < 3) {
+              try {
+                await BatchCall.updateOne(
+                  { batch_call_id: jobId },
+                  { $set: { [retryKey]: retryCount + 1 } }
+                );
+              } catch (_) { /* best-effort */ }
+              waiting++;
+              continue;
+            }
+            // After 3 retries fall through: accept a genuinely empty call.
+          }
+
           if (!ready && !statusSaysDone) {
             if (batchFullyDone) {
               terminalWithoutConversation++;

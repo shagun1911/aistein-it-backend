@@ -437,33 +437,47 @@ export class ElevenLabsWebhookController {
   }
 
   /**
-   * When ElevenLabs sends a post_call_transcription webhook for an OUTBOUND (batch) call,
-   * trigger an immediate sync so we don't wait for the next 30s poll.
-   * The sync function handles everything: fetching batch status, checking per-recipient
-   * status, fetching transcripts, creating conversations, and triggering automations.
-   * We just need to wait a few seconds for ElevenLabs to update the recipient status
-   * to "completed" before we query it.
+   * When ElevenLabs fires post_call_transcription for an outbound (batch) call the full
+   * transcript array is already in the webhook payload. We use it directly to:
+   *   1. Find the matching batch (by conv_id or phone).
+   *   2. Create/update the Conversation + Messages in Mongo.
+   *   3. Trigger automation immediately — no polling delay, no extra API call needed.
+   *
+   * The 30-second poll / BatchCallMonitor still run as a safety net. Because the phone
+   * number is added to automation_triggered_phones before returning, those jobs simply
+   * skip it on their next tick.
+   *
+   * Falls back to the old full-sync approach only when the webhook transcript is empty
+   * (e.g. zero-second hangup) or no matching batch can be identified.
    */
   private async processBatchCallWebhook(webhookBody: any) {
     const data = webhookBody?.data;
     const phoneNumber: string | undefined = data?.metadata?.phone_call?.external_number || data?.user_id;
+    const elevenLabsConvId: string | undefined = data?.conversation_id;
 
     if (!phoneNumber) {
       console.log('[ElevenLabs Webhook] Outbound webhook missing phoneNumber – skipping');
       return;
     }
 
-    const conversationId: string | undefined = data?.conversation_id;
+    // The post_call_transcription payload already contains the transcript.
+    const webhookTranscript: any[] = Array.isArray(data?.transcript) ? data.transcript : [];
+    const duration: number = data?.metadata?.call_duration_secs || 0;
+    const hasContent = webhookTranscript.length > 0 || duration > 0;
+
     console.log(
-      `[ElevenLabs Webhook] 📞 Outbound call completed for ${phoneNumber}` +
-      (conversationId ? ` (conv: ${conversationId})` : '') +
-      ' – will trigger batch sync in 5s'
+      `[ElevenLabs Webhook] 📞 Outbound call for ${phoneNumber}` +
+      (elevenLabsConvId ? ` (conv: ${elevenLabsConvId})` : '') +
+      ` – transcript turns: ${webhookTranscript.length}, duration: ${duration}s`
     );
 
     const BatchCall = (await import('../models/BatchCall')).default;
     const { batchCallingService } = await import('../services/batchCalling.service');
 
-    const normalizePhone = (p: string) => String(p || '').replace(/\D/g, '');
+    const normalizePhone = (p: string) => {
+      const digits = String(p || '').replace(/\D/g, '');
+      return digits.length >= 10 ? digits.slice(-10) : digits;
+    };
     const phoneNorm = normalizePhone(phoneNumber);
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
@@ -481,6 +495,55 @@ export class ElevenLabsWebhookController {
       return;
     }
 
+    // ── FAST PATH: transcript in webhook → process per-call directly ──────────
+    if (hasContent) {
+      for (const batch of activeBatches) {
+        const batchId = (batch as any).batch_call_id;
+        const orgId =
+          (batch as any).organizationId?.toString() ||
+          (batch as any).userId?.toString();
+        if (!orgId || !batchId) continue;
+
+        try {
+          const status = await batchCallingService.getBatchJobStatus(batchId);
+          const recipients = status.recipients || [];
+          const recipient = recipients.find((r: any) => {
+            if (elevenLabsConvId && r.conversation_id === elevenLabsConvId) return true;
+            return normalizePhone(r.phone_number) === phoneNorm;
+          });
+          if (!recipient) continue;
+
+          const dynamicVars =
+            recipient.conversation_initiation_client_data?.dynamic_variables || {};
+
+          const processed = await this.processOutboundRecipientFromWebhook({
+            batch,
+            organizationId: orgId,
+            phoneNumber,
+            elevenLabsConvId: elevenLabsConvId || recipient.conversation_id || '',
+            webhookTranscript,
+            duration,
+            dynamicVars,
+            webhookData: data
+          });
+
+          if (processed) {
+            console.log(
+              `[ElevenLabs Webhook] ✅ Per-call automation done for ${phoneNumber} (batch: ${batchId})`
+            );
+            return;
+          }
+        } catch (err: any) {
+          console.error(
+            `[ElevenLabs Webhook] ⚠️ Per-call processing failed for batch ${(batch as any).batch_call_id}:`,
+            err.message
+          );
+        }
+      }
+    }
+
+    // ── FALLBACK: no content or no batch matched → full batch sync ─────────────
+    // Give ElevenLabs 5s to update recipient status before we query it.
     await new Promise(resolve => setTimeout(resolve, 5000));
 
     let synced = 0;
@@ -495,12 +558,12 @@ export class ElevenLabsWebhookController {
         const status = await batchCallingService.getBatchJobStatus(batchId);
         const recipients = status.recipients || [];
         const matches = recipients.some((r: any) => {
-          if (conversationId && r.conversation_id === conversationId) return true;
+          if (elevenLabsConvId && r.conversation_id === elevenLabsConvId) return true;
           return normalizePhone(r.phone_number) === phoneNorm;
         });
         if (!matches) continue;
 
-        console.log(`[ElevenLabs Webhook] 🔄 Triggering sync for batch: ${batchId}`);
+        console.log(`[ElevenLabs Webhook] 🔄 Fallback sync for batch: ${batchId}`);
         await batchCallingService.syncBatchCallConversations(batchId, orgId);
         synced++;
       } catch (err: any) {
@@ -519,9 +582,298 @@ export class ElevenLabsWebhookController {
           console.error(`[ElevenLabs Webhook] ⚠️ Fallback sync failed:`, err.message);
         }
       }
-    } else {
-      console.log(`[ElevenLabs Webhook] ✅ Synced ${synced} batch(es) for ${phoneNumber}`);
     }
+  }
+
+  /**
+   * Process a single outbound recipient using the transcript that arrived in the
+   * post_call_transcription webhook body. This avoids polling and eliminates the
+   * "empty transcript at trigger time" bug for the primary path.
+   *
+   * Returns true if automation was successfully triggered (phone marked done).
+   * Returns false on any error so the caller can fall back to full sync.
+   */
+  private async processOutboundRecipientFromWebhook(params: {
+    batch: any;
+    organizationId: string;
+    phoneNumber: string;
+    elevenLabsConvId: string;
+    webhookTranscript: any[];
+    duration: number;
+    dynamicVars: Record<string, any>;
+    webhookData: any;
+  }): Promise<boolean> {
+    const {
+      batch,
+      organizationId,
+      phoneNumber,
+      elevenLabsConvId,
+      webhookTranscript,
+      duration,
+      dynamicVars,
+      webhookData
+    } = params;
+
+    const batchId = batch.batch_call_id;
+
+    try {
+      const BatchCall = (await import('../models/BatchCall')).default;
+      const Conversation = (await import('../models/Conversation')).default;
+      const Customer = (await import('../models/Customer')).default;
+      const Message = (await import('../models/Message')).default;
+      const mongoose = (await import('mongoose')).default;
+      const { automationService } = await import('../services/automation.service');
+
+      const orgObjectId = new mongoose.Types.ObjectId(organizationId);
+      const userId = batch.userId?.toString() || organizationId;
+
+      const normalizePhoneKey = (p: string) => {
+        const digits = String(p || '').replace(/\D/g, '');
+        return digits.length >= 10 ? digits.slice(-10) : digits;
+      };
+      const phoneKey = normalizePhoneKey(phoneNumber);
+
+      // ── Dedup: skip if automation already triggered for this phone ────────────
+      const batchDoc = await BatchCall.findOne(
+        { batch_call_id: batchId },
+        { automation_triggered_phones: 1 }
+      ).lean() as any;
+
+      const alreadyDone = (batchDoc?.automation_triggered_phones || []).some(
+        (p: string) => normalizePhoneKey(p) === phoneKey
+      );
+      if (alreadyDone) {
+        console.log(
+          `[ElevenLabs Webhook] ⏭️ Automation already done for ${phoneNumber} in batch ${batchId}`
+        );
+        return true;
+      }
+
+      // ── Contact info from dynamic variables (CSV columns) ─────────────────────
+      const firstName =
+        dynamicVars.first_name || dynamicVars.customer_first_name || '';
+      const lastName =
+        dynamicVars.last_name || dynamicVars.customer_last_name || '';
+      const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
+      const name =
+        fullName || dynamicVars.name || dynamicVars.customer_name || `Caller ${phoneNumber}`;
+      const email = dynamicVars.email || dynamicVars.customer_email;
+      const csvAddress =
+        dynamicVars.address ||
+        dynamicVars.full_address ||
+        dynamicVars.customer_address ||
+        dynamicVars.home_address ||
+        '';
+
+      // ── Find or create Customer ───────────────────────────────────────────────
+      let customer = await Customer.findOne({ phone: phoneNumber, organizationId: orgObjectId });
+      if (!customer) {
+        customer = await Customer.create({
+          name,
+          phone: phoneNumber,
+          email,
+          organizationId: orgObjectId,
+          source: 'phone',
+          color: `#${Math.floor(Math.random() * 16777215).toString(16)}`
+        });
+      } else {
+        let updated = false;
+        if (name !== 'Unknown' && customer.name !== name) { customer.name = name; updated = true; }
+        if (email && customer.email !== email) { customer.email = email; updated = true; }
+        if (updated) await customer.save();
+      }
+
+      const contactId = customer._id.toString();
+
+      // ── Recording URL (proxied through our backend for inline playback) ───────
+      const backendPublicBase = (
+        process.env.BACKEND_URL ||
+        process.env.PUBLIC_API_URL ||
+        `http://localhost:${process.env.PORT || 5001}`
+      ).replace(/\/+$/, '');
+      const recordingUrl = elevenLabsConvId
+        ? `${backendPublicBase}/api/v1/conversations/recording/${elevenLabsConvId}`
+        : '';
+
+      const endReason = webhookData?.metadata?.termination_reason || '';
+      const startTimeUnix: number = webhookData?.metadata?.start_time_unix_secs || 0;
+
+      // ── Find or create Conversation ───────────────────────────────────────────
+      let existing: any = null;
+      if (elevenLabsConvId) {
+        existing = await Conversation.findOne({
+          organizationId: orgObjectId,
+          channel: 'phone',
+          'metadata.batch_call_id': batchId,
+          'metadata.conversation_id': elevenLabsConvId
+        });
+      }
+      if (!existing) {
+        const batchConvs = await Conversation.find({
+          organizationId: orgObjectId,
+          channel: 'phone',
+          'metadata.batch_call_id': batchId
+        }).lean();
+        existing =
+          batchConvs.find(
+            (c: any) => normalizePhoneKey(c?.metadata?.phone_number) === phoneKey
+          ) || null;
+      }
+
+      let conversationMongoId: string;
+
+      if (existing) {
+        conversationMongoId = existing._id.toString();
+        await Conversation.updateOne(
+          { _id: existing._id },
+          {
+            $set: {
+              transcript: webhookTranscript,
+              'metadata.duration_seconds': duration,
+              'metadata.call_duration_secs': duration,
+              'metadata.end_reason': endReason,
+              'metadata.conversation_id': elevenLabsConvId,
+              'metadata.recording_url': recordingUrl,
+              'metadata.audio_url': recordingUrl
+            }
+          }
+        );
+
+        // Upsert messages only if none exist yet
+        const existingMsgCount = await Message.countDocuments({
+          conversationId: existing._id,
+          type: 'message'
+        });
+        if (existingMsgCount === 0 && webhookTranscript.length > 0) {
+          await Message.insertMany(
+            this.buildMessagesFromTranscript(existing._id, webhookTranscript, startTimeUnix, batchId)
+          );
+        }
+      } else {
+        const conversation = await Conversation.create({
+          organizationId: orgObjectId,
+          customerId: customer._id,
+          channel: 'phone',
+          status: 'closed',
+          transcript: webhookTranscript,
+          isAiManaging: true,
+          unread: false,
+          metadata: {
+            batch_call_id: batchId,
+            conversation_id: elevenLabsConvId,
+            phone_number: phoneNumber,
+            callerId: elevenLabsConvId,
+            duration_seconds: duration,
+            call_duration_secs: duration,
+            call_successful: true,
+            end_reason: endReason,
+            recording_url: recordingUrl,
+            audio_url: recordingUrl,
+            callInitiated: startTimeUnix
+              ? new Date(startTimeUnix * 1000)
+              : new Date(duration ? Date.now() - duration * 1000 : Date.now()),
+            callCompletedAt: new Date(),
+            source: 'batch'
+          }
+        });
+
+        conversationMongoId = conversation._id.toString();
+
+        if (webhookTranscript.length > 0) {
+          await Message.insertMany(
+            this.buildMessagesFromTranscript(conversation._id, webhookTranscript, startTimeUnix, batchId)
+          );
+        }
+      }
+
+      // ── Trigger automation ────────────────────────────────────────────────────
+      const triggerResults = await automationService.triggerByEvent(
+        'batch_call_completed',
+        {
+          event: 'batch_call_completed',
+          batch_id: batchId,
+          conversation_id: conversationMongoId,
+          contactId,
+          organizationId,
+          source: 'batch_call',
+          recording_url: recordingUrl,
+          audio_url: recordingUrl,
+          dynamic_variables: dynamicVars,
+          selected_dynamic_variable_keys: batch.selected_dynamic_variable_keys || [],
+          freshContactData: {
+            name,
+            first_name: firstName,
+            last_name: lastName,
+            email,
+            phone: phoneNumber,
+            address: csvAddress
+          }
+        },
+        { userId, organizationId }
+      );
+
+      const workflowNames =
+        (triggerResults || []).map((r: any) => r?.name).filter(Boolean).join(', ') || 'none';
+      console.log(
+        `[ElevenLabs Webhook] ✅ AUTOMATION TRIGGERED | contact: ${name} | phone: ${phoneNumber} | batch: ${batchId} | conv: ${elevenLabsConvId} | workflow(s): ${workflowNames}`
+      );
+
+      // ── Mark phone done so sync/poll skip it ──────────────────────────────────
+      await BatchCall.updateOne(
+        { batch_call_id: batchId },
+        { $addToSet: { automation_triggered_phones: phoneNumber } }
+      );
+
+      return true;
+    } catch (err: any) {
+      console.error(
+        `[ElevenLabs Webhook] ❌ processOutboundRecipientFromWebhook failed | phone: ${phoneNumber} | batch: ${batchId}:`,
+        err.message
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Build Message documents from a post_call_transcription transcript array.
+   * Transcript items have the shape: { role, message, time_in_call_secs, interrupted, … }
+   */
+  private buildMessagesFromTranscript(
+    conversationId: any,
+    transcript: any[],
+    startTimeUnix: number,
+    batchId: string
+  ): any[] {
+    const msgs: any[] = [];
+    for (let i = 0; i < transcript.length; i++) {
+      const item = transcript[i];
+      const text = (item.message || item.content || item.text || '').trim();
+      if (!text) continue;
+      const role = item.role || '';
+      const sender = role === 'agent' || role === 'assistant' ? 'ai' : 'customer';
+      const timestamp =
+        startTimeUnix && item.time_in_call_secs != null
+          ? new Date((startTimeUnix + item.time_in_call_secs) * 1000)
+          : new Date();
+      msgs.push({
+        conversationId,
+        sender,
+        text,
+        type: 'message',
+        attachments: [],
+        sourcesUsed: [],
+        topics: [],
+        timestamp,
+        metadata: {
+          fromBatchCall: true,
+          from_transcript: true,
+          time_in_call_secs: item.time_in_call_secs,
+          interrupted: item.interrupted,
+          transcriptItemId: `${batchId}_${i}`
+        }
+      });
+    }
+    return msgs;
   }
 }
 

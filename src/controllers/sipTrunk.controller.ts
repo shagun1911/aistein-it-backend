@@ -298,59 +298,15 @@ export class SipTrunkController {
         omit_sender_email
       } = req.body;
 
-      // Get sender email from request, or automatically fetch from connected Gmail
-      let sender_email: string | undefined = requestSenderEmail;
+      // sender_email is only forwarded when explicitly provided in the request body.
+      // Outbound test calls should pass omit_sender_email: true (or omit sender_email entirely).
+      const sender_email =
+        omit_sender_email || !requestSenderEmail
+          ? undefined
+          : String(requestSenderEmail).trim() || undefined;
 
       if (omit_sender_email) {
-        sender_email = undefined;
-        console.log('[SIP Trunk Controller] omit_sender_email=true — skipping sender_email and Gmail auto-fetch');
-      } else if (!sender_email) {
-        console.log('[SIP Trunk Controller] No sender_email provided, fetching from connected Gmail...');
-        const organizationId = req.user?.organizationId || req.user?._id;
-        
-        if (organizationId) {
-          try {
-            // Try GoogleIntegration first (for Gmail OAuth)
-            const GoogleIntegration = (await import('../models/GoogleIntegration')).default;
-            const googleIntegration = await GoogleIntegration.findOne({
-              organizationId: organizationId instanceof mongoose.Types.ObjectId 
-                ? organizationId 
-                : new mongoose.Types.ObjectId(organizationId.toString()),
-              'services.gmail': true,
-              status: 'active'
-            }).lean();
-
-            if (googleIntegration?.googleProfile?.email) {
-              sender_email = googleIntegration.googleProfile.email;
-              console.log('[SIP Trunk Controller] ✅ Found Gmail email from GoogleIntegration:', sender_email);
-            } else {
-              // Fallback: Try SocialIntegration (for Gmail via Dialog360 or other)
-              const SocialIntegration = (await import('../models/SocialIntegration')).default;
-              const socialIntegration = await SocialIntegration.findOne({
-                organizationId: organizationId instanceof mongoose.Types.ObjectId 
-                  ? organizationId 
-                  : new mongoose.Types.ObjectId(organizationId.toString()),
-                platform: 'gmail',
-                status: 'connected'
-              }).lean();
-
-              if (socialIntegration) {
-                // Check credentials.email or metadata.email
-                sender_email = socialIntegration.credentials?.email || socialIntegration.metadata?.email;
-                if (sender_email) {
-                  console.log('[SIP Trunk Controller] ✅ Found Gmail email from SocialIntegration:', sender_email);
-                }
-              }
-            }
-
-            if (!sender_email) {
-              console.warn('[SIP Trunk Controller] ⚠️ No Gmail email found in connected integrations');
-            }
-          } catch (emailError: any) {
-            console.warn('[SIP Trunk Controller] ⚠️ Error fetching Gmail email:', emailError.message);
-            // Continue without sender_email - it's optional
-          }
-        }
+        console.log('[SIP Trunk Controller] omit_sender_email=true — sender_email excluded from outbound payload');
       }
 
       console.log('[SIP Trunk Controller] ===== OUTBOUND CALL REQUEST =====');

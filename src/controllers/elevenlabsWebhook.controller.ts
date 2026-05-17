@@ -436,6 +436,46 @@ export class ElevenLabsWebhookController {
     }
   }
 
+  /** Grep for this marker in logs: BATCH_CALL_POST_CALL_TRANSCRIPTION_WEBHOOK */
+  private static readonly BATCH_POST_CALL_LOG_MARKER = 'BATCH_CALL_POST_CALL_TRANSCRIPTION_WEBHOOK';
+
+  /**
+   * Log the complete post_call_transcription payload for an outbound (batch) call.
+   * Uses a fixed marker so the entry is easy to find in console and log files.
+   */
+  private logBatchPostCallTranscriptionWebhook(webhookBody: unknown): void {
+    const marker = ElevenLabsWebhookController.BATCH_POST_CALL_LOG_MARKER;
+    const body = webhookBody as Record<string, any> | null | undefined;
+    const data = body?.data;
+
+    const summary = {
+      marker,
+      type: body?.type,
+      event_timestamp: body?.event_timestamp,
+      conversation_id: data?.conversation_id,
+      status: data?.status,
+      batch_call_id: data?.metadata?.batch_call?.batch_call_id,
+      phone: data?.metadata?.phone_call?.external_number || data?.user_id,
+      direction: data?.metadata?.phone_call?.direction,
+      transcript_turns: Array.isArray(data?.transcript) ? data.transcript.length : 0,
+      call_duration_secs: data?.metadata?.call_duration_secs,
+    };
+
+    const fullPayloadJson = JSON.stringify(body ?? webhookBody, null, 2);
+    const separator = '='.repeat(80);
+
+    console.log(`\n${separator}`);
+    console.log(`[${marker}] post_call_transcription webhook — outbound batch call ended`);
+    console.log(`[${marker}] summary:`, JSON.stringify(summary, null, 2));
+    console.log(`[${marker}] full payload:\n${fullPayloadJson}`);
+    console.log(`${separator}\n`);
+
+    logger.info(`[${marker}] post_call_transcription webhook (outbound batch)`, {
+      ...summary,
+      full_payload: body ?? webhookBody,
+    });
+  }
+
   /**
    * When ElevenLabs fires post_call_transcription for an outbound (batch) call the full
    * transcript array is already in the webhook payload. We use it directly to:
@@ -454,6 +494,8 @@ export class ElevenLabsWebhookController {
    *   - direct batch DB lookup finds nothing
    */
   private async processBatchCallWebhook(webhookBody: any) {
+    this.logBatchPostCallTranscriptionWebhook(webhookBody);
+
     const data = webhookBody?.data;
     const phoneNumber: string | undefined = data?.metadata?.phone_call?.external_number || data?.user_id;
     const elevenLabsConvId: string | undefined = data?.conversation_id;

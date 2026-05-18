@@ -91,7 +91,9 @@ const setupQueueProcessors = () => {
   // POLL JOB PROCESSOR (Lightweight, High Concurrency)
   // ============================================================
   // Polls Python API for batch status and re-enqueues itself until completed
-  batchCallSyncQueue.process('poll', 50, async (job: Bull.Job) => {
+  // Concurrency 1: one poll job runs at a time to avoid hammering the Python service
+  // with N_recipients × concurrent_jobs requests per second.
+  batchCallSyncQueue.process('poll', 1, async (job: Bull.Job) => {
     const { batch_call_id, organizationId, pollCount = 0 } = job.data;
 
     try {
@@ -200,6 +202,23 @@ export const enqueueBatchPoll = async (batch_call_id: string, organizationId: st
   }
 
   try {
+    // Dedup: skip if there is already a waiting/delayed/active poll job for this batch.
+    // Without this, multiple code paths (controller, queue, automationEngine) each call
+    // enqueueBatchPoll for the same batch, creating N independent self-re-enqueuing chains
+    // that hammer the Python conversation API every ~300ms instead of every 30s.
+    const [waiting, delayed, active] = await Promise.all([
+      batchCallSyncQueue.getWaiting(),
+      batchCallSyncQueue.getDelayed(),
+      batchCallSyncQueue.getActive(),
+    ]);
+    const alreadyQueued = [...waiting, ...delayed, ...active].some(
+      (j) => j.name === 'poll' && j.data?.batch_call_id === batch_call_id
+    );
+    if (alreadyQueued) {
+      console.log(`[Batch Call Sync Queue] ⏭️ Poll already queued for batch ${batch_call_id} – skipping duplicate`);
+      return true;
+    }
+
     await batchCallSyncQueue.add('poll', {
       batch_call_id, organizationId, pollCount: 0
     }, { delay: 30000, attempts: 3, backoff: { type: 'fixed', delay: 10000 } });

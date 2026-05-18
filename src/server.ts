@@ -488,14 +488,26 @@ const startServer = async () => {
       // Don't block server startup if sync fails
     }
     
-    // Start batch call monitor for automatic conversation sync
-    try {
-      const { batchCallMonitor } = await import('./services/batchCallMonitor.service');
-      batchCallMonitor.start();
-      logger.info('✅ Batch call monitor started');
-    } catch (error: any) {
-      logger.warn('⚠️  Could not start batch call monitor:', error.message);
-    }
+    // Start batch call monitor ONLY when the Bull queue is unavailable (Redis down).
+    // When Bull is running it handles polling with proper 30s delays; starting the
+    // monitor on top doubles every sync cycle and hammers the Python conversation API.
+    //
+    // The Bull queue itself is created inside a 3s setTimeout, so we defer this
+    // check by 5s to let the queue initialise before deciding.
+    setTimeout(async () => {
+      try {
+        const { isBatchCallSyncQueueAvailable } = await import('./queues/batchCallSync.queue');
+        const { batchCallMonitor } = await import('./services/batchCallMonitor.service');
+        if (isBatchCallSyncQueueAvailable()) {
+          logger.info('✅ Batch call monitor skipped – Bull queue is active (no duplicate polling)');
+        } else {
+          batchCallMonitor.start();
+          logger.info('✅ Batch call monitor started (Bull queue unavailable – using monitor as fallback)');
+        }
+      } catch (error: any) {
+        logger.warn('⚠️  Could not start batch call monitor:', error.message);
+      }
+    }, 5000);
     
     // Start server with Socket.io
     httpServer.listen(PORT_NUMBER, () => {

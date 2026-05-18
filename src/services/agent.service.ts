@@ -759,7 +759,7 @@ export class AgentService {
         pythonUrl,
         requestBody,
         {
-          timeout: 30000, // 30 seconds timeout
+          timeout: 300000, // 30 seconds timeout
           headers: {
             'Content-Type': 'application/json'
           }

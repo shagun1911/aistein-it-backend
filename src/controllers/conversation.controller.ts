@@ -5,16 +5,6 @@ import { successResponse, paginatedResponse } from '../utils/response.util';
 import { gcsService } from '../services/gcs.service';
 import { AppError } from '../middleware/error.middleware';
 
-/**
- * Per-org throttle for the background batch-call sync that runs after each
- * conversations-list request. Without this, a user clicking through pages or
- * filters would re-fire the BatchCall lookup + ElevenLabs round-trip every
- * second. 60s is plenty — completed batches rarely change between calls and
- * the WebSocket already pushes real-time updates when they do.
- */
-const lastBatchSyncAt = new Map<string, number>();
-const BATCH_SYNC_THROTTLE_MS = 60_000;
-
 export class ConversationController {
   private conversationService: ConversationService;
 
@@ -32,74 +22,6 @@ export class ConversationController {
       if (!organizationId) {
         throw new AppError(401, 'UNAUTHORIZED', 'Organization ID or User ID not found');
       }
-
-      // Trigger batch-call sync completely in the background — do not await anything
-      // before serving the response. The DB query and sync work happen after the response
-      // has already been sent, so they never add latency to the list page load.
-      // Throttled to once per org per BATCH_SYNC_THROTTLE_MS so list pagination /
-      // filter clicks don't repeatedly hit ElevenLabs.
-      const orgKeyForThrottle = organizationId.toString();
-      const lastRun = lastBatchSyncAt.get(orgKeyForThrottle) || 0;
-      const shouldRunBatchSync = Date.now() - lastRun > BATCH_SYNC_THROTTLE_MS;
-      if (shouldRunBatchSync) {
-        lastBatchSyncAt.set(orgKeyForThrottle, Date.now());
-      }
-
-      if (shouldRunBatchSync) setImmediate(() => {
-        void (async () => {
-          try {
-            const BatchCall = (await import('../models/BatchCall')).default;
-            const { batchCallingService } = await import('../services/batchCalling.service');
-            const mongoose = (await import('mongoose')).default;
-            const userId = req.user?._id;
-
-            const orgObjectId = organizationId instanceof mongoose.Types.ObjectId
-              ? organizationId
-              : new mongoose.Types.ObjectId(organizationId.toString());
-            const userObjectId = userId instanceof mongoose.Types.ObjectId
-              ? userId
-              : new mongoose.Types.ObjectId(userId.toString());
-
-            const pendingBatches = await BatchCall.find({
-              $and: [
-                { $or: [{ userId: userObjectId }, { organizationId: orgObjectId }] },
-                { conversations_synced: { $ne: true } },
-                { status: { $nin: ['cancelled', 'canceled'] } },
-                { $or: [{ syncErrorCount: { $exists: false } }, { syncErrorCount: { $lt: 5 } }] }
-              ]
-            }).lean() as any[];
-
-            if (pendingBatches.length === 0) return;
-
-            console.log(`[Conversation Controller] 🔄 Background: syncing ${pendingBatches.length} batch call(s)`);
-
-            await Promise.allSettled(pendingBatches.map(async (batch) => {
-              try {
-                const status = await batchCallingService.getBatchJobStatus(batch.batch_call_id);
-                await BatchCall.updateOne(
-                  { batch_call_id: batch.batch_call_id },
-                  {
-                    $set: {
-                      status: status.status,
-                      total_calls_dispatched: status.total_calls_dispatched ?? batch.total_calls_dispatched,
-                      total_calls_scheduled: status.total_calls_scheduled ?? batch.total_calls_scheduled,
-                      total_calls_finished: status.total_calls_finished ?? batch.total_calls_finished,
-                      last_updated_at_unix: status.last_updated_at_unix || Math.floor(Date.now() / 1000)
-                    }
-                  }
-                );
-                if (status.status === 'completed') {
-                  await batchCallingService.syncBatchCallConversations(batch.batch_call_id, organizationId.toString());
-                }
-              } catch (err: any) {
-                console.error(`[Conversation Controller] ❌ Batch sync error (${batch.batch_call_id}):`, err.message);
-              }
-            }));
-          } catch (err: any) {
-            console.error('[Conversation Controller] ⚠️ Background batch sync error:', err.message);
-          }
-        })();
-      });
 
       const orgFilters: any = {
         ...filters,

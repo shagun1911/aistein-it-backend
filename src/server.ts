@@ -178,14 +178,6 @@ app.get('/api/v1/warmup', (req, res) => {
 
 app.get('/api/v1/health', async (req, res) => {
   try {
-    // Get batch call monitor status
-    const { batchCallMonitor } = await import('./services/batchCallMonitor.service');
-    const monitorStatus = batchCallMonitor.getStatus();
-    
-    // Get batch call sync queue status
-    const { isBatchCallSyncQueueAvailable } = await import('./queues/batchCallSync.queue');
-    const syncQueueAvailable = isBatchCallSyncQueueAvailable();
-    
     // Get batch call queue status
     const { isBatchCallQueueAvailable } = await import('./queues/batchCall.queue');
     const batchCallQueueAvailable = isBatchCallQueueAvailable();
@@ -204,13 +196,9 @@ app.get('/api/v1/health', async (req, res) => {
         environment: process.env.NODE_ENV || 'development',
         gitCommit: GIT_COMMIT_HASH || null
       },
-      batchCallMonitor: {
-        enabled: monitorStatus.isRunning,
-        checkInterval: `${monitorStatus.checkIntervalSeconds}s`
-      },
-      batchCallSyncQueue: {
-        enabled: syncQueueAvailable,
-        status: syncQueueAvailable ? 'active' : 'unavailable (using fallback)'
+      batchCallCompletion: {
+        mode: 'webhook',
+        note: 'post_call_transcription webhooks; manual POST /batch-calling/:jobId/sync'
       },
       batchCallQueue: {
         enabled: batchCallQueueAvailable,
@@ -431,15 +419,6 @@ const startServer = async () => {
       logger.warn('⚠️  Could not load CSV import queue:', error.message);
     }
 
-    // Initialize Batch Call Sync queue (poll + sync for automatic automation triggering)
-    try {
-      await import('./queues/batchCallSync.queue');
-      // Queue creation happens asynchronously after Redis connection
-      logger.info('✅ Batch Call Sync queue module loaded');
-    } catch (error: any) {
-      logger.warn('⚠️  Could not load Batch Call Sync queue:', error.message);
-    }
-
     // Initialize Batch Call queue (for background processing of large batch calls)
     try {
       await import('./queues/batchCall.queue');
@@ -487,27 +466,6 @@ const startServer = async () => {
       logger.warn('⚠️  Could not perform startup agent sync:', error.message);
       // Don't block server startup if sync fails
     }
-    
-    // Start batch call monitor ONLY when the Bull queue is unavailable (Redis down).
-    // When Bull is running it handles polling with proper 30s delays; starting the
-    // monitor on top doubles every sync cycle and hammers the Python conversation API.
-    //
-    // The Bull queue itself is created inside a 3s setTimeout, so we defer this
-    // check by 5s to let the queue initialise before deciding.
-    setTimeout(async () => {
-      try {
-        const { isBatchCallSyncQueueAvailable } = await import('./queues/batchCallSync.queue');
-        const { batchCallMonitor } = await import('./services/batchCallMonitor.service');
-        if (isBatchCallSyncQueueAvailable()) {
-          logger.info('✅ Batch call monitor skipped – Bull queue is active (no duplicate polling)');
-        } else {
-          batchCallMonitor.start();
-          logger.info('✅ Batch call monitor started (Bull queue unavailable – using monitor as fallback)');
-        }
-      } catch (error: any) {
-        logger.warn('⚠️  Could not start batch call monitor:', error.message);
-      }
-    }, 5000);
     
     // Start server with Socket.io
     httpServer.listen(PORT_NUMBER, () => {

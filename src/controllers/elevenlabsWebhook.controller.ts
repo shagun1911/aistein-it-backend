@@ -71,8 +71,7 @@ export class ElevenLabsWebhookController {
         }
       }
 
-      // For outbound (batch) calls – trigger an immediate sync so the transcript is
-      // picked up without waiting for the next 30s poll tick.
+      // For outbound (batch) calls – process transcript via webhook fast path only.
       if (body?.type === 'post_call_transcription') {
         const direction = body?.data?.metadata?.phone_call?.direction;
         if (direction === 'outbound') {
@@ -484,14 +483,9 @@ export class ElevenLabsWebhookController {
    *   3. Create/update the Conversation + Messages in Mongo.
    *   4. Trigger automation immediately — no polling delay, no getBatchJobStatus call.
    *
-   * Gate: only run the fast path when data.status === "done". ElevenLabs sets this only
-   * after transcript generation is complete, making it the most reliable signal.
-   * Webhooks with status "in-progress" or "failed" fall through to the poll/sync path.
-   *
-   * Falls back to the full-sync approach when:
-   *   - status is not "done"
-   *   - batch_call_id is absent from webhook metadata
-   *   - direct batch DB lookup finds nothing
+   * Gate: only process when data.status === "done". ElevenLabs sets this only after
+   * transcript generation is complete. If processing fails, use manual
+   * POST /batch-calling/:jobId/sync — no background poll/sync fallback.
    */
   private async processBatchCallWebhook(webhookBody: any) {
     this.logBatchPostCallTranscriptionWebhook(webhookBody);
@@ -563,93 +557,10 @@ export class ElevenLabsWebhookController {
       }
     }
 
-    // ── FALLBACK: status not done, batch_call_id missing, or direct path failed ─
-    //
-    // IMPORTANT: We only ever sync the ONE batch that owns this call.
-    // The previous approach fetched up to 15 active batches and synced every
-    // matching one (plus the most-recent as a catch-all), which caused every
-    // completed call webhook to trigger N×recipients HTTP calls to the Python
-    // conversation API — hammering it continuously.
-    if (callStatus !== 'done') {
-      console.log(
-        `[ElevenLabs Webhook] ⏭️ Status "${callStatus}" (not done) – falling back to batch sync`
-      );
-    }
-
-    // Give ElevenLabs 5s to update recipient status before querying batch API.
-    await new Promise(resolve => setTimeout(resolve, 5000));
-
-    const { batchCallingService } = await import('../services/batchCalling.service');
-
-    // ── Tier 1: batch_call_id is in the webhook metadata — direct lookup, no scan ──
-    const webhookBatchId: string | undefined = data?.metadata?.batch_call?.batch_call_id;
-    if (webhookBatchId) {
-      const batch = await BatchCall.findOne({ batch_call_id: webhookBatchId }).lean();
-      if (batch) {
-        const orgId =
-          (batch as any).organizationId?.toString() ||
-          (batch as any).userId?.toString();
-        if (orgId) {
-          console.log(`[ElevenLabs Webhook] 🔄 Fallback sync for batch (from metadata): ${webhookBatchId}`);
-          try {
-            await batchCallingService.syncBatchCallConversations(webhookBatchId, orgId);
-          } catch (err: any) {
-            console.error(`[ElevenLabs Webhook] ⚠️ Sync failed for ${webhookBatchId}:`, err.message);
-          }
-        }
-      }
-      return;
-    }
-
-    // ── Tier 2: no batch_call_id — match by phone/convId across recent batches ──
-    // This path should be rare (ElevenLabs usually includes batch_call_id).
-    // We stop as soon as we find ONE matching batch to avoid syncing unrelated batches.
-    const normalizePhone = (p: string) => {
-      const digits = String(p || '').replace(/\D/g, '');
-      return digits.length >= 10 ? digits.slice(-10) : digits;
-    };
-    const phoneNorm = normalizePhone(phoneNumber);
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-
-    const candidateBatches = await BatchCall.find({
-      conversations_synced: { $ne: true },
-      status: { $nin: ['cancelled', 'canceled', 'failed'] },
-      createdAt: { $gte: oneDayAgo }
-    })
-      .sort({ createdAt: -1 })
-      .limit(15)
-      .lean();
-
-    if (candidateBatches.length === 0) {
-      console.log('[ElevenLabs Webhook] No active batch found – skipping fallback sync');
-      return;
-    }
-
-    for (const batch of candidateBatches) {
-      const batchId = (batch as any).batch_call_id;
-      const orgId =
-        (batch as any).organizationId?.toString() ||
-        (batch as any).userId?.toString();
-      if (!orgId || !batchId) continue;
-
-      try {
-        const status = await batchCallingService.getBatchJobStatus(batchId);
-        const recipients = status.recipients || [];
-        const matches = recipients.some((r: any) => {
-          if (elevenLabsConvId && r.conversation_id === elevenLabsConvId) return true;
-          return normalizePhone(r.phone_number) === phoneNorm;
-        });
-        if (!matches) continue;
-
-        console.log(`[ElevenLabs Webhook] 🔄 Fallback sync for batch (phone match): ${batchId}`);
-        await batchCallingService.syncBatchCallConversations(batchId, orgId);
-        return; // stop after the first matching batch — do NOT fall through to others
-      } catch (err: any) {
-        console.error(`[ElevenLabs Webhook] ⚠️ Sync failed for ${batchId}:`, err.message);
-      }
-    }
-
-    console.log(`[ElevenLabs Webhook] ⚠️ No matching batch found for phone ${phoneNumber} – skipping fallback sync`);
+    console.warn(
+      `[ElevenLabs Webhook] ⚠️ Webhook-only path could not process ${phoneNumber}` +
+      ` (status: ${callStatus}) – use POST /batch-calling/:jobId/sync if needed`
+    );
   }
 
   /**

@@ -13,7 +13,7 @@ import mongoose from 'mongoose';
  * - Controller enqueues job with batch call data
  * - Queue processor submits to Python API
  * - Stores result in database
- * - Triggers polling for batch completion
+ * - Completion handled via post_call_transcription webhooks
  */
 
 // Create batch call queue (will fail gracefully if Redis is unavailable)
@@ -196,19 +196,10 @@ const setupQueueProcessor = () => {
       // Update job progress
       job.progress(80);
 
-      // Enqueue poll job for automatic batch completion detection
-      try {
-        const { enqueueBatchPoll } = await import('./batchCallSync.queue');
-        const enqueued = await enqueueBatchPoll(result.id, organizationId.toString());
-        
-        if (enqueued) {
-          console.log('[Batch Call Queue] 🚀 Background polling started for batch:', result.id);
-        } else {
-          console.log('[Batch Call Queue] ℹ️  Queue not available - batch will rely on BatchCallMonitor fallback');
-        }
-      } catch (queueError: any) {
-        console.warn('[Batch Call Queue] ⚠️  Failed to enqueue batch poll:', queueError.message);
-      }
+      console.log(
+        '[Batch Call Queue] Batch submitted – completion handled via post_call_transcription webhooks:',
+        result.id
+      );
 
       // Update job progress
       job.progress(100);

@@ -909,14 +909,6 @@ export class AutomationEngine {
               conversations_synced: false
             });
 
-            // Enqueue poll job
-            try {
-              const { enqueueBatchPoll } = await import('../queues/batchCallSync.queue');
-              await enqueueBatchPoll(result.id, context.organizationId.toString());
-            } catch (pollError: any) {
-              console.warn(`[Automation Engine] ⚠️  Failed to enqueue batch poll:`, pollError.message);
-            }
-
             return {
               success: true,
               total: recipients.length,

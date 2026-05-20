@@ -1,6 +1,10 @@
 import { Response, NextFunction } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { batchCallingService, isActiveBatchStatus } from '../services/batchCalling.service';
+import {
+  batchCallingService,
+  BATCH_COMM_API_TIMEOUT_MS,
+  isActiveBatchStatus
+} from '../services/batchCalling.service';
 import mongoose from 'mongoose';
 
 const MAX_RECIPIENTS = 10000;
@@ -1258,10 +1262,11 @@ export class BatchCallingController {
             .catch(() => null)
         : Promise.resolve(null);
 
-      // Race Python against a 5-second wall clock so a slow comm-api never hangs the page.
       const statusResult: any = await Promise.race([
         pythonStatusPromise,
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000))
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), BATCH_COMM_API_TIMEOUT_MS)
+        )
       ]);
 
       const resultsResult = includeTranscript && batchIsActive

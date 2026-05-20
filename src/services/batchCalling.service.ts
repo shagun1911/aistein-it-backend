@@ -12,6 +12,9 @@ import {
 
 const COMM_API_URL = getCommApiBaseUrl();
 
+/** Axios timeout for all batch-calling ↔ Python comm-api HTTP calls (ms). */
+export const BATCH_COMM_API_TIMEOUT_MS = 300_000;
+
 export interface BatchCallRecipient {
   phone_number: string;
   name: string;
@@ -146,7 +149,7 @@ export class BatchCallingService {
         pythonUrl,
         payload,
         {
-          timeout: 600000, // 10 minutes timeout
+          timeout: BATCH_COMM_API_TIMEOUT_MS,
           headers: {
             'Content-Type': 'application/json'
           }
@@ -173,7 +176,7 @@ export class BatchCallingService {
    * Get batch job status
    * Calls Python /api/v1/batch-calling/{job_id} endpoint
    */
-  async getBatchJobStatus(jobId: string, timeoutMs = 10000): Promise<BatchCallResponse> {
+  async getBatchJobStatus(jobId: string, timeoutMs = BATCH_COMM_API_TIMEOUT_MS): Promise<BatchCallResponse> {
     if (isCommApiCircuitOpen()) {
       throw new AppError(
         503,
@@ -208,7 +211,7 @@ export class BatchCallingService {
    * Pull latest summary counters from the Python API and persist to Mongo.
    * Used for list refresh on in-flight batches only (not full recipient sync).
    */
-  async refreshBatchSummaryInDb(batchCallId: string, timeoutMs = 20000): Promise<{
+  async refreshBatchSummaryInDb(batchCallId: string, timeoutMs = BATCH_COMM_API_TIMEOUT_MS): Promise<{
     status: string;
     total_calls_dispatched: number;
     total_calls_scheduled: number;
@@ -254,7 +257,7 @@ export class BatchCallingService {
       const response = await axios.post<BatchCallResponse>(
         pythonUrl,
         {},
-        { timeout: 30000, headers: { 'Content-Type': 'application/json' } }
+        { timeout: BATCH_COMM_API_TIMEOUT_MS, headers: { 'Content-Type': 'application/json' } }
       );
 
       console.log('[Batch Calling Service] ✅ Batch job retry initiated successfully');
@@ -281,7 +284,7 @@ export class BatchCallingService {
         pythonUrl,
         {},
         {
-          timeout: 30000, // 30 seconds timeout
+          timeout: BATCH_COMM_API_TIMEOUT_MS,
           headers: {
             'Content-Type': 'application/json'
           }
@@ -316,7 +319,7 @@ export class BatchCallingService {
         pythonUrl,
         {},
         {
-          timeout: 30000,
+          timeout: BATCH_COMM_API_TIMEOUT_MS,
           headers: {
             'Content-Type': 'application/json'
           }
@@ -356,7 +359,7 @@ export class BatchCallingService {
 
       const response = await axios.get<BatchJobCallsResponse>(
         `${COMM_API_URL}/api/v1/batch-calling/${jobId}/calls`,
-        { params, timeout: 30000, headers: { 'Content-Type': 'application/json' } }
+        { params, timeout: BATCH_COMM_API_TIMEOUT_MS, headers: { 'Content-Type': 'application/json' } }
       );
 
       return response.data;
@@ -396,7 +399,7 @@ export class BatchCallingService {
 
       const response = await axios.get<any>(
         `${COMM_API_URL}/api/v1/batch-calling/${jobId}/results`,
-        { params, timeout: 60000, headers: { 'Content-Type': 'application/json' } }
+        { params, timeout: BATCH_COMM_API_TIMEOUT_MS, headers: { 'Content-Type': 'application/json' } }
       );
 
       return response.data;
@@ -419,7 +422,7 @@ export class BatchCallingService {
     try {
       const response = await axios.get(
         `${COMM_API_URL}/api/v1/conversations/${conversationId}`,
-        { timeout: 30000, headers: { 'Content-Type': 'application/json' } }
+        { timeout: BATCH_COMM_API_TIMEOUT_MS, headers: { 'Content-Type': 'application/json' } }
       );
       return response.data;
     } catch (error: any) {

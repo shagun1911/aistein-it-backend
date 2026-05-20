@@ -72,6 +72,22 @@ export interface BatchJobCallsResponse {
   cursor?: string;
 }
 
+/** Batch job statuses that may still change — only these are refreshed on list load. */
+export const ACTIVE_BATCH_STATUSES = new Set([
+  'pending',
+  'scheduled',
+  'running',
+  'in_progress',
+  'retrying',
+  'queued',
+  'processing',
+  'initiated'
+]);
+
+export function isActiveBatchStatus(status: string | undefined): boolean {
+  return ACTIVE_BATCH_STATUSES.has(String(status || '').toLowerCase().trim());
+}
+
 export class BatchCallingService {
   private syncLocks = new Set<string>();
 
@@ -186,6 +202,40 @@ export class BatchCallingService {
         message
       );
     }
+  }
+
+  /**
+   * Pull latest summary counters from the Python API and persist to Mongo.
+   * Used for list refresh on in-flight batches only (not full recipient sync).
+   */
+  async refreshBatchSummaryInDb(batchCallId: string): Promise<{
+    status: string;
+    total_calls_dispatched: number;
+    total_calls_scheduled: number;
+    total_calls_finished: number;
+    last_updated_at_unix: number;
+  } | null> {
+    const latestStatus = await this.getBatchJobStatus(batchCallId);
+    const BatchCall = (await import('../models/BatchCall')).default;
+    await BatchCall.updateOne(
+      { batch_call_id: batchCallId },
+      {
+        $set: {
+          status: latestStatus.status,
+          total_calls_dispatched: latestStatus.total_calls_dispatched,
+          total_calls_scheduled: latestStatus.total_calls_scheduled,
+          total_calls_finished: latestStatus.total_calls_finished,
+          last_updated_at_unix: latestStatus.last_updated_at_unix
+        }
+      }
+    );
+    return {
+      status: latestStatus.status,
+      total_calls_dispatched: latestStatus.total_calls_dispatched,
+      total_calls_scheduled: latestStatus.total_calls_scheduled,
+      total_calls_finished: latestStatus.total_calls_finished,
+      last_updated_at_unix: latestStatus.last_updated_at_unix
+    };
   }
 
   /**

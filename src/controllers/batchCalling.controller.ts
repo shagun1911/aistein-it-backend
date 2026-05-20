@@ -1,6 +1,6 @@
 import { Response, NextFunction } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { batchCallingService } from '../services/batchCalling.service';
+import { batchCallingService, isActiveBatchStatus } from '../services/batchCalling.service';
 import mongoose from 'mongoose';
 
 const MAX_RECIPIENTS = 10000;
@@ -884,7 +884,10 @@ export class BatchCallingController {
   /**
    * Get all batch calls for the user's organization
    * GET /api/v1/batch-calling
-   * Syncs status from Python API for each batch call
+   *
+   * Returns MongoDB records immediately. Only in-flight batches are refreshed from
+   * the Python API (summary fields only) so listing stays fast with many completed
+   * 500-contact batches.
    */
   async getBatchCalls(req: AuthRequest, res: Response, next: NextFunction) {
     try {
@@ -911,57 +914,42 @@ export class BatchCallingController {
         .sort({ createdAt: -1 })
         .lean();
 
-      // Sync status from Python API for each batch call
-      const syncedBatchCalls = await Promise.all(
-        batchCalls.map(async (batchCall) => {
+      const activeBatches = batchCalls.filter((b) => isActiveBatchStatus(b.status));
+
+      if (activeBatches.length === 0) {
+        return res.status(200).json({
+          success: true,
+          data: batchCalls
+        });
+      }
+
+      const summaryById = new Map<string, Record<string, unknown>>();
+      await Promise.all(
+        activeBatches.map(async (batchCall) => {
           try {
-            // Fetch latest status from Python API
-            const latestStatus = await batchCallingService.getBatchJobStatus(batchCall.batch_call_id);
-
-            // Update database with latest status if it changed
-            const statusChanged =
-              batchCall.status !== latestStatus.status ||
-              batchCall.total_calls_dispatched !== latestStatus.total_calls_dispatched ||
-              batchCall.total_calls_scheduled !== latestStatus.total_calls_scheduled ||
-              batchCall.total_calls_finished !== latestStatus.total_calls_finished;
-
-            if (statusChanged) {
-              await BatchCall.updateOne(
-                { batch_call_id: batchCall.batch_call_id },
-                {
-                  $set: {
-                    status: latestStatus.status,
-                    total_calls_dispatched: latestStatus.total_calls_dispatched,
-                    total_calls_scheduled: latestStatus.total_calls_scheduled,
-                    total_calls_finished: latestStatus.total_calls_finished,
-                    last_updated_at_unix: latestStatus.last_updated_at_unix
-                  }
-                }
-              );
-
-              // Return updated data
-              return {
-                ...batchCall,
-                status: latestStatus.status,
-                total_calls_dispatched: latestStatus.total_calls_dispatched,
-                total_calls_scheduled: latestStatus.total_calls_scheduled,
-                total_calls_finished: latestStatus.total_calls_finished,
-                last_updated_at_unix: latestStatus.last_updated_at_unix
-              };
+            const summary = await batchCallingService.refreshBatchSummaryInDb(
+              batchCall.batch_call_id
+            );
+            if (summary) {
+              summaryById.set(batchCall.batch_call_id, summary);
             }
-
-            return batchCall;
           } catch (error: any) {
-            // If Python API call fails, return the database record as-is
-            console.warn(`[Batch Calling Controller] ⚠️ Failed to sync status for batch call ${batchCall.batch_call_id}:`, error.message);
-            return batchCall;
+            console.warn(
+              `[Batch Calling Controller] ⚠️ Failed to refresh active batch ${batchCall.batch_call_id}:`,
+              error.message
+            );
           }
         })
       );
 
+      const data = batchCalls.map((batchCall) => {
+        const summary = summaryById.get(batchCall.batch_call_id);
+        return summary ? { ...batchCall, ...summary } : batchCall;
+      });
+
       res.status(200).json({
         success: true,
-        data: syncedBatchCalls
+        data
       });
     } catch (error) {
       next(error);
@@ -1204,23 +1192,16 @@ export class BatchCallingController {
         });
       }
 
-      const [
-        statusResult,
-        callsResult,
-        resultsResult,
-        failedCallsResult,
-        busyCallsResult,
-        noAnswerCallsResult,
-        voicemailCallsResult
-      ] = await Promise.all([
+      // Status includes all recipients; results adds transcripts — avoid 5 extra /calls round-trips.
+      const [statusResult, resultsResult] = await Promise.all([
         batchCallingService.getBatchJobStatus(jobId).catch(() => null),
-        batchCallingService.getBatchJobCalls(jobId, { page_size: 100 }).catch(() => ({ calls: [] })),
-        batchCallingService.getBatchJobResults(jobId, true).catch(() => null),
-        batchCallingService.getBatchJobCalls(jobId, { status: 'failed', page_size: 100 }).catch(() => ({ calls: [] })),
-        batchCallingService.getBatchJobCalls(jobId, { status: 'busy', page_size: 100 }).catch(() => ({ calls: [] })),
-        batchCallingService.getBatchJobCalls(jobId, { status: 'no_answer', page_size: 100 }).catch(() => ({ calls: [] })),
-        batchCallingService.getBatchJobCalls(jobId, { status: 'voicemail', page_size: 100 }).catch(() => ({ calls: [] }))
+        batchCallingService.getBatchJobResults(jobId, true).catch(() => null)
       ]);
+      const callsResult = { calls: [] as any[] };
+      const failedCallsResult = { calls: [] as any[] };
+      const busyCallsResult = { calls: [] as any[] };
+      const noAnswerCallsResult = { calls: [] as any[] };
+      const voicemailCallsResult = { calls: [] as any[] };
 
       const extractArray = (input: any): any[] => {
         if (Array.isArray(input)) return input;
@@ -1448,6 +1429,28 @@ export class BatchCallingController {
       };
 
       const recipientRows = extractArray(statusResult?.recipients || statusResult);
+
+      const batchStatusLowerEarly = String(statusResult?.status || '').toLowerCase();
+      const scheduledEarly = Number(statusResult?.total_calls_scheduled ?? 0);
+      const finishedEarly = Number(statusResult?.total_calls_finished ?? 0);
+      const batchStillRunningEarly =
+        batchStatusLowerEarly === 'pending' ||
+        batchStatusLowerEarly === 'in_progress' ||
+        batchStatusLowerEarly === 'running' ||
+        batchStatusLowerEarly === 'queued' ||
+        batchStatusLowerEarly === 'processing';
+      const batchExplicitlyCompleteEarly =
+        batchStatusLowerEarly === 'completed' ||
+        batchStatusLowerEarly === 'done' ||
+        batchStatusLowerEarly === 'finished';
+      const batchNotDoneEarly =
+        !batchExplicitlyCompleteEarly &&
+        (batchStillRunningEarly ||
+          (statusResult != null &&
+            scheduledEarly > 0 &&
+            Number.isFinite(finishedEarly) &&
+            finishedEarly < scheduledEarly));
+
       const dedupeRows = (rows: any[]): any[] => {
         const seen = new Set<string>();
         const out: any[] = [];
@@ -1474,16 +1477,34 @@ export class BatchCallingController {
       ]);
       const resultRows = extractArray(resultsResult);
 
-      // Live conversation details help resolve final status when batch endpoint still says "initiated".
-      const liveConversationIds = Array.from(
-        new Set(
-          [
-            ...recipientRows.map((r: any) => r?.conversation_id).filter(Boolean),
-            ...callRows.map((r: any) => r?.conversation_id || r?.conversationId).filter(Boolean),
-            ...resultRows.map((r: any) => r?.conversation_id || r?.conversationId || r?.id).filter(Boolean)
-          ].map(String)
-        )
-      ).slice(0, 150);
+      // Live conversation fetches are expensive — only for in-flight recipients while batch is running.
+      const terminalRecipientStatuses = new Set([
+        'completed',
+        'complete',
+        'done',
+        'finished',
+        'success',
+        'successful',
+        'failed',
+        'busy',
+        'no_answer',
+        'no-answer',
+        'voicemail',
+        'cancelled',
+        'canceled'
+      ]);
+      const liveConversationIds = batchNotDoneEarly
+        ? Array.from(
+            new Set(
+              recipientRows
+                .filter((r: any) => {
+                  const s = String(r?.status || '').toLowerCase().trim();
+                  return r?.conversation_id && !terminalRecipientStatuses.has(s);
+                })
+                .map((r: any) => String(r.conversation_id))
+            )
+          ).slice(0, 25)
+        : [];
 
       const liveConversationMap = new Map<string, any>();
       if (liveConversationIds.length > 0) {

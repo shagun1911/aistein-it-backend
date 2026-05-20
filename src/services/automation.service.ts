@@ -541,6 +541,36 @@ export function cleanExtractedString(v: unknown): string {
   return s && s.toLowerCase() !== 'null' ? s : '';
 }
 
+export function isMeaningfulExtractedValue(v: unknown): boolean {
+  const s = cleanExtractedString(v);
+  if (!s) return false;
+  const lower = s.toLowerCase();
+  return lower !== 'undefined' && lower !== 'not provided' && lower !== 'n/a';
+}
+
+/** Inbound webhook default when no name is known — should not block extracted names. */
+export function isPlaceholderCallerContactName(name: unknown, phone?: unknown): boolean {
+  const n = cleanExtractedString(name);
+  if (!n) return true;
+  if (/^caller\s*\+?\d/i.test(n)) return true;
+  const phoneStr = cleanExtractedString(phone);
+  if (phoneStr) {
+    const normPhone = phoneStr.replace(/\D/g, '');
+    const normName = n.replace(/\D/g, '');
+    if (/^caller\b/i.test(n) && normName && normPhone && normName.includes(normPhone)) return true;
+    if (n === `Caller ${phoneStr}`.trim()) return true;
+  }
+  return false;
+}
+
+export function resolveExtractedPersonName(extracted: Record<string, any> | undefined): string {
+  const ex = extracted || {};
+  const direct = [ex.name, ex.customer_name, ex.full_name].map(cleanExtractedString).find(isMeaningfulExtractedValue);
+  if (direct) return direct;
+  const combined = [ex.first_name, ex.last_name].map(cleanExtractedString).filter(isMeaningfulExtractedValue).join(' ').trim();
+  return combined || '';
+}
+
 /** Resolve which keys in extracted_data hold date/time/booked per the node's json_example schema. */
 export function resolveAppointmentFieldKeys(jsonExample?: Record<string, any>): {
   dateKey: string;
@@ -1003,7 +1033,15 @@ export class AutomationService {
         timeout: 120_000
       });
       const data = response.data || {};
-      const extracted_data: Record<string, any> = data.extracted_data || {};
+      const extracted_data: Record<string, any> = { ...(data.extracted_data || {}) };
+      // Some Python responses put requested json_example keys at the top level.
+      if (json_example) {
+        for (const key of Object.keys(json_example)) {
+          if (!isMeaningfulExtractedValue(extracted_data[key]) && isMeaningfulExtractedValue(data[key])) {
+            extracted_data[key] = data[key];
+          }
+        }
+      }
 
       const { dateKey, timeKey, bookedKey } = resolveAppointmentFieldKeys(json_example);
       const bookedRaw = extracted_data[bookedKey] ?? extracted_data.appointment_booked ?? data.appointment_booked;
@@ -1058,10 +1096,38 @@ export class AutomationService {
     }
 
     try {
-      return await this.extractConversationDataViaPythonApi(conversationId, extractionType, {
+      const result = await this.extractConversationDataViaPythonApi(conversationId, extractionType, {
         extraction_prompt: prompt,
         json_example: jsonExample
       });
+
+      const nameKeys = ['name', 'customer_name', 'full_name'] as const;
+      const wantsName = nameKeys.some((k) => k in jsonExample);
+      const hasName = isMeaningfulExtractedValue(resolveExtractedPersonName(result.extracted_data));
+      if (wantsName && !hasName && result.success !== false) {
+        console.warn(
+          '[Automation Service] Python extract-data omitted name — supplementing via local LLM',
+          { conversationId }
+        );
+        try {
+          const local = await this.extractConversationData(conversationId, extractionType, organizationId, {
+            extraction_prompt: prompt,
+            json_example: jsonExample
+          });
+          if (local.success && local.extracted_data) {
+            result.extracted_data = { ...(result.extracted_data || {}), ...local.extracted_data };
+            for (const k of nameKeys) {
+              if (isMeaningfulExtractedValue(local.extracted_data[k])) {
+                result.extracted_data[k] = local.extracted_data[k];
+              }
+            }
+          }
+        } catch (supplementErr: any) {
+          console.warn('[Automation Service] Local name supplement failed:', supplementErr?.message);
+        }
+      }
+
+      return result;
     } catch {
       return this.extractConversationData(conversationId, extractionType, organizationId, {
         extraction_prompt: prompt,

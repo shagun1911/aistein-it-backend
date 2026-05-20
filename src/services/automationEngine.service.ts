@@ -21,6 +21,14 @@ import SocialIntegration from '../models/SocialIntegration';
 import Message from '../models/Message';
 import Conversation from '../models/Conversation';
 
+/** Cached to avoid circular import with automation.service on every template resolve. */
+let extractionTemplateHelpersPromise: Promise<typeof import('./automation.service')> | null = null;
+function getExtractionTemplateHelpers() {
+  if (!extractionTemplateHelpersPromise) {
+    extractionTemplateHelpersPromise = import('./automation.service');
+  }
+  return extractionTemplateHelpersPromise;
+}
 
 // Voice ID mapping from voice name to ElevenLabs voice ID
 const VOICE_ID_MAP: Record<string, string> = {
@@ -170,16 +178,25 @@ export class AutomationEngine {
     const contactName = context.contact?.name || context.triggerData?.freshContactData?.name || '';
     const contactEmail = context.contact?.email || context.triggerData?.freshContactData?.email || '';
     const contactPhone = context.contact?.phone || context.triggerData?.freshContactData?.phone || '';
+    const {
+      resolveExtractedPersonName,
+      isPlaceholderCallerContactName,
+      isMeaningfulExtractedValue,
+      cleanExtractedString
+    } = await getExtractionTemplateHelpers();
+    const extractedPersonName = resolveExtractedPersonName(ex);
     const contactFirstName =
+      (isMeaningfulExtractedValue(ex.first_name) ? cleanExtractedString(ex.first_name) : '') ||
       context.triggerData?.freshContactData?.first_name ||
       context.triggerData?.dynamic_variables?.first_name ||
-      ex.first_name ||
-      (contactName ? String(contactName).trim().split(/\s+/)[0] : '');
+      (contactName && !isPlaceholderCallerContactName(contactName, contactPhone)
+        ? String(contactName).trim().split(/\s+/)[0]
+        : '');
     const contactLastName =
+      (isMeaningfulExtractedValue(ex.last_name) ? cleanExtractedString(ex.last_name) : '') ||
       context.triggerData?.freshContactData?.last_name ||
       context.triggerData?.dynamic_variables?.last_name ||
-      ex.last_name ||
-      (contactName
+      (contactName && !isPlaceholderCallerContactName(contactName, contactPhone)
         ? String(contactName).trim().split(/\s+/).slice(1).join(' ')
         : '');
     const mergedAppointmentDate = mergedDate;
@@ -321,8 +338,11 @@ export class AutomationEngine {
       fallbackPhoneCandidates.length > 0 ? String(fallbackPhoneCandidates[0]) : 'Not Provided';
 
     const resolvedName =
-      (contactName && String(contactName).trim()) ||
-      [contactFirstName, contactLastName].filter(Boolean).join(' ').trim() ||
+      extractedPersonName ||
+      (contactName && !isPlaceholderCallerContactName(contactName, contactPhone)
+        ? String(contactName).trim()
+        : '') ||
+      [contactFirstName, contactLastName].filter(isMeaningfulExtractedValue).join(' ').trim() ||
       'Not Provided';
     const instagramHandle =
       context.contact?.metadata?.instagramUsername ||
@@ -1741,13 +1761,18 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           const normalized = buildNormalizedExtractionContext(result, json_example);
           const { finalDate, finalTime, finalBooked, extractionConfidence, extracted_data } = normalized;
 
+          const { resolveExtractedPersonName: resolvePersonName } = await getExtractionTemplateHelpers();
+          const extractedName = resolvePersonName(extracted_data);
+
           console.log(
             `[Automation Engine] ✅ Extraction result:`,
             result.success
               ? {
                   appointment_booked: finalBooked,
                   appointment_date: finalDate || null,
-                  appointment_time: finalTime || null
+                  appointment_time: finalTime || null,
+                  name: extractedName || null,
+                  extracted_keys: Object.keys(extracted_data || {})
                 }
               : result.error
           );
@@ -1771,7 +1796,7 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           };
 
           console.log(
-            `[Automation Engine] 📋 Extraction summary: booked=${finalBooked} appointment_date="${finalDate}" appointment_time="${finalTime}"`
+            `[Automation Engine] 📋 Extraction summary: booked=${finalBooked} appointment_date="${finalDate}" appointment_time="${finalTime}" name="${extractedName || ''}"`
           );
 
           return {
@@ -1947,7 +1972,10 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
       execute: async (config, triggerData, context: IAutomationExecutionContext) => {
         const { spreadsheetId } = config;
         const userValues: any[] = Array.isArray((config as any).values) ? (config as any).values : [];
-        const isBatchCompletedEvent = String(context?.triggerData?.event || '').trim() === 'batch_call_completed';
+        const triggerEvent = String(context?.triggerData?.event || '').trim();
+        const isBatchCompletedEvent = triggerEvent === 'batch_call_completed';
+        const isInboundEvent =
+          triggerEvent === 'inbound_call_completed' || triggerEvent === 'inbound_chatbox_message';
         const mongoConversationId = String(context?.triggerData?.conversation_id || '').trim();
         const externalConversationId = String(
           context?.conversation?.conversation_id ||
@@ -2253,10 +2281,10 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
               .join('\n')
           );
 
-          // Sheet-level dedup:
-          // - For batch_call_completed, dedup ONLY by exact conversation_id.
-          //   (Same phone can have multiple valid calls; each should append.)
-          // - For non-batch flows, keep phone fallback dedup to avoid noise.
+          // Sheet-level dedup (skipped for inbound — each completed call/message should append):
+          // - inbound_call_completed / inbound_chatbox_message: no dedup
+          // - batch_call_completed: dedup ONLY by exact conversation_id
+          // - other flows: phone + conversation_id dedup
           const phoneIdx = rowPlan.findIndex(
             (r) => /\{\{\s*(phone|phone_number|contact\.phone)\s*\}\}/i.test(r.template)
           );
@@ -2267,7 +2295,7 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
             ''
           ).trim();
 
-          if ((phoneVal && phoneVal !== 'Not Provided') || convIdVal) {
+          if (!isInboundEvent && ((phoneVal && phoneVal !== 'Not Provided') || convIdVal)) {
             try {
               const allRows = await sheets.spreadsheets.values.get({
                 spreadsheetId,

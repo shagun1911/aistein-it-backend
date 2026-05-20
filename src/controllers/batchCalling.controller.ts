@@ -914,43 +914,26 @@ export class BatchCallingController {
         .sort({ createdAt: -1 })
         .lean();
 
-      const activeBatches = batchCalls.filter((b) => isActiveBatchStatus(b.status));
+      // Respond immediately from Mongo — never block on Python.
+      // Active-batch counts are refreshed in the background so the next
+      // frontend poll (15 s) will see updated numbers.
+      res.status(200).json({ success: true, data: batchCalls });
 
-      if (activeBatches.length === 0) {
-        return res.status(200).json({
-          success: true,
-          data: batchCalls
+      // Background refresh: update Mongo for any in-flight batches.
+      const activeBatches = batchCalls.filter((b) => isActiveBatchStatus(b.status));
+      if (activeBatches.length > 0) {
+        setImmediate(() => {
+          void Promise.all(
+            activeBatches.map(async (b) => {
+              try {
+                await batchCallingService.refreshBatchSummaryInDb(b.batch_call_id);
+              } catch {
+                // best-effort; next poll will retry
+              }
+            })
+          );
         });
       }
-
-      const summaryById = new Map<string, Record<string, unknown>>();
-      await Promise.all(
-        activeBatches.map(async (batchCall) => {
-          try {
-            const summary = await batchCallingService.refreshBatchSummaryInDb(
-              batchCall.batch_call_id
-            );
-            if (summary) {
-              summaryById.set(batchCall.batch_call_id, summary);
-            }
-          } catch (error: any) {
-            console.warn(
-              `[Batch Calling Controller] ⚠️ Failed to refresh active batch ${batchCall.batch_call_id}:`,
-              error.message
-            );
-          }
-        })
-      );
-
-      const data = batchCalls.map((batchCall) => {
-        const summary = summaryById.get(batchCall.batch_call_id);
-        return summary ? { ...batchCall, ...summary } : batchCall;
-      });
-
-      res.status(200).json({
-        success: true,
-        data
-      });
     } catch (error) {
       next(error);
     }
@@ -1264,14 +1247,26 @@ export class BatchCallingController {
         });
       }
 
-      // Status has per-recipient metadata. Bulk /results with transcripts is omitted by default
-      // (500 transcripts made this endpoint very slow and huge).
-      const [statusResult, resultsResult] = await Promise.all([
-        batchCallingService.getBatchJobStatus(jobId).catch(() => null),
-        includeTranscript
-          ? batchCallingService.getBatchJobResults(jobId, true).catch(() => null)
-          : Promise.resolve(null)
+      // Primary source: Mongo conversations (synced by webhook, always fast).
+      // Python status is only fetched for in-flight batches AND with a short timeout
+      // so a slow Python never blocks the response.
+      const batchIsActive = isActiveBatchStatus(batchCall.status);
+
+      const pythonStatusPromise = batchIsActive
+        ? batchCallingService.getBatchJobStatus(jobId)
+            .then((r) => r)
+            .catch(() => null)
+        : Promise.resolve(null);
+
+      // Race Python against a 5-second wall clock so a slow comm-api never hangs the page.
+      const statusResult: any = await Promise.race([
+        pythonStatusPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000))
       ]);
+
+      const resultsResult = includeTranscript && batchIsActive
+        ? await batchCallingService.getBatchJobResults(jobId, true).catch(() => null)
+        : null;
       const callsResult = { calls: [] as any[] };
       const failedCallsResult = { calls: [] as any[] };
       const busyCallsResult = { calls: [] as any[] };

@@ -1145,12 +1145,84 @@ export class BatchCallingController {
   }
 
   /**
-   * Get complete per-contact batch details
-   * GET /api/v1/batch-calling/:jobId/details
+   * Lazy-load transcript for one batch contact (from Mongo messages).
+   * GET /api/v1/batch-calling/:jobId/contacts/:conversationId/transcript
+   */
+  async getBatchContactTranscript(req: AuthRequest, res: Response, next: NextFunction) {
+    try {
+      const { jobId, conversationId } = req.params;
+      if (!jobId || !conversationId) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'MISSING_PARAMS', message: 'Job ID and conversation ID are required' }
+        });
+      }
+
+      const organizationId = await resolveOrganizationObjectId(req);
+      if (!organizationId) {
+        return res.status(401).json({
+          success: false,
+          error: 'Unauthorized',
+          detail: 'Organization ID or User ID not found'
+        });
+      }
+
+      const Conversation = (await import('../models/Conversation')).default;
+      const Message = (await import('../models/Message')).default;
+
+      const conversation = await Conversation.findOne({
+        organizationId,
+        channel: 'phone',
+        'metadata.batch_call_id': jobId,
+        'metadata.conversation_id': conversationId
+      })
+        .select('_id')
+        .lean();
+
+      if (!conversation) {
+        return res.status(404).json({
+          success: false,
+          error: { code: 'NOT_FOUND', message: 'Conversation not found for this batch contact' }
+        });
+      }
+
+      const messages = await Message.find({
+        conversationId: conversation._id,
+        type: 'message'
+      })
+        .sort({ timestamp: 1 })
+        .select('sender text timestamp')
+        .lean();
+
+      const transcript = messages.map((m: any) => ({
+        role: m.sender === 'customer' ? 'user' : 'agent',
+        message: m.text,
+        timestamp: m.timestamp
+      }));
+
+      return res.status(200).json({
+        success: true,
+        data: { conversation_id: conversationId, transcript }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Get paginated per-contact batch details (summary only; transcripts loaded separately).
+   * GET /api/v1/batch-calling/:jobId/details?page=1&page_size=50
    */
   async getBatchJobDetails(req: AuthRequest, res: Response, next: NextFunction) {
     try {
       const { jobId } = req.params;
+      const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+      const pageSize = Math.min(
+        100,
+        Math.max(1, parseInt(String(req.query.page_size || '50'), 10) || 50)
+      );
+      const includeTranscript = req.query.include_transcript === 'true';
+
       if (!jobId) {
         return res.status(400).json({
           success: false,
@@ -1192,10 +1264,13 @@ export class BatchCallingController {
         });
       }
 
-      // Status includes all recipients; results adds transcripts — avoid 5 extra /calls round-trips.
+      // Status has per-recipient metadata. Bulk /results with transcripts is omitted by default
+      // (500 transcripts made this endpoint very slow and huge).
       const [statusResult, resultsResult] = await Promise.all([
         batchCallingService.getBatchJobStatus(jobId).catch(() => null),
-        batchCallingService.getBatchJobResults(jobId, true).catch(() => null)
+        includeTranscript
+          ? batchCallingService.getBatchJobResults(jobId, true).catch(() => null)
+          : Promise.resolve(null)
       ]);
       const callsResult = { calls: [] as any[] };
       const failedCallsResult = { calls: [] as any[] };
@@ -1477,6 +1552,17 @@ export class BatchCallingController {
       ]);
       const resultRows = extractArray(resultsResult);
 
+      const recipientByPhone = new Map<string, any>();
+      for (const r of recipientRows) {
+        const key = normalizePhoneForCompare(r?.phone_number || r?.phone);
+        if (key && !recipientByPhone.has(key)) recipientByPhone.set(key, r);
+      }
+      const resultByPhone = new Map<string, any>();
+      for (const r of resultRows) {
+        const key = normalizePhoneForCompare(r?.phone_number || r?.phone);
+        if (key && !resultByPhone.has(key)) resultByPhone.set(key, r);
+      }
+
       // Live conversation fetches are expensive — only for in-flight recipients while batch is running.
       const terminalRecipientStatuses = new Set([
         'completed',
@@ -1544,7 +1630,9 @@ export class BatchCallingController {
         organizationId: orgObjectId,
         channel: 'phone',
         'metadata.batch_call_id': jobId
-      }).lean();
+      })
+        .select('_id customerId status channel metadata createdAt updatedAt')
+        .lean();
 
       const conversationIds = dbConversations.map((c: any) => c._id);
       const [messageCounts, customers] = await Promise.all([
@@ -1572,12 +1660,26 @@ export class BatchCallingController {
         if (convId && !dbByConversationId.has(convId)) dbByConversationId.set(convId, c);
       }
 
-      const allPhones = new Set<string>();
+      const phoneOrdered: string[] = [];
+      const seenPhoneKeys = new Set<string>();
+      for (const r of recipientRows) {
+        const raw = r?.phone_number || r?.phone;
+        if (!raw) continue;
+        const key = normalizePhoneForCompare(raw);
+        if (!key || seenPhoneKeys.has(key)) continue;
+        seenPhoneKeys.add(key);
+        phoneOrdered.push(String(raw));
+      }
+      for (const c of dbConversations) {
+        const raw = c?.metadata?.phone_number;
+        if (!raw) continue;
+        const key = normalizePhoneForCompare(raw);
+        if (!key || seenPhoneKeys.has(key)) continue;
+        seenPhoneKeys.add(key);
+        phoneOrdered.push(String(raw));
+      }
+
       const allConversationIds = new Set<string>();
-      recipientRows.forEach((r: any) => r?.phone_number && allPhones.add(r.phone_number));
-      callRows.forEach((r: any) => r?.phone_number && allPhones.add(r.phone_number));
-      resultRows.forEach((r: any) => (r?.phone_number || r?.phone) && allPhones.add(r.phone_number || r.phone));
-      dbConversations.forEach((c: any) => c?.metadata?.phone_number && allPhones.add(c.metadata.phone_number));
       recipientRows.forEach((r: any) => r?.conversation_id && allConversationIds.add(r.conversation_id));
       callRows.forEach((r: any) => (r?.conversation_id || r?.conversationId) && allConversationIds.add(r.conversation_id || r.conversationId));
       resultRows.forEach((r: any) => (r?.conversation_id || r?.conversationId || r?.id) && allConversationIds.add(r.conversation_id || r.conversationId || r.id));
@@ -1782,27 +1884,26 @@ export class BatchCallingController {
         return { status: raw || 'pending', failed_reason: '', end_reason: '' };
       };
 
-      const contacts = [...allPhones].map((phone) => {
+      const contacts = phoneOrdered.map((phone) => {
         const normalizedPhone = normalizePhoneForCompare(phone);
-        const statusRow = recipientRows.find((r: any) => normalizePhoneForCompare(r?.phone_number) === normalizedPhone) || byPhone.get(normalizedPhone) || {};
+        const statusRow = recipientByPhone.get(normalizedPhone) || byPhone.get(normalizedPhone) || {};
         const statusRecipientId = statusRow?.id ? String(statusRow.id) : '';
         const callRow =
-          callRows.find((r: any) => normalizePhoneForCompare(r?.phone_number || r?.phone) === normalizedPhone) ||
-          (statusRecipientId ? byRecipientId.get(statusRecipientId) : null) ||
-          {};
+          (statusRecipientId ? byRecipientId.get(statusRecipientId) : null) || {};
         const resultRow =
-          resultRows.find((r: any) => normalizePhoneForCompare(r?.phone_number || r?.phone) === normalizedPhone) ||
+          (includeTranscript ? resultByPhone.get(normalizedPhone) : null) ||
           (statusRecipientId ? byRecipientId.get(statusRecipientId) : null) ||
           {};
         const conversationId = statusRow?.conversation_id || callRow?.conversation_id || callRow?.conversationId || resultRow?.conversation_id || resultRow?.conversationId || resultRow?.id;
         const liveConversation = conversationId ? liveConversationMap.get(String(conversationId)) : null;
         const dbConversation = dbByPhone.get(phone) || (conversationId ? dbByConversationId.get(conversationId) : null);
         const customer = dbConversation?.customerId ? customerMap.get(String(dbConversation.customerId)) : null;
-        const transcript =
-          resultRow?.transcript ||
-          callRow?.transcript ||
-          dbConversation?.transcript ||
-          null;
+        const transcript = includeTranscript
+          ? resultRow?.transcript ||
+            callRow?.transcript ||
+            dbConversation?.transcript ||
+            null
+          : undefined;
 
         const dynamicVars = statusRow?.conversation_initiation_client_data?.dynamic_variables || {};
         const displayName = statusRow?.name || callRow?.name || resultRow?.name || dynamicVars.name || dynamicVars.customer_name || customer?.name || 'Unknown';
@@ -1934,7 +2035,9 @@ export class BatchCallingController {
             '';
           const durationSecondsRow =
             row?.metadata?.call_duration_secs || row?.call_duration_secs || dbConversation?.metadata?.duration_seconds || 0;
-          const transcriptRow = row?.transcript || dbConversation?.transcript || null;
+          const transcriptRow = includeTranscript
+            ? row?.transcript || dbConversation?.transcript || null
+            : undefined;
           const msgRow = dbConversation ? messageCountMap.get(String(dbConversation._id)) || 0 : 0;
           const hasTranscriptRow = (() => {
             const t = transcriptRow;
@@ -1996,6 +2099,12 @@ export class BatchCallingController {
           return (a.name || '').localeCompare(b.name || '');
         });
 
+      const totalContacts = mergedContacts.length;
+      const totalPages = Math.max(1, Math.ceil(totalContacts / pageSize));
+      const safePage = Math.min(page, totalPages);
+      const startIndex = (safePage - 1) * pageSize;
+      const pagedContacts = mergedContacts.slice(startIndex, startIndex + pageSize);
+
       res.status(200).json({
         success: true,
         data: {
@@ -2006,7 +2115,13 @@ export class BatchCallingController {
             live_total_calls_scheduled: statusResult?.total_calls_scheduled ?? batchCall.total_calls_scheduled,
             live_total_calls_finished: statusResult?.total_calls_finished ?? batchCall.total_calls_finished
           },
-          contacts: mergedContacts
+          contacts: pagedContacts,
+          pagination: {
+            page: safePage,
+            page_size: pageSize,
+            total_contacts: totalContacts,
+            total_pages: totalPages
+          }
         }
       });
     } catch (error) {

@@ -19,7 +19,13 @@ router.get('/:jobId/calls', batchCallingController.getBatchJobCalls);
 // GET /api/v1/batch-calling/:jobId/results - Get batch job results with transcripts (must be before /:jobId)
 router.get('/:jobId/results', batchCallingController.getBatchJobResults);
 
-// GET /api/v1/batch-calling/:jobId/details - Complete per-contact batch details
+// GET /api/v1/batch-calling/:jobId/contacts/:conversationId/transcript - Lazy-load one transcript
+router.get(
+  '/:jobId/contacts/:conversationId/transcript',
+  batchCallingController.getBatchContactTranscript
+);
+
+// GET /api/v1/batch-calling/:jobId/details - Paginated per-contact batch details (no bulk transcripts)
 router.get('/:jobId/details', batchCallingController.getBatchJobDetails);
 
 // GET /api/v1/batch-calling/:jobId - Get batch job status

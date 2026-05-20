@@ -35,6 +35,32 @@ User creates Email Template → Backend creates on elvenlabs-voiceagent → tool
 
 ---
 
+## Inbound Call → Booking Flow (manual wiring)
+
+If you already have a **2-node** inbound automation (trigger + digest Gmail) and want the same booking steps as outbound batch calls:
+
+1. Do **not** change the first two nodes (trigger + digest email).
+2. After the digest Gmail node, add these five actions in order:
+   - **Extract Appointment** — same `conversation_id`, prompt, and JSON example as your outbound flow
+   - **Condition** — `appointment.booked` equals `true`
+   - **Google Calendar – Create Event** — copy calendar settings from outbound
+   - **Google Sheets – Append Row** — copy `spreadsheetId`, sheet tab, and `useFixedFormat` from outbound
+   - **Gmail – Send Email** — confirmation to `{{contact.email}}` (same subject/body as outbound)
+
+Or use the prebuilt template **Inbound Call → Email Conversation Digest** (7 steps) and set `spreadsheetId` on the Sheets node to match outbound.
+
+**Verification**
+
+| Scenario | Expected |
+|----------|----------|
+| Call with booking in transcript | Digest email → calendar event → sheet row → confirmation email |
+| Call without booking | Digest email only; condition skips calendar, sheets, confirmation |
+| Logs | Event type `inbound_call_completed` (not `batch_call_completed`) |
+
+Optional test: `node backend/test_inbound_flow.js` (set automation id in script).
+
+---
+
 ## Batch Call Recipients
 
 The backend automatically adds to every recipient:

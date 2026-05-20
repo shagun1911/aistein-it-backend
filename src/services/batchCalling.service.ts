@@ -1,9 +1,16 @@
 import axios from 'axios';
 import { AppError } from '../middleware/error.middleware';
+import {
+  assertCommApiResponseData,
+  formatCommApiError,
+  getCommApiBaseUrl,
+  isCommApiCircuitOpen,
+  isCommApiUnavailableError,
+  recordCommApiFailure,
+  recordCommApiSuccess
+} from '../utils/commApiHealth';
 
-// Use PYTHON_API_URL if available (for elvenlabs-voiceagent), otherwise fall back to COMM_API_URL
-// This ensures consistency - if PYTHON_API_URL is set, use it for all Python API calls
-const COMM_API_URL = process.env.PYTHON_API_URL || process.env.COMM_API_URL || 'https://elvenlabs-voiceagent.onrender.com';
+const COMM_API_URL = getCommApiBaseUrl();
 
 export interface BatchCallRecipient {
   phone_number: string;
@@ -151,18 +158,32 @@ export class BatchCallingService {
    * Calls Python /api/v1/batch-calling/{job_id} endpoint
    */
   async getBatchJobStatus(jobId: string): Promise<BatchCallResponse> {
+    if (isCommApiCircuitOpen()) {
+      throw new AppError(
+        503,
+        'COMM_API_UNAVAILABLE',
+        'Comm API is temporarily unavailable; batch status sync is paused'
+      );
+    }
+
     try {
       const response = await axios.get<BatchCallResponse>(
         `${COMM_API_URL}/api/v1/batch-calling/${jobId}`,
         { timeout: 30000, headers: { 'Content-Type': 'application/json' } }
       );
+      assertCommApiResponseData(response.data, `batch status ${jobId}`);
+      recordCommApiSuccess();
       return response.data;
     } catch (error: any) {
-      console.error('[Batch Calling Service] ❌ Failed to get batch status:', jobId, error.response?.data || error.message);
+      if (isCommApiUnavailableError(error)) {
+        recordCommApiFailure(error);
+      }
+      const message = formatCommApiError(error, `batch status ${jobId}`);
+      console.error('[Batch Calling Service] ❌ Failed to get batch status:', jobId, message);
       throw new AppError(
-        error.response?.status || 500,
-        'BATCH_CALL_ERROR',
-        error.response?.data?.message || error.response?.data?.detail || 'Failed to get batch job status'
+        error.response?.status || (isCommApiUnavailableError(error) ? 503 : 500),
+        isCommApiUnavailableError(error) ? 'COMM_API_UNAVAILABLE' : 'BATCH_CALL_ERROR',
+        message
       );
     }
   }
@@ -493,6 +514,10 @@ export class BatchCallingService {
    *   3. When all recipients resolved → conversations_synced = true, stop polling
    */
   async syncBatchCallConversations(jobId: string, organizationId: string): Promise<void> {
+    if (isCommApiCircuitOpen()) {
+      return;
+    }
+
     if (this.syncLocks.has(jobId)) {
       return;
     }
@@ -522,7 +547,10 @@ export class BatchCallingService {
       try {
         batchStatus = await this.getBatchJobStatus(jobId);
       } catch (err: any) {
-        console.error(`[Batch Calling Service] ❌ Cannot fetch batch status: ${err.message}`);
+        await BatchCall.updateOne({ batch_call_id: jobId }, { $inc: { syncErrorCount: 1 } });
+        if (!isCommApiCircuitOpen()) {
+          console.error(`[Batch Calling Service] ❌ Cannot fetch batch status: ${err.message}`);
+        }
         return;
       }
 

@@ -72,6 +72,16 @@ router.post('/:platform/oauth/callback', socialIntegrationController.oauthCallba
 // All other routes require authentication
 router.use(authenticate);
 
+// Facebook Lead Ads form fields (must be before /:platform)
+router.get(
+  '/facebook/forms/:formId/fields',
+  socialIntegrationController.getFacebookFormFields.bind(socialIntegrationController)
+);
+router.post(
+  '/facebook/resubscribe-webhooks',
+  socialIntegrationController.resubscribeFacebookWebhooks.bind(socialIntegrationController)
+);
+
 // WhatsApp manual connection (without OAuth)
 router.post('/whatsapp/connect-manual', socialIntegrationController.connectWhatsAppManual.bind(socialIntegrationController));
 

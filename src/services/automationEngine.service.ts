@@ -629,6 +629,16 @@ export class AutomationEngine {
       }
     });
 
+    // Meta Lead Ads Trigger
+    this.triggers.set('meta_lead', {
+      validate: async (config, data) => {
+        return (
+          data.event === 'meta_lead' &&
+          String(data.form_id) === String(config.formId)
+        );
+      },
+    });
+
 
     this.triggers.set('shopify_order', {
       validate: async (config, data) => {
@@ -976,6 +986,116 @@ export class AutomationEngine {
         };
       }
     });
+
+    this.actions.set('aistein_meta_lead_batch_call', {
+    execute: async (config, triggerData, context: IAutomationExecutionContext) => {
+      const agentId = config.agentId || config.agent_id;
+      const phoneNumberId = config.phoneNumberId || config.phone_number_id;
+      const phoneField = config.phoneField;
+      const fieldMapping: Record<string, string> = config.fieldMapping || {};
+      const callNamePrefix = config.callNamePrefix || 'Meta Lead';
+      const leadData: Record<string, string> = triggerData?.data || {};
+
+      if (!agentId) throw new Error('Agent ID is required.');
+      if (!phoneNumberId) throw new Error('Phone number ID is required.');
+      if (!phoneField) throw new Error('Phone field mapping is required.');
+      if (!context?.userId || !context?.organizationId) {
+        throw new Error('User and organization context are required for Meta lead batch call.');
+      }
+
+      const phoneNumber = leadData[phoneField];
+      if (!phoneNumber || String(phoneNumber).trim() === '') {
+        throw new Error(`Lead is missing phone number in field "${phoneField}".`);
+      }
+
+      const dynamicVars: Record<string, string> = {};
+      for (const [metaField, agentVar] of Object.entries(fieldMapping)) {
+        const val = leadData[metaField];
+        if (val !== undefined && val !== null && String(val).trim() !== '') {
+          dynamicVars[agentVar] = String(val).trim();
+        }
+      }
+
+      const resolvedName =
+        dynamicVars.name ||
+        dynamicVars.customer_name ||
+        leadData.full_name ||
+        leadData.name ||
+        'Lead';
+      dynamicVars.name = dynamicVars.name || resolvedName;
+      dynamicVars.customer_name = dynamicVars.customer_name || resolvedName;
+      dynamicVars['contact.name'] = dynamicVars['contact.name'] || resolvedName;
+
+      const resolvedEmail =
+        dynamicVars.email ||
+        dynamicVars.customer_email ||
+        leadData.email ||
+        leadData.work_email ||
+        '';
+      if (resolvedEmail) {
+        dynamicVars.email = dynamicVars.email || resolvedEmail;
+        dynamicVars.customer_email = dynamicVars.customer_email || resolvedEmail;
+        dynamicVars['contact.email'] = dynamicVars['contact.email'] || resolvedEmail;
+      }
+
+      const phoneStr = String(phoneNumber).trim();
+      dynamicVars.phone = dynamicVars.phone || phoneStr;
+      dynamicVars.phone_number = dynamicVars.phone_number || phoneStr;
+      dynamicVars.customer_phone_number = dynamicVars.customer_phone_number || phoneStr;
+      dynamicVars['contact.phone_number'] = dynamicVars['contact.phone_number'] || phoneStr;
+
+      const recipient: any = {
+        phone_number: phoneStr,
+        name: resolvedName,
+        dynamic_variables: dynamicVars,
+      };
+      if (resolvedEmail) recipient.email = resolvedEmail;
+
+      const callName = `${callNamePrefix} - ${phoneStr || triggerData?.leadgen_id || 'Lead'}`;
+
+      console.info(`[Automation Engine] 📞 Meta lead batch call → ${phoneStr} (leadgen: ${triggerData?.leadgen_id || 'n/a'})`);
+
+      const { batchCallingService } = await import('../services/batchCalling.service');
+      const result = await batchCallingService.submitBatchCall({
+        agent_id: agentId,
+        phone_number_id: phoneNumberId,
+        call_name: callName,
+        recipients: [recipient],
+      });
+
+      const BatchCall = (await import('../models/BatchCall')).default;
+      await BatchCall.create({
+        userId: new mongoose.Types.ObjectId(context.userId.toString()),
+        organizationId: new mongoose.Types.ObjectId(context.organizationId.toString()),
+        batch_call_id: result.id,
+        name: result.name,
+        agent_id: result.agent_id,
+        status: result.status,
+        phone_number_id: result.phone_number_id,
+        phone_provider: result.phone_provider,
+        created_at_unix: result.created_at_unix,
+        scheduled_time_unix: result.scheduled_time_unix,
+        timezone: result.timezone || 'UTC',
+        total_calls_dispatched: result.total_calls_dispatched,
+        total_calls_scheduled: result.total_calls_scheduled,
+        total_calls_finished: result.total_calls_finished,
+        last_updated_at_unix: result.last_updated_at_unix,
+        retry_count: result.retry_count,
+        agent_name: result.agent_name,
+        call_name: callName,
+        recipients_count: 1,
+        conversations_synced: false,
+      });
+
+      return {
+        success: true,
+        total: 1,
+        batch_call_id: result.id,
+        status: 'submitted',
+        leadgen_id: triggerData?.leadgen_id,
+      };
+    },
+  });
 
     // Extract Data Action (supports dynamic extraction_prompt + json_example or legacy extraction_type)
     this.actions.set('aistein_extract_data', {
@@ -2536,7 +2656,8 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
           aistein_outbound_call: 'Outbound Call',
           aistein_api_call: 'API Call',
           aistein_create_contact: 'Create Contact',
-          aistein_batch_calling: 'Start Batch Calling'
+          aistein_batch_calling: 'Start Batch Calling',
+          aistein_meta_lead_batch_call: 'Place Batch Call (Meta Lead)',
         };
         return labels[service] || service.replace(/^aistein_/, '').replace(/^keplero_/, '').replace(/_/g, ' ');
       };

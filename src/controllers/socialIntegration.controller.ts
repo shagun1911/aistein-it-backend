@@ -1825,6 +1825,111 @@ export class SocialIntegrationController {
       next(error);
     }
   }
+
+  /**
+   * Fetch Meta Lead Ad form questions for automation trigger configuration.
+   */
+  async getFacebookFormFields(req: AuthRequest, res: Response, next: NextFunction) {
+    try {
+      const { formId } = req.params;
+      if (!formId) {
+        throw new AppError(400, 'INVALID_REQUEST', 'Form ID is required');
+      }
+
+      const organizationId = req.user?.organizationId || req.user?._id;
+      if (!organizationId) {
+        throw new AppError(401, 'UNAUTHORIZED', 'Organization ID not found');
+      }
+
+      const integration = await SocialIntegration.findOne({
+        organizationId,
+        platform: 'facebook',
+        status: 'connected',
+      }).sort({ updatedAt: -1 });
+
+      if (!integration) {
+        throw new AppError(404, 'NOT_FOUND', 'Facebook integration not connected');
+      }
+
+      let pageAccessToken = integration.credentials?.pageAccessToken;
+      if (!pageAccessToken && (integration as any).getDecryptedApiKey) {
+        pageAccessToken = (integration as any).getDecryptedApiKey();
+      }
+      if (!pageAccessToken) {
+        throw new AppError(400, 'INVALID_CREDENTIALS', 'Facebook page access token not found');
+      }
+
+      const axios = (await import('axios')).default;
+      const apiVersion = process.env.META_GRAPH_API_VERSION || 'v21.0';
+      const graphRes = await axios.get(`https://graph.facebook.com/${apiVersion}/${formId}`, {
+        params: {
+          fields: 'name,questions',
+          access_token: pageAccessToken,
+        },
+      });
+
+      const formName = graphRes.data?.name || '';
+      const questions = Array.isArray(graphRes.data?.questions) ? graphRes.data.questions : [];
+      const fields = questions.map((q: any) => ({
+        key: q.key || q.id || '',
+        label: q.label || q.key || q.id || '',
+        type: q.type || 'CUSTOM',
+      })).filter((f: { key: string }) => !!f.key);
+
+      res.json(successResponse({ formName, fields }, 'Form fields fetched successfully'));
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Re-subscribe all connected Facebook pages to webhook fields (includes leadgen).
+   */
+  async resubscribeFacebookWebhooks(req: AuthRequest, res: Response, next: NextFunction) {
+    try {
+      const organizationId = req.user?.organizationId || req.user?._id;
+      if (!organizationId) {
+        throw new AppError(401, 'UNAUTHORIZED', 'Organization ID not found');
+      }
+
+      const integrations = await SocialIntegration.find({
+        organizationId,
+        platform: 'facebook',
+        status: 'connected',
+      });
+
+      const metaAppId = process.env.META_APP_ID || '';
+      const metaAppSecret = process.env.META_APP_SECRET || '';
+      const metaOAuth = new MetaOAuthService({
+        appId: metaAppId,
+        appSecret: metaAppSecret,
+        redirectUri: '',
+      });
+
+      const results: Array<{ integrationId: string; pageId?: string; subscribed: boolean }> = [];
+      for (const integration of integrations) {
+        const pageId = integration.credentials?.facebookPageId;
+        let pageAccessToken = integration.credentials?.pageAccessToken;
+        if (!pageAccessToken && (integration as any).getDecryptedApiKey) {
+          pageAccessToken = (integration as any).getDecryptedApiKey();
+        }
+        if (!pageId || !pageAccessToken) {
+          results.push({ integrationId: integration._id.toString(), pageId, subscribed: false });
+          continue;
+        }
+        const subscribed = await metaOAuth.subscribePageToWebhooks(String(pageId), pageAccessToken);
+        if (subscribed) {
+          integration.webhookVerified = true;
+          await integration.save();
+        }
+        results.push({ integrationId: integration._id.toString(), pageId: String(pageId), subscribed });
+      }
+
+      res.json(successResponse({ results }, 'Facebook webhook re-subscription completed'));
+    } catch (error) {
+      next(error);
+    }
+  }
 }
 
 export default new SocialIntegrationController();

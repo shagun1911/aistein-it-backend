@@ -37,6 +37,7 @@ export const FACEBOOK_PAGE_SUBSCRIBED_FIELDS = [
   'messaging_postbacks',
   'messaging_optins',
   'messaging_referrals',
+  'leadgen',
 ] as const;
 
 export class MetaOAuthService {

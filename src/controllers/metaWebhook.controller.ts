@@ -612,6 +612,14 @@ export class MetaWebhookController {
           // Normalize to string so DB lookup matches (Meta may send id as number)
           const pageId = entry.id != null ? String(entry.id) : '';
           if (!pageId) continue;
+
+          // Meta Lead Ads — leadgen field changes
+          for (const change of entry.changes || []) {
+            if (change.field === 'leadgen' && change.value) {
+              console.log('[Messenger Webhook] Processing leadgen change:', JSON.stringify(change.value));
+              await this.handleLeadgenChange(change.value, pageId);
+            }
+          }
           
           // Python: for event in entry.get('messaging', []):
           for (const event of entry.messaging || []) {
@@ -637,6 +645,145 @@ export class MetaWebhookController {
     } catch (error) {
       console.error('[Messenger Webhook] Error processing webhook:', error);
       // Don't throw - we already sent 200 response
+    }
+  }
+
+  /**
+   * Flatten Meta lead field_data array into a key-value map.
+   */
+  private flattenFieldData(fieldData: Array<{ name?: string; values?: string[] }> | undefined): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const item of fieldData || []) {
+      const name = item.name;
+      if (!name) continue;
+      const values = item.values || [];
+      out[name] = values.length > 1 ? values.join(', ') : (values[0] ?? '');
+    }
+    return out;
+  }
+
+  /**
+   * Find connected Facebook integration by page ID (string or legacy number).
+   */
+  private async findFacebookIntegrationByPageId(pageId: string) {
+    const pageIdStr = String(pageId);
+    let integration = await SocialIntegration.findOne({
+      'credentials.facebookPageId': pageIdStr,
+      platform: 'facebook',
+      status: 'connected',
+      userId: { $exists: true, $ne: null },
+    }).sort({ updatedAt: -1 });
+
+    if (!integration && pageIdStr && !isNaN(Number(pageIdStr))) {
+      integration = await SocialIntegration.findOne({
+        'credentials.facebookPageId': Number(pageIdStr),
+        platform: 'facebook',
+        status: 'connected',
+        userId: { $exists: true, $ne: null },
+      }).sort({ updatedAt: -1 });
+    }
+
+    return integration;
+  }
+
+  /**
+   * Handle Meta Lead Ads leadgen webhook change.
+   */
+  private async handleLeadgenChange(value: any, pageId: string) {
+    try {
+      const leadgenId = value.leadgen_id != null ? String(value.leadgen_id) : '';
+      const formId = value.form_id != null ? String(value.form_id) : '';
+      const eventPageId = value.page_id != null ? String(value.page_id) : pageId;
+      const createdTime = value.created_time;
+
+      if (!leadgenId) {
+        console.warn('[Messenger Webhook] leadgen change missing leadgen_id');
+        return;
+      }
+
+      const integration = await this.findFacebookIntegrationByPageId(eventPageId || pageId);
+      if (!integration) {
+        console.warn(`[Messenger Webhook] No integration found for leadgen page_id: ${eventPageId || pageId}`);
+        return;
+      }
+
+      if (!integration.userId) {
+        console.error('[Messenger Webhook] Integration missing userId for leadgen');
+        return;
+      }
+
+      const MetaLead = (await import('../models/MetaLead')).default;
+      try {
+        await MetaLead.create({
+          leadgen_id: leadgenId,
+          form_id: formId || undefined,
+          page_id: eventPageId || pageId,
+          organizationId: integration.organizationId || undefined,
+        });
+      } catch (dedupeErr: any) {
+        if (dedupeErr?.code === 11000) {
+          console.log(`[Messenger Webhook] ⏭️ Skipping duplicate leadgen_id: ${leadgenId}`);
+          return;
+        }
+        throw dedupeErr;
+      }
+
+      let pageAccessToken = integration.credentials?.pageAccessToken;
+      if (!pageAccessToken && (integration as any).getDecryptedApiKey) {
+        pageAccessToken = (integration as any).getDecryptedApiKey();
+      }
+      if (!pageAccessToken) {
+        console.error('[Messenger Webhook] No page access token for leadgen fetch');
+        return;
+      }
+
+      const apiVersion = process.env.META_GRAPH_API_VERSION || 'v21.0';
+      const graphUrl = `https://graph.facebook.com/${apiVersion}/${leadgenId}`;
+      const graphRes = await axios.get(graphUrl, {
+        params: {
+          fields: 'created_time,field_data,form_id,page_id',
+          access_token: pageAccessToken,
+        },
+      });
+
+      const leadPayload = graphRes.data || {};
+      const flattened = this.flattenFieldData(leadPayload.field_data);
+      const resolvedFormId = formId || (leadPayload.form_id != null ? String(leadPayload.form_id) : '');
+      const resolvedPageId = eventPageId || (leadPayload.page_id != null ? String(leadPayload.page_id) : pageId);
+
+      const orgContext = await this.resolveOrgContextFromIntegration(integration);
+      const organizationId =
+        integration.organizationId?.toString() ||
+        orgContext?.organization?._id?.toString() ||
+        orgContext?.users?.[0]?.organizationId?.toString() ||
+        integration.userId.toString();
+      const userId = integration.userId.toString();
+
+      const { automationEngine } = await import('../services/automationEngine.service');
+      const automationData = {
+        event: 'meta_lead',
+        form_id: resolvedFormId,
+        page_id: resolvedPageId,
+        leadgen_id: leadgenId,
+        created_time: createdTime || leadPayload.created_time,
+        data: flattened,
+        organizationId,
+        userId,
+        source: 'meta_lead',
+      };
+      const context = { organizationId, userId };
+
+      console.log('[Messenger Webhook] ✅ Triggering meta_lead automation:', {
+        leadgenId,
+        formId: resolvedFormId,
+        fieldCount: Object.keys(flattened).length,
+      });
+
+      automationEngine
+        .triggerByEvent('meta_lead', automationData, context)
+        .catch((err) => console.error('[Messenger Webhook] meta_lead automation trigger error:', err));
+    } catch (error: any) {
+      console.error('[Messenger Webhook] Error handling leadgen change:', error.response?.data || error.message || error);
     }
   }
 

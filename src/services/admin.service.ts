@@ -15,6 +15,24 @@ import { usageTrackerService } from './usage/usageTracker.service';
 import mongoose from 'mongoose';
 import Plan from '../models/Plan';
 
+const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:metrics';
+const ADMIN_DASHBOARD_CACHE_TTL_SEC = 300;
+
+const adminDashboardLocalCache = new Map<string, { value: any; expiresAt: number }>();
+
+function getAdminDashboardFromLocalCache(): any | null {
+  const entry = adminDashboardLocalCache.get(ADMIN_DASHBOARD_CACHE_KEY);
+  if (entry && entry.expiresAt > Date.now()) return entry.value;
+  if (entry) adminDashboardLocalCache.delete(ADMIN_DASHBOARD_CACHE_KEY);
+  return null;
+}
+
+function setAdminDashboardLocalCache(value: any): void {
+  adminDashboardLocalCache.set(ADMIN_DASHBOARD_CACHE_KEY, {
+    value,
+    expiresAt: Date.now() + ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000
+  });
+}
 
 export class AdminService {
   /**
@@ -22,6 +40,17 @@ export class AdminService {
    */
   async getDashboardMetrics() {
     try {
+      try {
+        const { default: redisClient, isRedisAvailable } = await import('../config/redis');
+        if (isRedisAvailable()) {
+          const cached = await redisClient.get(ADMIN_DASHBOARD_CACHE_KEY);
+          if (cached) return JSON.parse(cached);
+        }
+      } catch (_) { /* fall through to compute */ }
+
+      const localHit = getAdminDashboardFromLocalCache();
+      if (localHit) return localHit;
+
       const [
         totalOrganizations,
         activeOrganizations,
@@ -35,24 +64,24 @@ export class AdminService {
         instagramIntegrations,
         facebookIntegrations,
         ecommerceIntegrations,
-        platformMetrics
+        platformUsage
       ] = await Promise.all([
-        Organization.countDocuments({ status: { $ne: 'deleted' } }).lean(),
-        Organization.countDocuments({ status: 'active' }).lean(),
-        User.countDocuments({ status: 'active' }).lean(),
-        Automation.countDocuments().lean(),
-        Automation.countDocuments({ isActive: true }).lean(),
-        AutomationExecution.countDocuments().lean(),
-        AutomationExecution.countDocuments({ status: 'failed' }).lean(),
-        GoogleIntegration.countDocuments({ status: 'active' }).lean(),
-        SocialIntegration.countDocuments({ platform: 'whatsapp', status: 'connected' }).lean(),
-        SocialIntegration.countDocuments({ platform: 'instagram', status: 'connected' }).lean(),
-        SocialIntegration.countDocuments({ platform: 'facebook', status: 'connected' }).lean(),
-        Settings.countDocuments({ 'ecommerceIntegration.platform': { $exists: true, $ne: null } }).lean(),
-        analyticsService.getSimpleMetrics()
+        Organization.countDocuments({ status: { $ne: 'deleted' } }),
+        Organization.countDocuments({ status: 'active' }),
+        User.countDocuments({ status: 'active' }),
+        Automation.countDocuments(),
+        Automation.countDocuments({ isActive: true }),
+        AutomationExecution.countDocuments(),
+        AutomationExecution.countDocuments({ status: 'failed' }),
+        GoogleIntegration.countDocuments({ status: 'active' }),
+        SocialIntegration.countDocuments({ platform: 'whatsapp', status: 'connected' }),
+        SocialIntegration.countDocuments({ platform: 'instagram', status: 'connected' }),
+        SocialIntegration.countDocuments({ platform: 'facebook', status: 'connected' }),
+        Settings.countDocuments({ 'ecommerceIntegration.platform': { $exists: true, $ne: null } }),
+        usageTrackerService.getPlatformUsageSummary()
       ]);
 
-      return {
+      const metrics = {
         totalOrganizations,
         activeOrganizations,
         totalUsers,
@@ -65,9 +94,20 @@ export class AdminService {
         instagramIntegrations,
         facebookIntegrations,
         ecommerceIntegrations,
-        totalCallMinutes: platformMetrics.callMinutes,
-        totalChatConversations: platformMetrics.totalConversations
+        totalCallMinutes: platformUsage.callMinutes,
+        totalChatConversations: platformUsage.chatConversations
       };
+
+      setAdminDashboardLocalCache(metrics);
+
+      try {
+        const { default: redisClient, isRedisAvailable } = await import('../config/redis');
+        if (isRedisAvailable()) {
+          await redisClient.setEx(ADMIN_DASHBOARD_CACHE_KEY, ADMIN_DASHBOARD_CACHE_TTL_SEC, JSON.stringify(metrics));
+        }
+      } catch (_) { /* cache write is best-effort */ }
+
+      return metrics;
     } catch (error: any) {
       logger.error('Failed to get dashboard metrics', { error: error.message });
       throw error;

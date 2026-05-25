@@ -505,6 +505,100 @@ export class UsageTrackerService {
       return { locked: false, reason: null };
     }
   }
+
+  /**
+   * Platform-wide call minutes for admin dashboard.
+   * Uses MongoDB aggregation only — never loads transcript blobs into Node memory.
+   */
+  async calculatePlatformCallMinutes(): Promise<number> {
+    try {
+      const result = await Conversation.aggregate([
+        { $match: { channel: 'phone' } },
+        {
+          $project: {
+            durationSeconds: {
+              $cond: {
+                if: { $and: [{ $gt: ['$callDurationSeconds', 0] }, { $lte: ['$callDurationSeconds', 7200] }] },
+                then: '$callDurationSeconds',
+                else: {
+                  $cond: {
+                    if: {
+                      $and: [
+                        { $gt: [{ $subtract: ['$updatedAt', '$createdAt'] }, 0] },
+                        { $lte: [{ $subtract: ['$updatedAt', '$createdAt'] }, 7200000] }
+                      ]
+                    },
+                    then: { $divide: [{ $subtract: ['$updatedAt', '$createdAt'] }, 1000] },
+                    else: 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            totalSeconds: { $sum: '$durationSeconds' }
+          }
+        }
+      ]);
+
+      if (!result.length) return 0;
+      return Math.ceil(result[0].totalSeconds / 60);
+    } catch (error: any) {
+      logger.error('[Usage Tracker] Error calculating platform call minutes:', error.message);
+      return 0;
+    }
+  }
+
+  /**
+   * Platform-wide completed chat conversations for admin dashboard.
+   * A conversation counts when it has at least one customer message and one AI reply (non-phone).
+   */
+  async calculatePlatformChatConversations(): Promise<number> {
+    try {
+      const result = await Message.aggregate([
+        { $match: { type: 'message', sender: { $in: ['customer', 'ai'] } } },
+        {
+          $group: {
+            _id: '$conversationId',
+            hasCustomer: { $max: { $cond: [{ $eq: ['$sender', 'customer'] }, 1, 0] } },
+            hasAi: { $max: { $cond: [{ $eq: ['$sender', 'ai'] }, 1, 0] } }
+          }
+        },
+        { $match: { hasCustomer: 1, hasAi: 1 } },
+        {
+          $lookup: {
+            from: 'conversations',
+            localField: '_id',
+            foreignField: '_id',
+            as: 'conv',
+            pipeline: [{ $project: { channel: 1 } }]
+          }
+        },
+        { $unwind: '$conv' },
+        { $match: { 'conv.channel': { $ne: 'phone' } } },
+        { $count: 'total' }
+      ]);
+
+      return result[0]?.total || 0;
+    } catch (error: any) {
+      logger.error('[Usage Tracker] Error calculating platform chat conversations:', error.message);
+      return 0;
+    }
+  }
+
+  /**
+   * Fast platform usage summary for admin dashboard hot path.
+   */
+  async getPlatformUsageSummary(): Promise<{ callMinutes: number; chatConversations: number }> {
+    const [callMinutes, chatConversations] = await Promise.all([
+      this.calculatePlatformCallMinutes(),
+      this.calculatePlatformChatConversations()
+    ]);
+    return { callMinutes, chatConversations };
+  }
 }
 
 export const usageTrackerService = new UsageTrackerService();

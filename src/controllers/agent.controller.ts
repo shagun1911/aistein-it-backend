@@ -19,7 +19,12 @@ export class AgentController {
         system_prompt,
         language,
         voice_id,
-        knowledge_base_ids
+        knowledge_base_ids,
+        escalationRules,
+        built_in_tools,
+        built_in_tool_details,
+        enable_human_transfer,
+        human_transfer_rules
       } = req.body;
 
       // Validation
@@ -63,7 +68,12 @@ export class AgentController {
         system_prompt: systemPromptResult.normalized.trim(),
         language: language.trim(),
         voice_id: voice_id?.trim(),
-        knowledge_base_ids: filteredKnowledgeBaseIds
+        knowledge_base_ids: filteredKnowledgeBaseIds,
+        escalationRules: Array.isArray(escalationRules) ? escalationRules : undefined,
+        built_in_tools,
+        built_in_tool_details,
+        enable_human_transfer,
+        human_transfer_rules: Array.isArray(human_transfer_rules) ? human_transfer_rules : undefined
       });
 
       console.log('Agent created successfully', agent);

@@ -336,7 +336,77 @@ export class AgentService {
     return 'eleven_flash_v2';
   }
 
-  private buildSafePromptSyncBody(agent: any, _toolIds: string[]): Record<string, any> {
+  /**
+   * Merge env-configured tool IDs with those stored on the agent document.
+   */
+  private resolvePromptToolIds(toolIdsFromEnv: string[], agent?: { tool_ids?: string[] } | null): string[] {
+    const merged = [...(toolIdsFromEnv || []), ...((agent?.tool_ids as string[] | undefined) || [])];
+    return [...new Set(merged.filter((id) => typeof id === 'string' && id.trim() !== ''))];
+  }
+
+  /**
+   * Our Python/ElevenLabs proxy rejects a single PATCH that includes both `tool_ids` and
+   * `built_in_tools` (it maps built-ins to legacy `tools`). Attach exactly one mode per request.
+   */
+  private attachToolsToPromptPatchBody(
+    body: Record<string, unknown>,
+    effectiveToolIds: string[],
+    builtInToolsPayload: Record<string, BuiltInToolPromptPayload>
+  ): 'tool_ids' | 'built_in_tools' | 'none' {
+    const hasToolIds = effectiveToolIds.length > 0;
+    const hasBuiltIns = Object.keys(builtInToolsPayload).length > 0;
+
+    // Always explicitly clear legacy `tools` array – upstream rejects requests where
+    // BOTH `tools` and `tool_ids` are present (stale data on the proxy/agent record).
+    body.tools = [];
+
+    if (hasToolIds) {
+      body.tool_ids = effectiveToolIds;
+      return 'tool_ids';
+    }
+    if (hasBuiltIns) {
+      body.built_in_tools = builtInToolsPayload;
+      return 'built_in_tools';
+    }
+    return 'none';
+  }
+
+  /**
+   * If the primary PATCH fails because upstream still has legacy `tools` populated,
+   * retry without `tool_ids` / `built_in_tools` and only the prompt fields.
+   * The agent keeps whatever tools were already configured upstream.
+   */
+  private isToolsTooIdsConflictError(error: any): boolean {
+    const detail = error?.response?.data?.detail;
+    const text = typeof detail === 'string' ? detail : error?.message || '';
+    return /both\s+tools\s+and\s+tool\s+ids/i.test(text);
+  }
+
+  /** Second PATCH for built-in tools when the primary PATCH used tool_ids (proxy limitation). */
+  private async patchBuiltInToolsOnlyOnPython(
+    agentId: string,
+    builtInToolsPayload: Record<string, BuiltInToolPromptPayload>
+  ): Promise<void> {
+    if (Object.keys(builtInToolsPayload).length === 0) return;
+
+    const pythonUrl = `${PYTHON_API_BASE_URL}/api/v1/agents/${agentId}/prompt`;
+    try {
+      await axios.patch(
+        pythonUrl,
+        { tools: [], built_in_tools: builtInToolsPayload },
+        { timeout: 30000, headers: { 'Content-Type': 'application/json' } }
+      );
+      console.log('[Agent Service] ✅ Built-in tools synced in follow-up PATCH for', agentId);
+    } catch (error: any) {
+      const detail = error.response?.data?.detail || error.message;
+      console.warn(
+        `[Agent Service] ⚠️ Built-in tools follow-up PATCH skipped for ${agentId} (non-fatal):`,
+        detail
+      );
+    }
+  }
+
+  private buildSafePromptSyncBody(agent: any, toolIds: string[]): Record<string, any> {
     const dbFirst = typeof agent?.first_message === 'string' ? agent.first_message.trim() : '';
     const dbGreeting = typeof agent?.greeting_message === 'string' ? agent.greeting_message.trim() : '';
     const dbSystem = typeof agent?.system_prompt === 'string' ? agent.system_prompt.trim() : '';
@@ -348,11 +418,14 @@ export class AgentService {
       dbGreeting ||
       'Hello! How can I help you today?';
 
+    const effectiveToolIds = this.resolvePromptToolIds(toolIds, agent);
+
     return {
       first_message: firstMessageSafe,
       system_prompt: dbSystem + COLLECT_ONLY_INSTRUCTION,
       language: agent?.language || 'en',
       knowledge_base_ids: agent?.knowledge_base_ids || [],
+      tool_ids: effectiveToolIds,
       ...(agent?.voice_id ? { voice_id: agent.voice_id } : {})
     };
   }
@@ -368,7 +441,8 @@ export class AgentService {
     firstMessageToSend: string,
     systemPromptToSend: string,
     validKnowledgeBaseIds: string[],
-    persistedAgent: IAgent
+    persistedAgent: IAgent,
+    toolIds: string[]
   ): Promise<void> {
     const postCallWebhookUrl = process.env.POST_CALL_WEBHOOK_URL?.trim();
 
@@ -387,14 +461,20 @@ export class AgentService {
     );
     const builtInToolsPayload = buildBuiltInToolsPythonPayload(mergedBuiltInInput, builtInToolFlags);
 
+    const effectiveToolIds = this.resolvePromptToolIds(toolIds, persistedAgent);
+
     const requestBody: Record<string, unknown> = {
-      built_in_tools: builtInToolsPayload,
       first_message: firstMessageToSend,
       knowledge_base_ids: validKnowledgeBaseIds,
       language: data.language,
       name: data.name,
       system_prompt: systemPromptToSend
     };
+    const toolsMode = this.attachToolsToPromptPatchBody(
+      requestBody,
+      effectiveToolIds,
+      builtInToolsPayload
+    );
 
     if (postCallWebhookUrl) {
       requestBody.post_call_webhook_url = postCallWebhookUrl;
@@ -422,6 +502,10 @@ export class AgentService {
       timeout: 30000,
       headers: { 'Content-Type': 'application/json' }
     });
+
+    if (toolsMode === 'tool_ids') {
+      await this.patchBuiltInToolsOnlyOnPython(agentId, builtInToolsPayload);
+    }
   }
 
   /**
@@ -807,7 +891,8 @@ export class AgentService {
           firstMessageToSend,
           systemPromptToSend,
           validKnowledgeBaseIds,
-          agent
+          agent,
+          toolIds
         );
       } catch (error: any) {
         console.error('[Agent Service] ⚠️ Failed PATCH /agents/{id}/prompt after create (non-fatal):', error.response?.data || error.message);
@@ -967,14 +1052,19 @@ export class AgentService {
     );
     const builtInToolsPayload = buildBuiltInToolsPythonPayload(mergedBuiltInInput, builtInToolFlags);
 
-    // PATCH body: explicit keys only — never tool_ids (built_in_tools only for tools).
+    const effectiveToolIds = this.resolvePromptToolIds(toolIds, agent);
+
     const patchBody: Record<string, unknown> = {
       first_message: firstMessageToSend,
       system_prompt: systemPromptToSend,
       language: data.language,
-      knowledge_base_ids: validKnowledgeBaseIds,
-      built_in_tools: builtInToolsPayload
+      knowledge_base_ids: validKnowledgeBaseIds
     };
+    const toolsMode = this.attachToolsToPromptPatchBody(
+      patchBody,
+      effectiveToolIds,
+      builtInToolsPayload
+    );
 
     if (data.voice_id !== undefined) {
       patchBody.voice_id = data.voice_id;
@@ -1005,16 +1095,40 @@ export class AgentService {
       has_voice_id: !!data.voice_id
     });
     console.log('[Agent Service] 🎤 Voice ID being sent to Python API:', data.voice_id);
+    console.log('[Agent Service] 📦 PATCH tools mode:', toolsMode);
     console.log('[Agent Service] 📦 PATCH /agents/.../prompt body:', JSON.stringify(patchBody, null, 2));
 
     try {
       const pythonUrl = `${PYTHON_API_BASE_URL}/api/v1/agents/${agentId}/prompt`;
       console.log('[Agent Service] 🔗 Python API URL:', pythonUrl);
 
-      const response = await axios.patch<UpdateAgentPromptResponse>(pythonUrl, patchBody, {
-        timeout: 30000,
-        headers: { 'Content-Type': 'application/json' }
-      });
+      let response;
+      try {
+        response = await axios.patch<UpdateAgentPromptResponse>(pythonUrl, patchBody, {
+          timeout: 30000,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (primaryErr: any) {
+        // Upstream still rejecting "tools vs tool_ids" – retry with prompt-only body so
+        // the user's prompt/voice/KB edits still go through. Tools stay as-is upstream.
+        if (this.isToolsTooIdsConflictError(primaryErr)) {
+          console.warn(
+            '[Agent Service] ⚠️ Upstream rejected tool fields, retrying prompt-only PATCH',
+            { agent_id: agentId, detail: primaryErr?.response?.data?.detail }
+          );
+          const fallbackBody: Record<string, unknown> = { ...patchBody };
+          delete fallbackBody.tool_ids;
+          delete fallbackBody.built_in_tools;
+          delete fallbackBody.tools;
+          response = await axios.patch<UpdateAgentPromptResponse>(pythonUrl, fallbackBody, {
+            timeout: 30000,
+            headers: { 'Content-Type': 'application/json' }
+          });
+          console.log('[Agent Service] ✅ Prompt-only fallback PATCH succeeded');
+        } else {
+          throw primaryErr;
+        }
+      }
 
       console.log('[Agent Service] 📥 Python API response:', JSON.stringify(response.data, null, 2));
 
@@ -1022,7 +1136,12 @@ export class AgentService {
         throw new AppError(500, 'INVALID_RESPONSE', 'Python API did not return agent_id');
       }
 
-      if (toolIds.length > 0) {
+      if (toolsMode === 'tool_ids') {
+        await this.patchBuiltInToolsOnlyOnPython(agentId, builtInToolsPayload);
+      }
+
+      const idsForToolNode = effectiveToolIds.length > 0 ? effectiveToolIds : toolIds;
+      if (idsForToolNode.length > 0) {
         await this.enableToolNodeForAgent(agentId);
       }
 

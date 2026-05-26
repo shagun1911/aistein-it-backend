@@ -8,7 +8,7 @@ const ENCRYPTION_ALGORITHM = 'aes-256-cbc';
 export interface ISocialIntegration extends Document {
   userId: mongoose.Types.ObjectId; // REQUIRED: User who owns this integration
   organizationId: mongoose.Types.ObjectId;
-  platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail';
+  platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail' | 'meta_leads';
   status: 'connected' | 'disconnected' | 'error';
   credentials: {
     apiKey: string; // Encrypted USER token
@@ -53,7 +53,7 @@ const SocialIntegrationSchema = new Schema<ISocialIntegration>(
     },
     platform: {
       type: String,
-      enum: ['whatsapp', 'instagram', 'facebook', 'gmail'],
+      enum: ['whatsapp', 'instagram', 'facebook', 'gmail', 'meta_leads'],
       required: true
     },
     status: {

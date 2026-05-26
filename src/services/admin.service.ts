@@ -15,10 +15,11 @@ import { usageTrackerService } from './usage/usageTracker.service';
 import mongoose from 'mongoose';
 import Plan from '../models/Plan';
 
-const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:metrics';
+const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:metrics:v2';
 const ADMIN_DASHBOARD_CACHE_TTL_SEC = 300;
 
 const adminDashboardLocalCache = new Map<string, { value: any; expiresAt: number }>();
+const platformUsageLocalCache = new Map<string, { value: { callMinutes: number; chatConversations: number }; expiresAt: number }>();
 
 function getAdminDashboardFromLocalCache(): any | null {
   const entry = adminDashboardLocalCache.get(ADMIN_DASHBOARD_CACHE_KEY);
@@ -34,7 +35,65 @@ function setAdminDashboardLocalCache(value: any): void {
   });
 }
 
+function platformUsageCacheKey(dateRange?: { dateFrom?: Date; dateTo?: Date }): string {
+  const from = dateRange?.dateFrom?.toISOString() ?? 'all';
+  const to = dateRange?.dateTo?.toISOString() ?? 'all';
+  return `admin:platform:usage:${from}:${to}`;
+}
+
 export class AdminService {
+  /**
+   * Platform call minutes + completed chat conversations — same source as Usage Reports.
+   * Uses analyticsService.getSimpleMetrics (callMetrics + chatMetrics services).
+   */
+  async getPlatformUsageTotals(dateRange?: { dateFrom?: Date; dateTo?: Date }): Promise<{
+    callMinutes: number;
+    chatConversations: number;
+  }> {
+    const cacheKey = platformUsageCacheKey(dateRange);
+
+    const localHit = platformUsageLocalCache.get(cacheKey);
+    if (localHit && localHit.expiresAt > Date.now()) {
+      return localHit.value;
+    }
+    if (localHit) platformUsageLocalCache.delete(cacheKey);
+
+    try {
+      const { default: redisClient, isRedisAvailable } = await import('../config/redis');
+      if (isRedisAvailable()) {
+        const cached = await redisClient.get(cacheKey);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          platformUsageLocalCache.set(cacheKey, {
+            value: parsed,
+            expiresAt: Date.now() + ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000
+          });
+          return parsed;
+        }
+      }
+    } catch (_) { /* fall through */ }
+
+    const metrics = await analyticsService.getSimpleMetrics(undefined, undefined, dateRange);
+    const result = {
+      callMinutes: metrics.callMinutes ?? 0,
+      chatConversations: metrics.totalConversations ?? 0
+    };
+
+    platformUsageLocalCache.set(cacheKey, {
+      value: result,
+      expiresAt: Date.now() + ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000
+    });
+
+    try {
+      const { default: redisClient, isRedisAvailable } = await import('../config/redis');
+      if (isRedisAvailable()) {
+        await redisClient.setEx(cacheKey, ADMIN_DASHBOARD_CACHE_TTL_SEC, JSON.stringify(result));
+      }
+    } catch (_) { /* best-effort */ }
+
+    return result;
+  }
+
   /**
    * Get dashboard metrics (platform-wide, all-time)
    */
@@ -78,7 +137,7 @@ export class AdminService {
         SocialIntegration.countDocuments({ platform: 'instagram', status: 'connected' }),
         SocialIntegration.countDocuments({ platform: 'facebook', status: 'connected' }),
         Settings.countDocuments({ 'ecommerceIntegration.platform': { $exists: true, $ne: null } }),
-        usageTrackerService.getPlatformUsageSummary()
+        this.getPlatformUsageTotals()
       ]);
 
       const metrics = {
@@ -576,11 +635,11 @@ export class AdminService {
         dateTo: dateTo ? new Date(dateTo) : undefined
       } : undefined;
 
-      // Get platform-wide metrics
-      const adminMetrics = await analyticsService.getAdminMetrics(range);
-
-      // Get all organizations for usage breakdown
-      const organizations = await Organization.find({ status: { $ne: 'deleted' } }).lean();
+      // Platform totals — same calculation as admin dashboard (Usage Reports header cards)
+      const [platformTotals, organizations] = await Promise.all([
+        this.getPlatformUsageTotals(range),
+        Organization.find({ status: { $ne: 'deleted' } }).lean()
+      ]);
       
       // Get usage by organization
       const usageByOrganization = await Promise.all(
@@ -624,8 +683,8 @@ export class AdminService {
       });
 
       return {
-        totalCallMinutes: adminMetrics.platformWide.callMetrics.totalCallMinutes || 0,
-        totalChatConversations: adminMetrics.platformWide.chatMetrics.totalConversations || 0,
+        totalCallMinutes: platformTotals.callMinutes,
+        totalChatConversations: platformTotals.chatConversations,
         usageByOrganization,
         conversationsByChannel
       };

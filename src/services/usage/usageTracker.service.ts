@@ -589,16 +589,6 @@ export class UsageTrackerService {
     }
   }
 
-  /**
-   * Fast platform usage summary for admin dashboard hot path.
-   */
-  async getPlatformUsageSummary(): Promise<{ callMinutes: number; chatConversations: number }> {
-    const [callMinutes, chatConversations] = await Promise.all([
-      this.calculatePlatformCallMinutes(),
-      this.calculatePlatformChatConversations()
-    ]);
-    return { callMinutes, chatConversations };
-  }
 }
 
 export const usageTrackerService = new UsageTrackerService();

@@ -7,6 +7,7 @@ import Conversation from '../../models/Conversation';
 import mongoose from 'mongoose';
 import { logger } from '../../utils/logger.util';
 import { CallMetrics, DateRange } from './analytics.types';
+import { usageTrackerService } from '../usage/usageTracker.service';
 
 export class CallMetricsService {
   /**
@@ -141,52 +142,24 @@ export class CallMetricsService {
         organizationId: new mongoose.Types.ObjectId(organizationId),
         channel: 'phone'
       };
-
-      // Add date filter if provided
       if (dateRange?.dateFrom || dateRange?.dateTo) {
         query.createdAt = {};
-        if (dateRange.dateFrom) {
-          query.createdAt.$gte = new Date(dateRange.dateFrom);
-        }
-        if (dateRange.dateTo) {
-          query.createdAt.$lte = new Date(dateRange.dateTo);
-        }
+        if (dateRange.dateFrom) query.createdAt.$gte = new Date(dateRange.dateFrom);
+        if (dateRange.dateTo) query.createdAt.$lte = new Date(dateRange.dateTo);
       }
 
-      const phoneConversations = await Conversation.find(query)
-        .select('transcript metadata createdAt updatedAt')
-        .lean();
-
-      let totalCallMinutes = 0;
-      let callsWithTranscript = 0;
-      let callsWithoutTranscript = 0;
-      let callsWithValidDuration = 0;
-
-      for (const conv of phoneConversations) {
-        const duration = this.getCallDuration(conv);
-
-        if (duration !== null && duration > 0) {
-          totalCallMinutes += duration;
-          callsWithValidDuration++;
-        }
-
-        if (conv.transcript && conv.transcript.items && conv.transcript.items.length > 0) {
-          callsWithTranscript++;
-        } else {
-          callsWithoutTranscript++;
-        }
-      }
-
-      const totalCalls = phoneConversations.length;
-      const averageCallDuration = callsWithValidDuration > 0 ? totalCallMinutes / callsWithValidDuration : 0;
+      const [totalCallMinutes, totalCalls] = await Promise.all([
+        usageTrackerService.calculateCallMinutes(organizationId, dateRange),
+        Conversation.countDocuments(query)
+      ]);
 
       return {
         totalCallMinutes,
         totalCalls,
-        callsWithValidDuration,
-        averageCallDuration: Math.round(averageCallDuration * 100) / 100, // Round to 2 decimals
-        callsWithTranscript,
-        callsWithoutTranscript
+        callsWithValidDuration: totalCalls,
+        averageCallDuration: totalCalls > 0 ? Math.round((totalCallMinutes / totalCalls) * 100) / 100 : 0,
+        callsWithTranscript: 0,
+        callsWithoutTranscript: totalCalls
       };
     } catch (error: any) {
       logger.error('[CallMetrics] Error getting organization call metrics:', error.message);
@@ -229,52 +202,24 @@ export class CallMetricsService {
   async getPlatformCallMetrics(dateRange?: DateRange): Promise<CallMetrics> {
     try {
       const query: any = { channel: 'phone' };
-
-      // Add date filter if provided
       if (dateRange?.dateFrom || dateRange?.dateTo) {
         query.createdAt = {};
-        if (dateRange.dateFrom) {
-          query.createdAt.$gte = new Date(dateRange.dateFrom);
-        }
-        if (dateRange.dateTo) {
-          query.createdAt.$lte = new Date(dateRange.dateTo);
-        }
+        if (dateRange.dateFrom) query.createdAt.$gte = new Date(dateRange.dateFrom);
+        if (dateRange.dateTo) query.createdAt.$lte = new Date(dateRange.dateTo);
       }
 
-      const phoneConversations = await Conversation.find(query)
-        .select('transcript metadata createdAt updatedAt')
-        .lean();
-
-      let totalCallMinutes = 0;
-      let callsWithTranscript = 0;
-      let callsWithoutTranscript = 0;
-      let callsWithValidDuration = 0;
-
-      for (const conv of phoneConversations) {
-        const duration = this.getCallDuration(conv);
-
-        if (duration !== null && duration > 0) {
-          totalCallMinutes += duration;
-          callsWithValidDuration++;
-        }
-
-        if (conv.transcript && conv.transcript.items && conv.transcript.items.length > 0) {
-          callsWithTranscript++;
-        } else {
-          callsWithoutTranscript++;
-        }
-      }
-
-      const totalCalls = phoneConversations.length;
-      const averageCallDuration = callsWithValidDuration > 0 ? totalCallMinutes / callsWithValidDuration : 0;
+      const [totalCallMinutes, totalCalls] = await Promise.all([
+        usageTrackerService.calculatePlatformCallMinutes(dateRange),
+        Conversation.countDocuments(query)
+      ]);
 
       return {
         totalCallMinutes,
         totalCalls,
-        callsWithValidDuration,
-        averageCallDuration: Math.round(averageCallDuration * 100) / 100,
-        callsWithTranscript,
-        callsWithoutTranscript
+        callsWithValidDuration: totalCalls,
+        averageCallDuration: totalCalls > 0 ? Math.round((totalCallMinutes / totalCalls) * 100) / 100 : 0,
+        callsWithTranscript: 0,
+        callsWithoutTranscript: totalCalls
       };
     } catch (error: any) {
       logger.error('[CallMetrics] Error getting platform call metrics:', error.message);

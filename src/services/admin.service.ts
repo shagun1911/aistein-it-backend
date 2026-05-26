@@ -10,12 +10,11 @@ import Conversation from '../models/Conversation';
 import Message from '../models/Message';
 import { profileService } from './profile.service';
 import { logger } from '../utils/logger.util';
-import { analyticsService } from './analytics/analytics.service';
-import { usageTrackerService } from './usage/usageTracker.service';
+import { usageTrackerService, mapWithConcurrency } from './usage/usageTracker.service';
 import mongoose from 'mongoose';
 import Plan from '../models/Plan';
 
-const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:metrics:v2';
+const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:metrics:v3';
 const ADMIN_DASHBOARD_CACHE_TTL_SEC = 300;
 
 const adminDashboardLocalCache = new Map<string, { value: any; expiresAt: number }>();
@@ -43,8 +42,7 @@ function platformUsageCacheKey(dateRange?: { dateFrom?: Date; dateTo?: Date }): 
 
 export class AdminService {
   /**
-   * Platform call minutes + completed chat conversations — same source as Usage Reports.
-   * Uses analyticsService.getSimpleMetrics (callMetrics + chatMetrics services).
+   * Platform call minutes + completed chat conversations (aggregation-only, no transcript scans).
    */
   async getPlatformUsageTotals(dateRange?: { dateFrom?: Date; dateTo?: Date }): Promise<{
     callMinutes: number;
@@ -73,11 +71,11 @@ export class AdminService {
       }
     } catch (_) { /* fall through */ }
 
-    const metrics = await analyticsService.getSimpleMetrics(undefined, undefined, dateRange);
-    const result = {
-      callMinutes: metrics.callMinutes ?? 0,
-      chatConversations: metrics.totalConversations ?? 0
-    };
+    const [callMinutes, chatConversations] = await Promise.all([
+      usageTrackerService.calculatePlatformCallMinutes(dateRange),
+      usageTrackerService.calculatePlatformChatConversations(dateRange)
+    ]);
+    const result = { callMinutes, chatConversations };
 
     platformUsageLocalCache.set(cacheKey, {
       value: result,
@@ -625,68 +623,102 @@ export class AdminService {
   }
 
   /**
-   * Get Usage Reports
+   * Usage report summary (platform totals + channel breakdown) — fast path for initial paint.
+   */
+  async getUsageReportsSummary(dateFrom?: string, dateTo?: string) {
+    const range = (dateFrom || dateTo) ? {
+      dateFrom: dateFrom ? new Date(dateFrom) : undefined,
+      dateTo: dateTo ? new Date(dateTo) : undefined
+    } : undefined;
+
+    const [platformTotals, organizationCount, conversationsByChannel] = await Promise.all([
+      this.getPlatformUsageTotals(range),
+      Organization.countDocuments({ status: { $ne: 'deleted' } }),
+      this.getConversationsByChannel(range)
+    ]);
+
+    return {
+      totalCallMinutes: platformTotals.callMinutes,
+      totalChatConversations: platformTotals.chatConversations,
+      organizationCount,
+      conversationsByChannel
+    };
+  }
+
+  private async getConversationsByChannel(dateRange?: { dateFrom?: Date; dateTo?: Date }) {
+    const match: Record<string, unknown> = {};
+    if (dateRange?.dateFrom || dateRange?.dateTo) {
+      match.createdAt = {};
+      if (dateRange.dateFrom) (match.createdAt as any).$gte = dateRange.dateFrom;
+      if (dateRange.dateTo) (match.createdAt as any).$lte = dateRange.dateTo;
+    }
+
+    const rows = await Conversation.aggregate([
+      ...(Object.keys(match).length ? [{ $match: match }] : []),
+      { $group: { _id: { $ifNull: ['$channel', 'unknown'] }, count: { $sum: 1 } } }
+    ]);
+
+    return rows.reduce((acc: Record<string, number>, row: { _id: string; count: number }) => {
+      acc[row._id || 'unknown'] = row.count;
+      return acc;
+    }, {});
+  }
+
+  private async buildUsageByOrganization(
+    organizations: Array<{ _id: mongoose.Types.ObjectId; name: string }>,
+    range?: { dateFrom?: Date; dateTo?: Date }
+  ) {
+    return mapWithConcurrency(organizations, 8, async (org) => {
+      try {
+        const orgId = org._id.toString();
+        const [totalCallMinutes, totalChatConversations, userCount] = await Promise.all([
+          usageTrackerService.calculateCallMinutes(orgId, range),
+          usageTrackerService.calculateOrganizationChatConversations(orgId, range),
+          User.countDocuments({ organizationId: org._id, status: 'active' })
+        ]);
+        return {
+          _id: orgId,
+          name: org.name,
+          totalCallMinutes,
+          totalChatConversations,
+          userCount
+        };
+      } catch (error) {
+        logger.error(`Failed to get metrics for org ${org._id}:`, error);
+        return {
+          _id: org._id.toString(),
+          name: org.name,
+          totalCallMinutes: 0,
+          totalChatConversations: 0,
+          userCount: 0
+        };
+      }
+    });
+  }
+
+  /**
+   * Get Usage Reports (full — includes per-organization table)
    */
   async getUsageReports(dateFrom?: string, dateTo?: string) {
     try {
-      // Use metrics service
       const range = (dateFrom || dateTo) ? {
         dateFrom: dateFrom ? new Date(dateFrom) : undefined,
         dateTo: dateTo ? new Date(dateTo) : undefined
       } : undefined;
 
-      // Platform totals — same calculation as admin dashboard (Usage Reports header cards)
-      const [platformTotals, organizations] = await Promise.all([
-        this.getPlatformUsageTotals(range),
-        Organization.find({ status: { $ne: 'deleted' } }).lean()
-      ]);
-      
-      // Get usage by organization
-      const usageByOrganization = await Promise.all(
-        organizations.map(async (org: any) => {
-          try {
-            const orgMetrics = await analyticsService.getOrganizationMetrics(org._id.toString(), range);
-            const userCount = await User.countDocuments({ organizationId: org._id, status: 'active' });
-            
-            return {
-              _id: org._id.toString(),
-              name: org.name,
-              totalCallMinutes: orgMetrics.callMinutes || 0,
-              totalChatConversations: orgMetrics.totalConversations || 0,
-              userCount
-            };
-          } catch (error) {
-            logger.error(`Failed to get metrics for org ${org._id}:`, error);
-            return {
-              _id: org._id.toString(),
-              name: org.name,
-              totalCallMinutes: 0,
-              totalChatConversations: 0,
-              userCount: 0
-            };
-          }
-        })
+      const summary = await this.getUsageReportsSummary(dateFrom, dateTo);
+      const organizations = await Organization.find({ status: { $ne: 'deleted' } })
+        .select('_id name')
+        .lean();
+
+      const usageByOrganization = await this.buildUsageByOrganization(
+        organizations as Array<{ _id: mongoose.Types.ObjectId; name: string }>,
+        range
       );
 
-      // Get conversations by channel
-      const conversationsByChannel: any = {};
-      const conversations = await Conversation.find(range ? {
-        createdAt: {
-          ...(range.dateFrom && { $gte: range.dateFrom }),
-          ...(range.dateTo && { $lte: range.dateTo })
-        }
-      } : {}).lean();
-
-      conversations.forEach((conv: any) => {
-        const channel = conv.channel || 'unknown';
-        conversationsByChannel[channel] = (conversationsByChannel[channel] || 0) + 1;
-      });
-
       return {
-        totalCallMinutes: platformTotals.callMinutes,
-        totalChatConversations: platformTotals.chatConversations,
-        usageByOrganization,
-        conversationsByChannel
+        ...summary,
+        usageByOrganization
       };
     } catch (error: any) {
       logger.error('Failed to get usage reports', { error: error.message });

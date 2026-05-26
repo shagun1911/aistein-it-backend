@@ -35,6 +35,7 @@ router.get('/users/:userId', adminController.getUserDetails);
 router.patch('/users/:userId/upgrade-plan', adminController.upgradeUserPlan);
 
 // Analytics
+router.get('/analytics/usage-reports/summary', adminController.getUsageReportsSummary);
 router.get('/analytics/usage-reports', adminController.getUsageReports);
 
 // Billing

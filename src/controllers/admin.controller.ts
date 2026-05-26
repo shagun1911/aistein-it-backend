@@ -232,7 +232,21 @@ export class AdminController {
   };
 
   /**
-   * Get usage reports
+   * Get usage report summary (platform totals + channels — fast)
+   */
+  getUsageReportsSummary = async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const dateFrom = req.query.dateFrom as string;
+      const dateTo = req.query.dateTo as string;
+      const summary = await this.adminService.getUsageReportsSummary(dateFrom, dateTo);
+      res.json(successResponse(summary));
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  /**
+   * Get usage reports (full, includes per-organization table)
    */
   getUsageReports = async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {

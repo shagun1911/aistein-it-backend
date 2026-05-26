@@ -23,6 +23,46 @@ const LOCAL_USAGE_TTL_MS = 60_000;
 /** One in-flight profile usage recompute per org (authInstant background warm). */
 const profileUsageWarmInFlight = new Set<string>();
 
+export type UsageDateRange = { dateFrom?: Date; dateTo?: Date };
+
+function conversationDateMatch(dateRange?: UsageDateRange): Record<string, unknown> {
+  if (!dateRange?.dateFrom && !dateRange?.dateTo) return {};
+  const createdAt: Record<string, Date> = {};
+  if (dateRange.dateFrom) createdAt.$gte = dateRange.dateFrom;
+  if (dateRange.dateTo) createdAt.$lte = dateRange.dateTo;
+  return { createdAt };
+}
+
+function messageTimestampMatch(dateRange?: UsageDateRange): Record<string, unknown> {
+  if (!dateRange?.dateFrom && !dateRange?.dateTo) return {};
+  const timestamp: Record<string, Date> = {};
+  if (dateRange.dateFrom) timestamp.$gte = dateRange.dateFrom;
+  if (dateRange.dateTo) timestamp.$lte = dateRange.dateTo;
+  return { timestamp };
+}
+
+/** Run async work over items with bounded concurrency. */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (index < items.length) {
+      const i = index++;
+      results[i] = await fn(items[i]);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, Math.max(items.length, 1)) }, () => worker())
+  );
+  return results;
+}
+
 function localCacheGet(key: string): any | null {
   const entry = localUsageCache.get(key);
   if (entry && entry.expiresAt > Date.now()) return entry.value;
@@ -42,13 +82,14 @@ export class UsageTrackerService {
    * falling back to a createdAt→updatedAt difference for conversations that don't have it.
    * Never loads transcript data into Node memory.
    */
-  async calculateCallMinutes(organizationId: string): Promise<number> {
+  async calculateCallMinutes(organizationId: string, dateRange?: UsageDateRange): Promise<number> {
     try {
       const result = await Conversation.aggregate([
         {
           $match: {
             organizationId: new mongoose.Types.ObjectId(organizationId),
-            channel: 'phone'
+            channel: 'phone',
+            ...conversationDateMatch(dateRange)
           }
         },
         {
@@ -510,10 +551,10 @@ export class UsageTrackerService {
    * Platform-wide call minutes for admin dashboard.
    * Uses MongoDB aggregation only — never loads transcript blobs into Node memory.
    */
-  async calculatePlatformCallMinutes(): Promise<number> {
+  async calculatePlatformCallMinutes(dateRange?: UsageDateRange): Promise<number> {
     try {
       const result = await Conversation.aggregate([
-        { $match: { channel: 'phone' } },
+        { $match: { channel: 'phone', ...conversationDateMatch(dateRange) } },
         {
           $project: {
             durationSeconds: {
@@ -556,10 +597,70 @@ export class UsageTrackerService {
    * Platform-wide completed chat conversations for admin dashboard.
    * A conversation counts when it has at least one customer message and one AI reply (non-phone).
    */
-  async calculatePlatformChatConversations(): Promise<number> {
+  /**
+   * Completed chat conversations for one org (customer + AI message, non-phone).
+   */
+  async calculateOrganizationChatConversations(
+    organizationId: string,
+    dateRange?: UsageDateRange
+  ): Promise<number> {
+    try {
+      const orgObjectId = new mongoose.Types.ObjectId(organizationId);
+      const result = await Message.aggregate([
+        {
+          $match: {
+            organizationId: orgObjectId,
+            type: 'message',
+            sender: { $in: ['customer', 'ai'] },
+            ...messageTimestampMatch(dateRange)
+          }
+        },
+        {
+          $group: {
+            _id: '$conversationId',
+            hasCustomer: { $max: { $cond: [{ $eq: ['$sender', 'customer'] }, 1, 0] } },
+            hasAi: { $max: { $cond: [{ $eq: ['$sender', 'ai'] }, 1, 0] } }
+          }
+        },
+        { $match: { hasCustomer: 1, hasAi: 1 } },
+        {
+          $lookup: {
+            from: 'conversations',
+            localField: '_id',
+            foreignField: '_id',
+            as: 'conv',
+            pipeline: [
+              {
+                $match: {
+                  organizationId: orgObjectId,
+                  channel: { $ne: 'phone' }
+                }
+              },
+              { $project: { _id: 1 } }
+            ]
+          }
+        },
+        { $match: { 'conv.0': { $exists: true } } },
+        { $count: 'total' }
+      ]);
+
+      return result[0]?.total || 0;
+    } catch (error: any) {
+      logger.error('[Usage Tracker] Error calculating org chat conversations:', error.message);
+      return 0;
+    }
+  }
+
+  async calculatePlatformChatConversations(dateRange?: UsageDateRange): Promise<number> {
     try {
       const result = await Message.aggregate([
-        { $match: { type: 'message', sender: { $in: ['customer', 'ai'] } } },
+        {
+          $match: {
+            type: 'message',
+            sender: { $in: ['customer', 'ai'] },
+            ...messageTimestampMatch(dateRange)
+          }
+        },
         {
           $group: {
             _id: '$conversationId',

@@ -8,6 +8,7 @@ import Message from '../../models/Message';
 import mongoose from 'mongoose';
 import { logger } from '../../utils/logger.util';
 import { ChatMetrics, DateRange } from './analytics.types';
+import { usageTrackerService } from '../usage/usageTracker.service';
 
 export class ChatMetricsService {
   /**
@@ -23,6 +24,20 @@ export class ChatMetricsService {
     channel?: string
   ): Promise<ChatMetrics> {
     try {
+      if (!channel || channel === 'all') {
+        const totalConversations = await usageTrackerService.calculateOrganizationChatConversations(
+          organizationId,
+          dateRange
+        );
+        return {
+          totalConversations,
+          totalChats: 0,
+          totalUserMessages: 0,
+          totalBotMessages: 0,
+          averageMessagesPerConversation: 0
+        };
+      }
+
       const query: any = {
         organizationId: new mongoose.Types.ObjectId(organizationId)
       };
@@ -200,130 +215,13 @@ export class ChatMetricsService {
    */
   async getPlatformChatMetrics(dateRange?: DateRange): Promise<ChatMetrics> {
     try {
-      const query: any = { channel: { $ne: 'phone' } };
-
-      // Add date filter if provided
-      if (dateRange?.dateFrom || dateRange?.dateTo) {
-        query.createdAt = {};
-        if (dateRange.dateFrom) {
-          query.createdAt.$gte = new Date(dateRange.dateFrom);
-        }
-        if (dateRange.dateTo) {
-          query.createdAt.$lte = new Date(dateRange.dateTo);
-        }
-      }
-
-      // Get completed conversations
-      const completedConversations = await Conversation.aggregate([
-        {
-          $match: query
-        },
-        {
-          $lookup: {
-            from: 'messages',
-            localField: '_id',
-            foreignField: 'conversationId',
-            as: 'messages'
-          }
-        },
-        {
-          $project: {
-            hasCustomerMessage: {
-              $gt: [
-                {
-                  $size: {
-                    $filter: {
-                      input: '$messages',
-                      as: 'msg',
-                      cond: {
-                        $and: [
-                          { $eq: ['$$msg.sender', 'customer'] },
-                          { $eq: ['$$msg.type', 'message'] }
-                        ]
-                      }
-                    }
-                  }
-                },
-                0
-              ]
-            },
-            hasAiMessage: {
-              $gt: [
-                {
-                  $size: {
-                    $filter: {
-                      input: '$messages',
-                      as: 'msg',
-                      cond: {
-                        $and: [
-                          { $eq: ['$$msg.sender', 'ai'] },
-                          { $eq: ['$$msg.type', 'message'] }
-                        ]
-                      }
-                    }
-                  }
-                },
-                0
-              ]
-            },
-            conversationId: '$_id'
-          }
-        },
-        {
-          $match: {
-            hasCustomerMessage: true,
-            hasAiMessage: true
-          }
-        },
-        {
-          $project: {
-            conversationId: 1
-          }
-        }
-      ]);
-
-      const conversationIds = completedConversations.map((c: any) => c.conversationId);
-
-      // Get total message counts
-      const messageQuery: any = {
-        conversationId: { $in: conversationIds },
-        type: 'message'
-      };
-
-      // Add date filter for messages if provided
-      if (dateRange?.dateFrom || dateRange?.dateTo) {
-        messageQuery.timestamp = {};
-        if (dateRange.dateFrom) {
-          messageQuery.timestamp.$gte = new Date(dateRange.dateFrom);
-        }
-        if (dateRange.dateTo) {
-          messageQuery.timestamp.$lte = new Date(dateRange.dateTo);
-        }
-      }
-
-      const [totalChats, userMessages, botMessages] = await Promise.all([
-        Message.countDocuments(messageQuery),
-        Message.countDocuments({
-          ...messageQuery,
-          sender: 'customer'
-        }),
-        Message.countDocuments({
-          ...messageQuery,
-          sender: 'ai'
-        })
-      ]);
-
-      const totalConversations = completedConversations.length;
-      const averageMessagesPerConversation = totalConversations > 0
-        ? Math.round((totalChats / totalConversations) * 100) / 100
-        : 0;
-
+      const totalConversations = await usageTrackerService.calculatePlatformChatConversations(dateRange);
       return {
         totalConversations,
-        totalChats,
-        totalUserMessages: userMessages,
-        totalBotMessages: botMessages,
-        averageMessagesPerConversation
+        totalChats: 0,
+        totalUserMessages: 0,
+        totalBotMessages: 0,
+        averageMessagesPerConversation: 0
       };
     } catch (error: any) {
       logger.error('[ChatMetrics] Error getting platform chat metrics:', error.message);

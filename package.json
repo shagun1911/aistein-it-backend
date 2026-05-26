@@ -19,7 +19,8 @@
     "remove:admin-roles": "ts-node-dev --transpile-only src/scripts/removeAdminRoles.ts",
     "wipe:social-integrations": "npx ts-node scripts/wipe-all-social-integrations.ts",
     "redis:clean-old-bull-jobs": "npx ts-node scripts/clean-old-bull-jobs.ts",
-    "test": "echo \"No tests yet\""
+    "test": "echo \"No tests yet\"",
+    "meta-leads:poll": "node dist/scripts/meta-leads-poll.js"
   },
   "keywords": [
     "chatbot",

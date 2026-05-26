@@ -11,7 +11,7 @@ export class SocialIntegrationService {
   async upsertIntegration(data: {
     userId: string; // REQUIRED: User who owns this integration
     organizationId: string;
-    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail';
+    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail' | 'meta_leads' | 'meta_leads';
     apiKey: string;
     clientId?: string;
     phoneNumberId?: string;
@@ -185,7 +185,7 @@ export class SocialIntegrationService {
    */
   async getIntegration(
     organizationId: string,
-    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail'
+    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail' | 'meta_leads'
   ): Promise<ISocialIntegration | null> {
     return await SocialIntegration.findOne({
       organizationId: new mongoose.Types.ObjectId(organizationId),
@@ -198,7 +198,7 @@ export class SocialIntegrationService {
    */
   async getDialog360Service(
     organizationId: string,
-    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail'
+    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail' | 'meta_leads'
   ): Promise<Dialog360Service> {
     const integration = await this.getIntegration(organizationId, platform);
     
@@ -222,7 +222,7 @@ export class SocialIntegrationService {
    */
   async disconnectIntegration(
     organizationId: string,
-    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail'
+    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail' | 'meta_leads'
   ): Promise<void> {
     const integration = await SocialIntegration.findOne({
       organizationId: new mongoose.Types.ObjectId(organizationId),
@@ -287,7 +287,7 @@ export class SocialIntegrationService {
    */
   async deleteIntegration(
     organizationId: string,
-    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail'
+    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail' | 'meta_leads'
   ): Promise<void> {
     const integration = await SocialIntegration.findOne({
       organizationId: new mongoose.Types.ObjectId(organizationId),
@@ -339,7 +339,7 @@ export class SocialIntegrationService {
    */
   async testConnection(
     organizationId: string,
-    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail'
+    platform: 'whatsapp' | 'instagram' | 'facebook' | 'gmail' | 'meta_leads'
   ): Promise<boolean> {
     try {
       // Gmail doesn't use Dialog360 - just check if integration exists and is connected

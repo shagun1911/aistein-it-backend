@@ -1055,37 +1055,29 @@ export class AutomationEngine {
 
       console.info(`[Automation Engine] 📞 Meta lead batch call → ${phoneStr} (leadgen: ${triggerData?.leadgen_id || 'n/a'})`);
 
-      const { batchCallingService } = await import('../services/batchCalling.service');
-      const result = await batchCallingService.submitBatchCall({
+      const { submitMetaLeadBatchCallViaApi } = await import('./metaLeadBatchCall.service');
+      const result = await submitMetaLeadBatchCallViaApi({
+        userId: context.userId.toString(),
+        organizationId: context.organizationId.toString(),
         agent_id: agentId,
         phone_number_id: phoneNumberId,
         call_name: callName,
         recipients: [recipient],
       });
+      // BatchCall row saved by BatchCallingController (same HTTP route as Campaigns page).
 
-      const BatchCall = (await import('../models/BatchCall')).default;
-      await BatchCall.create({
-        userId: new mongoose.Types.ObjectId(context.userId.toString()),
-        organizationId: new mongoose.Types.ObjectId(context.organizationId.toString()),
-        batch_call_id: result.id,
-        name: result.name,
-        agent_id: result.agent_id,
-        status: result.status,
-        phone_number_id: result.phone_number_id,
-        phone_provider: result.phone_provider,
-        created_at_unix: result.created_at_unix,
-        scheduled_time_unix: result.scheduled_time_unix,
-        timezone: result.timezone || 'UTC',
-        total_calls_dispatched: result.total_calls_dispatched,
-        total_calls_scheduled: result.total_calls_scheduled,
-        total_calls_finished: result.total_calls_finished,
-        last_updated_at_unix: result.last_updated_at_unix,
-        retry_count: result.retry_count,
-        agent_name: result.agent_name,
-        call_name: callName,
-        recipients_count: 1,
-        conversations_synced: false,
-      });
+      if (triggerData?.leadgen_id) {
+        const MetaLead = (await import('../models/MetaLead')).default;
+        await MetaLead.findOneAndUpdate(
+          { leadgen_id: String(triggerData.leadgen_id) },
+          {
+            $set: {
+              batch_call_dispatched: true,
+              batch_call_dispatched_at: new Date(),
+            },
+          }
+        );
+      }
 
       return {
         success: true,
@@ -2742,8 +2734,15 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
         }
       }
 
+      // Meta Lead Ads: run from webhook/poll payload — no CRM contact row required
+      const isMetaLeadTrigger =
+        triggerNode.service === 'meta_lead' || triggerData?.event === 'meta_lead';
+      if (contactIds.length === 0 && isMetaLeadTrigger) {
+        contactIds = ['__meta_lead__'];
+      }
+
       console.log(`[Automation Engine] 👥 Processing ${contactIds.length} contact(s)`);
-      if (contactIds.length === 0) {
+      if (contactIds.length === 0 && triggerData.event === 'batch_call_completed') {
         console.warn(
           '[Automation Engine] ⚠️ batch_call_completed: no contactId and could not recover — no action nodes will run. Check conversation.customerId and freshContactData.phone.'
         );
@@ -2751,11 +2750,26 @@ const metaUrl = `https://graph.facebook.com/v21.0/${integration.credentials.waba
       const missingContacts: string[] = [];
 
       for (const contactId of contactIds) {
-        let contact = await Customer.findById(contactId).lean();
-        if (!contact) {
-          console.log(`[Automation Engine] ⚠️  Contact ${contactId} not found, skipping`);
-          missingContacts.push(String(contactId));
-          continue;
+        let contact: any;
+        if (contactId === '__meta_lead__') {
+          const leadData = triggerData?.data || {};
+          contact = {
+            _id: triggerData?.leadgen_id || 'meta-lead',
+            name: leadData.full_name || leadData.name || 'Lead',
+            email: leadData.work_email || leadData.email || '',
+            phone: leadData.phone_number || leadData.phone || '',
+            organizationId,
+          };
+          console.log(
+            `[Automation Engine] 👤 Meta lead (from form data): ${contact.name} (${contact.phone || 'no phone'})`
+          );
+        } else {
+          contact = await Customer.findById(contactId).lean();
+          if (!contact) {
+            console.log(`[Automation Engine] ⚠️  Contact ${contactId} not found, skipping`);
+            missingContacts.push(String(contactId));
+            continue;
+          }
         }
 
         // CRITICAL FIX: Use fresh contact data from CSV if available (for batch calls)

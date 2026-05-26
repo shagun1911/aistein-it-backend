@@ -13,6 +13,11 @@ import mongoose from 'mongoose';
 import GoogleIntegration from '../models/GoogleIntegration';
 import SocialIntegration from '../models/SocialIntegration';
 import redisClient, { isRedisAvailable } from '../config/redis';
+import {
+  getMetaLeadsGraphApiVersion,
+  metaLeadsConfig,
+  resolveMetaLeadsPageAccessToken,
+} from '../config/metaLeads.config';
 
 const PENDING_PAGES_TTL = 300; // 5 minutes
 
@@ -1828,6 +1833,7 @@ export class SocialIntegrationController {
 
   /**
    * Fetch Meta Lead Ad form questions for automation trigger configuration.
+   * Verified Meta call: GET /{form-id}?fields=id,name,status,questions with Page access token.
    */
   async getFacebookFormFields(req: AuthRequest, res: Response, next: NextFunction) {
     try {
@@ -1841,40 +1847,64 @@ export class SocialIntegrationController {
         throw new AppError(401, 'UNAUTHORIZED', 'Organization ID not found');
       }
 
-      const integration = await SocialIntegration.findOne({
-        organizationId,
-        platform: 'facebook',
-        status: 'connected',
-      }).sort({ updatedAt: -1 });
+      const orgFilter = mongoose.Types.ObjectId.isValid(String(organizationId))
+        ? new mongoose.Types.ObjectId(String(organizationId))
+        : organizationId;
 
-      if (!integration) {
-        throw new AppError(404, 'NOT_FOUND', 'Facebook integration not connected');
-      }
+      const { findMetaLeadsIntegrationByOrganization } = await import(
+        '../services/metaLeadsIntegration.service'
+      );
 
-      let pageAccessToken = integration.credentials?.pageAccessToken;
-      if (!pageAccessToken && (integration as any).getDecryptedApiKey) {
-        pageAccessToken = (integration as any).getDecryptedApiKey();
-      }
+      const metaLeadsIntegration = await findMetaLeadsIntegrationByOrganization(String(organizationId));
+      const facebookIntegration = metaLeadsIntegration
+        ? null
+        : await SocialIntegration.findOne({
+            organizationId: orgFilter,
+            platform: 'facebook',
+            status: 'connected',
+          }).sort({ updatedAt: -1 });
+
+      const integration = metaLeadsIntegration || facebookIntegration;
+
+      const pageAccessToken = resolveMetaLeadsPageAccessToken(
+        integration?.credentials?.pageAccessToken
+      );
+
       if (!pageAccessToken) {
-        throw new AppError(400, 'INVALID_CREDENTIALS', 'Facebook page access token not found');
+        throw new AppError(
+          404,
+          'NOT_FOUND',
+          'Connect Meta Lead Ads in Settings (Lead Ads OAuth), or set META_LEADS_PAGE_ACCESS_TOKEN for development.'
+        );
       }
 
-      const axios = (await import('axios')).default;
-      const apiVersion = process.env.META_GRAPH_API_VERSION || 'v21.0';
-      const graphRes = await axios.get(`https://graph.facebook.com/${apiVersion}/${formId}`, {
-        params: {
-          fields: 'name,questions',
-          access_token: pageAccessToken,
-        },
-      });
+      const pageIdStr =
+        (integration?.credentials?.facebookPageId
+          ? String(integration.credentials.facebookPageId).trim()
+          : '') ||
+        metaLeadsConfig.pageId ||
+        '';
 
-      const formName = graphRes.data?.name || '';
-      const questions = Array.isArray(graphRes.data?.questions) ? graphRes.data.questions : [];
-      const fields = questions.map((q: any) => ({
-        key: q.key || q.id || '',
-        label: q.label || q.key || q.id || '',
-        type: q.type || 'CUSTOM',
-      })).filter((f: { key: string }) => !!f.key);
+      const { fetchLeadgenFormFromMeta } = await import('../services/metaLeadsIntegration.service');
+
+      let formName = '';
+      let fields: { key: string; label: string; type: string }[] = [];
+      try {
+        const result = await fetchLeadgenFormFromMeta({
+          formId: String(formId).trim(),
+          pageAccessToken,
+          pageId: pageIdStr || undefined,
+        });
+        formName = result.formName;
+        fields = result.fields;
+      } catch (metaErr: any) {
+        throw new AppError(
+          502,
+          'META_API_ERROR',
+          metaErr?.message ||
+            'Could not load form fields from Meta. Verify the Form ID belongs to your connected Meta Lead Ads page.'
+        );
+      }
 
       res.json(successResponse({ formName, fields }, 'Form fields fetched successfully'));
     } catch (error) {

@@ -12,6 +12,11 @@ import KnowledgeBase from '../models/KnowledgeBase';
 import Settings from '../models/Settings';
 import { aiBehaviorService } from '../services/aiBehavior.service';
 import { getEcommerceCredentials } from '../utils/ecommerce.util';
+import {
+  getMetaLeadsGraphApiVersion,
+  metaLeadsConfig,
+  resolveMetaLeadsPageAccessToken,
+} from '../config/metaLeads.config';
 
 // Helper function to resolve a single KB ID to collection name(s) - SAME AS CHATBOT
 async function resolveSingleKBId(kbId: string, userId: string): Promise<string[]> {
@@ -543,6 +548,65 @@ export class MetaWebhookController {
   }
 
   /**
+   * Verify Meta Lead Ads webhook (GET) — uses META_LEADS_VERIFY_TOKEN only.
+   * Callback URL: /api/v1/social-integrations/meta-leads/webhook
+   */
+  async verifyMetaLeads(req: Request, res: Response) {
+    try {
+      const mode = req.query['hub.mode'];
+      const token = req.query['hub.verify_token'];
+      const challenge = req.query['hub.challenge'];
+      const verifyToken = metaLeadsConfig.verifyToken;
+
+      if (!verifyToken) {
+        console.warn('[Meta Leads Webhook] META_LEADS_VERIFY_TOKEN not set');
+        res.sendStatus(503);
+        return;
+      }
+      if (mode !== 'subscribe' || token !== verifyToken) {
+        console.log('[Meta Leads Webhook] Verification failed', { mode, tokenMatch: token === verifyToken });
+        res.sendStatus(403);
+        return;
+      }
+      if (challenge === undefined || challenge === null || challenge === '') {
+        res.status(400).type('text/plain').send('Missing hub.challenge');
+        return;
+      }
+      console.log('[Meta Leads Webhook] Verification successful');
+      res.status(200).type('text/plain').send(String(challenge));
+    } catch (error) {
+      console.error('[Meta Leads Webhook] Verification error:', error);
+      res.sendStatus(500);
+    }
+  }
+
+  /**
+   * Meta Lead Ads webhook (POST) — primary delivery for leadgen changes.
+   */
+  async handleMetaLeads(req: Request, res: Response) {
+    try {
+      res.sendStatus(200);
+      const webhookData = req.body;
+      console.log('[Meta Leads Webhook] Primary delivery — received:', JSON.stringify(webhookData, null, 2));
+
+      if (webhookData.object !== 'page') return;
+
+      for (const entry of webhookData.entry || []) {
+        const pageId = entry.id != null ? String(entry.id) : metaLeadsConfig.pageId;
+        if (!pageId) continue;
+
+        for (const change of entry.changes || []) {
+          if (change.field === 'leadgen' && change.value) {
+            await this.handleLeadgenChange(change.value, pageId);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[Meta Leads Webhook] Error processing webhook:', error);
+    }
+  }
+
+  /**
    * Handle incoming WhatsApp webhook events (POST request)
    */
   async handleWhatsApp(req: Request, res: Response) {
@@ -613,9 +677,15 @@ export class MetaWebhookController {
           const pageId = entry.id != null ? String(entry.id) : '';
           if (!pageId) continue;
 
-          // Meta Lead Ads — leadgen field changes
+          // Leadgen: use dedicated meta-leads/webhook when META_LEADS_* is configured
           for (const change of entry.changes || []) {
             if (change.field === 'leadgen' && change.value) {
+              if (metaLeadsConfig.verifyToken) {
+                console.log(
+                  '[Messenger Webhook] Skipping leadgen — use /meta-leads/webhook for Lead Ads'
+                );
+                continue;
+              }
               console.log('[Messenger Webhook] Processing leadgen change:', JSON.stringify(change.value));
               await this.handleLeadgenChange(change.value, pageId);
             }
@@ -701,43 +771,54 @@ export class MetaWebhookController {
         return;
       }
 
-      const integration = await this.findFacebookIntegrationByPageId(eventPageId || pageId);
-      if (!integration) {
-        console.warn(`[Messenger Webhook] No integration found for leadgen page_id: ${eventPageId || pageId}`);
+      if (formId && !metaLeadsConfig.isAllowedFormId(formId)) {
+        console.log(
+          `[Meta Leads] Skipping leadgen ${leadgenId} — form ${formId} not in META_LEADS_FORM_IDS`
+        );
         return;
       }
 
-      if (!integration.userId) {
-        console.error('[Messenger Webhook] Integration missing userId for leadgen');
+      const lookupPageId = eventPageId || pageId || metaLeadsConfig.pageId;
+      const { findMetaLeadsIntegrationByPageId } = await import(
+        '../services/metaLeadsIntegration.service'
+      );
+      const integration = await findMetaLeadsIntegrationByPageId(lookupPageId);
+
+      if (
+        !integration &&
+        metaLeadsConfig.pageId &&
+        !metaLeadsConfig.isAllowedPageId(lookupPageId)
+      ) {
+        console.log(
+          `[Meta Leads] Skipping leadgen ${leadgenId} — page ${lookupPageId} not connected`
+        );
+        return;
+      }
+
+      const { resolveMetaLeadsPageAccessToken: resolveToken } = await import(
+        '../services/metaLeadsIntegration.service'
+      );
+      const pageAccessToken = resolveToken(integration);
+      if (!pageAccessToken) {
+        console.warn(
+          `[Meta Leads] No token for page ${lookupPageId} — connect Meta Lead Ads in Settings`
+        );
+        return;
+      }
+
+      if (!integration?.userId) {
+        console.warn(`[Meta Leads] No org integration for page ${lookupPageId}`);
         return;
       }
 
       const MetaLead = (await import('../models/MetaLead')).default;
-      try {
-        await MetaLead.create({
-          leadgen_id: leadgenId,
-          form_id: formId || undefined,
-          page_id: eventPageId || pageId,
-          organizationId: integration.organizationId || undefined,
-        });
-      } catch (dedupeErr: any) {
-        if (dedupeErr?.code === 11000) {
-          console.log(`[Messenger Webhook] ⏭️ Skipping duplicate leadgen_id: ${leadgenId}`);
-          return;
-        }
-        throw dedupeErr;
-      }
-
-      let pageAccessToken = integration.credentials?.pageAccessToken;
-      if (!pageAccessToken && (integration as any).getDecryptedApiKey) {
-        pageAccessToken = (integration as any).getDecryptedApiKey();
-      }
-      if (!pageAccessToken) {
-        console.error('[Messenger Webhook] No page access token for leadgen fetch');
+      const existingLead = await MetaLead.findOne({ leadgen_id: leadgenId }).lean();
+      if (existingLead?.batch_call_dispatched) {
+        console.log(`[Meta Leads] ⏭️ Skipping leadgen_id (already batch-called): ${leadgenId}`);
         return;
       }
 
-      const apiVersion = process.env.META_GRAPH_API_VERSION || 'v21.0';
+      const apiVersion = getMetaLeadsGraphApiVersion();
       const graphUrl = `https://graph.facebook.com/${apiVersion}/${leadgenId}`;
       const graphRes = await axios.get(graphUrl, {
         params: {
@@ -751,13 +832,50 @@ export class MetaWebhookController {
       const resolvedFormId = formId || (leadPayload.form_id != null ? String(leadPayload.form_id) : '');
       const resolvedPageId = eventPageId || (leadPayload.page_id != null ? String(leadPayload.page_id) : pageId);
 
-      const orgContext = await this.resolveOrgContextFromIntegration(integration);
-      const organizationId =
-        integration.organizationId?.toString() ||
-        orgContext?.organization?._id?.toString() ||
-        orgContext?.users?.[0]?.organizationId?.toString() ||
-        integration.userId.toString();
-      const userId = integration.userId.toString();
+      if (!metaLeadsConfig.isAllowedFormId(resolvedFormId)) {
+        console.log(
+          `[Meta Leads] Skipping leadgen ${leadgenId} — resolved form ${resolvedFormId || '(empty)'} not in META_LEADS_FORM_IDS`
+        );
+        return;
+      }
+
+      const { resolveMetaLeadAutomationContext } = await import(
+        '../services/metaLeadsPolling.service'
+      );
+      const fallbackIntegration = {
+        organizationId: integration.organizationId,
+        userId: integration.userId,
+      };
+
+      let organizationId: string;
+      let userId: string;
+      try {
+        const ctx = await resolveMetaLeadAutomationContext(resolvedFormId, fallbackIntegration);
+        organizationId = ctx.organizationId;
+        userId = ctx.userId;
+      } catch (ctxErr: any) {
+        console.error('[Meta Leads] meta_lead context:', ctxErr?.message || ctxErr);
+        return;
+      }
+
+      try {
+        await MetaLead.findOneAndUpdate(
+          { leadgen_id: leadgenId },
+          {
+            $set: {
+              form_id: resolvedFormId || formId || undefined,
+              page_id: resolvedPageId,
+              organizationId,
+              processedAt: new Date(),
+              source: 'webhook',
+            },
+            $setOnInsert: { batch_call_dispatched: false },
+          },
+          { upsert: true }
+        );
+      } catch (metaErr: any) {
+        console.error('[Meta Leads] MetaLead upsert failed:', metaErr?.message || metaErr);
+      }
 
       const { automationEngine } = await import('../services/automationEngine.service');
       const automationData = {
@@ -784,6 +902,89 @@ export class MetaWebhookController {
         .catch((err) => console.error('[Messenger Webhook] meta_lead automation trigger error:', err));
     } catch (error: any) {
       console.error('[Messenger Webhook] Error handling leadgen change:', error.response?.data || error.message || error);
+    }
+  }
+
+  /**
+   * Manually process a Meta lead by leadgen_id (for test leads / missed webhooks).
+   * POST /api/v1/social-integrations/meta-leads/process
+   * Header: x-meta-leads-secret: <META_LEADS_CRON_SECRET>
+   * Body: { "leadgen_id": "...", "form_id": "optional", "page_id": "optional" }
+   */
+  /**
+   * Fallback: poll Meta Graph for leads missed by webhook (manual or scheduled).
+   * POST /api/v1/social-integrations/meta-leads/poll
+   */
+  async pollMetaLeads(req: Request, res: Response) {
+    try {
+      const secret =
+        (req.headers['x-meta-leads-secret'] as string) ||
+        (req.query.secret as string) ||
+        (req.body?.secret as string);
+      if (!metaLeadsConfig.cronSecret || secret !== metaLeadsConfig.cronSecret) {
+        res.status(401).json({ success: false, error: 'Invalid or missing x-meta-leads-secret' });
+        return;
+      }
+
+      const { runMetaLeadsPoll } = await import('../services/metaLeadsPolling.service');
+      const result = await runMetaLeadsPoll();
+      res.json({ success: result.ok, ...result });
+    } catch (error: any) {
+      console.error('[Meta Leads Poll] pollMetaLeads error:', error);
+      res.status(500).json({ success: false, error: error.message || 'Poll failed' });
+    }
+  }
+
+  async processMetaLead(req: Request, res: Response) {
+    try {
+      const secret =
+        (req.headers['x-meta-leads-secret'] as string) ||
+        (req.query.secret as string) ||
+        (req.body?.secret as string);
+      if (!metaLeadsConfig.cronSecret || secret !== metaLeadsConfig.cronSecret) {
+        res.status(401).json({ success: false, error: 'Invalid or missing x-meta-leads-secret' });
+        return;
+      }
+
+      const leadgenId = req.body?.leadgen_id != null ? String(req.body.leadgen_id).trim() : '';
+      if (!leadgenId) {
+        res.status(400).json({ success: false, error: 'leadgen_id is required' });
+        return;
+      }
+
+      const formId =
+        req.body?.form_id != null
+          ? String(req.body.form_id)
+          : metaLeadsConfig.formIds[0] || '';
+      const pageId =
+        req.body?.page_id != null
+          ? String(req.body.page_id)
+          : metaLeadsConfig.pageId || '';
+
+      console.log('[Meta Leads] Manual process requested:', { leadgenId, formId, pageId });
+
+      await this.handleLeadgenChange(
+        {
+          leadgen_id: leadgenId,
+          form_id: formId,
+          page_id: pageId,
+          created_time: Math.floor(Date.now() / 1000),
+        },
+        pageId
+      );
+
+      res.json({
+        success: true,
+        message:
+          'Lead processing finished. Check server logs for automation trigger / skip reason. Duplicate leadgen_id is skipped.',
+        leadgen_id: leadgenId,
+      });
+    } catch (error: any) {
+      console.error('[Meta Leads] processMetaLead error:', error);
+      res.status(500).json({
+        success: false,
+        error: error.message || 'Failed to process lead',
+      });
     }
   }
 

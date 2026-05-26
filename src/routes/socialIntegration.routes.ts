@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import socialIntegrationController from '../controllers/socialIntegration.controller';
 import metaWebhookController from '../controllers/metaWebhook.controller';
+import metaLeadsIntegrationController from '../controllers/metaLeadsIntegration.controller';
 import { authenticate } from '../middleware/auth.middleware';
 
 // Note: Instagram webhook routes have been moved to /api/v1/webhooks/instagram
@@ -22,6 +23,24 @@ router.post('/whatsapp/webhook', metaWebhookController.handleWhatsApp.bind(metaW
 // Messenger webhook
 router.get('/messenger/webhook', (req, res) => metaWebhookController.verify(req, res, 'messenger'));
 router.post('/messenger/webhook', metaWebhookController.handleMessenger.bind(metaWebhookController));
+
+// Meta Lead Ads — primary: webhook (META_LEADS_* env, separate from Messenger/socials)
+router.get('/meta-leads/webhook', (req, res) => metaWebhookController.verifyMetaLeads(req, res));
+router.post('/meta-leads/webhook', metaWebhookController.handleMetaLeads.bind(metaWebhookController));
+// Manual: process one lead by leadgen_id (test leads / missed webhook)
+router.post('/meta-leads/process', metaWebhookController.processMetaLead.bind(metaWebhookController));
+// Fallback: Graph API poll catch-up (cron / manual; enable META_LEADS_POLL_FALLBACK_ENABLED)
+router.post('/meta-leads/poll', metaWebhookController.pollMetaLeads.bind(metaWebhookController));
+
+// Meta Lead Ads OAuth (separate from facebook/messenger — does not modify social OAuth)
+router.get(
+  '/meta-leads/oauth/callback',
+  metaLeadsIntegrationController.oauthCallback.bind(metaLeadsIntegrationController)
+);
+router.post(
+  '/meta-leads/oauth/callback',
+  metaLeadsIntegrationController.oauthCallback.bind(metaLeadsIntegrationController)
+);
 
 // Instagram webhook (backward compatibility - also available at /api/v1/webhooks/instagram)
 router.get('/instagram/webhook', (req, res) => {
@@ -72,7 +91,33 @@ router.post('/:platform/oauth/callback', socialIntegrationController.oauthCallba
 // All other routes require authentication
 router.use(authenticate);
 
-// Facebook Lead Ads form fields (must be before /:platform)
+// Meta Lead Ads — connect / status (separate from facebook messenger)
+router.get(
+  '/meta-leads/integration',
+  metaLeadsIntegrationController.getIntegration.bind(metaLeadsIntegrationController)
+);
+router.post(
+  '/meta-leads/oauth/initiate',
+  metaLeadsIntegrationController.initiateOAuth.bind(metaLeadsIntegrationController)
+);
+router.get(
+  '/meta-leads/oauth/pending-pages',
+  metaLeadsIntegrationController.getPendingPages.bind(metaLeadsIntegrationController)
+);
+router.post(
+  '/meta-leads/oauth/select-page',
+  metaLeadsIntegrationController.selectPage.bind(metaLeadsIntegrationController)
+);
+router.post(
+  '/meta-leads/disconnect',
+  metaLeadsIntegrationController.disconnect.bind(metaLeadsIntegrationController)
+);
+router.get(
+  '/meta-leads/forms/:formId/fields',
+  socialIntegrationController.getFacebookFormFields.bind(socialIntegrationController)
+);
+
+// Facebook Lead Ads form fields (legacy path; prefers meta_leads integration)
 router.get(
   '/facebook/forms/:formId/fields',
   socialIntegrationController.getFacebookFormFields.bind(socialIntegrationController)

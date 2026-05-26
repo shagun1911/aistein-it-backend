@@ -494,6 +494,10 @@ const startServer = async () => {
       logger.info(`Server running on port ${PORT_NUMBER} (PID: ${SERVER_PID})`);
       logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
       logger.info(`Socket.io enabled for real-time messaging`);
+
+      import('./services/metaLeadsPolling.service')
+        .then(({ startMetaLeadsPollingScheduler }) => startMetaLeadsPollingScheduler())
+        .catch((err) => console.error('[Meta Leads Poll] Failed to start scheduler:', err));
       
       // Log webhook endpoints
       const ngrokBaseUrl = process.env.NGROK_BASE_URL;
@@ -503,6 +507,11 @@ const startServer = async () => {
       console.log(`   - WhatsApp: ${basePath}/api/v1/social-integrations/whatsapp/webhook`);
       console.log(`   - Messenger: ${basePath}/api/v1/social-integrations/messenger/webhook`);
       console.log(`   - Instagram: ${basePath}/api/v1/social-integrations/instagram/webhook`);
+      console.log(`   - Meta Leads webhook: ${basePath}/api/v1/social-integrations/meta-leads/webhook`);
+      console.log(`   - Meta Leads OAuth callback: ${basePath}/api/v1/social-integrations/meta-leads/oauth/callback`);
+      if (process.env.META_LEADS_POLL_FALLBACK_ENABLED === 'true' || process.env.META_LEADS_POLL_ENABLED === 'true') {
+        console.log(`   - Meta Leads (fallback poll): POST ${basePath}/api/v1/social-integrations/meta-leads/poll`);
+      }
       
       console.log('\n📡 ElevenLabs Webhook active:');
       console.log(`   - Endpoint: ${basePath}/api/v1/webhook/elevenlabs`);

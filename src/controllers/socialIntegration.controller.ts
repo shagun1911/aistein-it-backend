@@ -1878,68 +1878,33 @@ export class SocialIntegrationController {
         );
       }
 
-      const axios = (await import('axios')).default;
-      const apiVersion = getMetaLeadsGraphApiVersion();
       const pageIdStr =
         (integration?.credentials?.facebookPageId
           ? String(integration.credentials.facebookPageId).trim()
           : '') ||
         metaLeadsConfig.pageId ||
         '';
-      const formIdStr = String(formId).trim();
 
-      const graphUrls = [
-        `https://graph.facebook.com/${apiVersion}/${formIdStr}`,
-        ...(pageIdStr ? [`https://graph.facebook.com/${apiVersion}/${pageIdStr}/${formIdStr}`] : []),
-      ];
+      const { fetchLeadgenFormFromMeta } = await import('../services/metaLeadsIntegration.service');
 
-      let graphRes: { data?: { name?: string; questions?: unknown[] } } | null = null;
-      let lastMetaError: string | undefined;
-
-      for (const url of graphUrls) {
-        try {
-          graphRes = await axios.get(url, {
-            params: {
-              fields: 'id,name,status,questions',
-              access_token: pageAccessToken,
-            },
-            timeout: 15000,
-          });
-          if (graphRes?.data) break;
-        } catch (axiosErr: any) {
-          const metaMsg =
-            axiosErr?.response?.data?.error?.message ||
-            axiosErr?.message ||
-            'Meta API request failed';
-          lastMetaError = metaMsg;
-          console.warn('[getFacebookFormFields] Meta Graph API error:', {
-            url,
-            pageId: pageIdStr || '(none)',
-            message: metaMsg,
-            code: axiosErr?.response?.data?.error?.code,
-            type: axiosErr?.response?.data?.error?.type,
-          });
-        }
-      }
-
-      if (!graphRes?.data) {
+      let formName = '';
+      let fields: { key: string; label: string; type: string }[] = [];
+      try {
+        const result = await fetchLeadgenFormFromMeta({
+          formId: String(formId).trim(),
+          pageAccessToken,
+          pageId: pageIdStr || undefined,
+        });
+        formName = result.formName;
+        fields = result.fields;
+      } catch (metaErr: any) {
         throw new AppError(
           502,
           'META_API_ERROR',
-          lastMetaError ||
-            'Could not load form fields from Meta. Use a Page access token (from me/accounts), ensure leads_retrieval is granted, and verify the form ID belongs to your connected page.'
+          metaErr?.message ||
+            'Could not load form fields from Meta. Verify the Form ID belongs to your connected Meta Lead Ads page.'
         );
       }
-
-      const formName = graphRes.data?.name || '';
-      const questions = Array.isArray(graphRes.data?.questions) ? graphRes.data.questions : [];
-      const fields = questions
-        .map((q: any) => ({
-          key: q.key || q.id || '',
-          label: q.label || q.key || q.id || '',
-          type: q.type || 'CUSTOM',
-        }))
-        .filter((f: { key: string }) => !!f.key);
 
       res.json(successResponse({ formName, fields }, 'Form fields fetched successfully'));
     } catch (error) {

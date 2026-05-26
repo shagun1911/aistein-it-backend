@@ -7,7 +7,7 @@ import Conversation from '../../models/Conversation';
 import mongoose from 'mongoose';
 import { logger } from '../../utils/logger.util';
 import { CallMetrics, DateRange } from './analytics.types';
-import { usageTrackerService } from '../usage/usageTracker.service';
+import { usageTrackerService, toUsageDateRange } from '../usage/usageTracker.service';
 
 export class CallMetricsService {
   /**
@@ -149,7 +149,7 @@ export class CallMetricsService {
       }
 
       const [totalCallMinutes, totalCalls] = await Promise.all([
-        usageTrackerService.calculateCallMinutes(organizationId, dateRange),
+        usageTrackerService.calculateCallMinutes(organizationId, toUsageDateRange(dateRange)),
         Conversation.countDocuments(query)
       ]);
 
@@ -209,7 +209,7 @@ export class CallMetricsService {
       }
 
       const [totalCallMinutes, totalCalls] = await Promise.all([
-        usageTrackerService.calculatePlatformCallMinutes(dateRange),
+        usageTrackerService.calculatePlatformCallMinutes(toUsageDateRange(dateRange)),
         Conversation.countDocuments(query)
       ]);
 

@@ -8,7 +8,7 @@ import Message from '../../models/Message';
 import mongoose from 'mongoose';
 import { logger } from '../../utils/logger.util';
 import { ChatMetrics, DateRange } from './analytics.types';
-import { usageTrackerService } from '../usage/usageTracker.service';
+import { usageTrackerService, toUsageDateRange } from '../usage/usageTracker.service';
 
 export class ChatMetricsService {
   /**
@@ -27,7 +27,7 @@ export class ChatMetricsService {
       if (!channel || channel === 'all') {
         const totalConversations = await usageTrackerService.calculateOrganizationChatConversations(
           organizationId,
-          dateRange
+          toUsageDateRange(dateRange)
         );
         return {
           totalConversations,
@@ -215,7 +215,9 @@ export class ChatMetricsService {
    */
   async getPlatformChatMetrics(dateRange?: DateRange): Promise<ChatMetrics> {
     try {
-      const totalConversations = await usageTrackerService.calculatePlatformChatConversations(dateRange);
+      const totalConversations = await usageTrackerService.calculatePlatformChatConversations(
+        toUsageDateRange(dateRange)
+      );
       return {
         totalConversations,
         totalChats: 0,

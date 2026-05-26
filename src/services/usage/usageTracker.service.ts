@@ -25,6 +25,18 @@ const profileUsageWarmInFlight = new Set<string>();
 
 export type UsageDateRange = { dateFrom?: Date; dateTo?: Date };
 
+/** Normalize analytics DateRange (string | Date) for usage aggregations. */
+export function toUsageDateRange(range?: {
+  dateFrom?: string | Date;
+  dateTo?: string | Date;
+}): UsageDateRange | undefined {
+  if (!range?.dateFrom && !range?.dateTo) return undefined;
+  return {
+    dateFrom: range.dateFrom ? new Date(range.dateFrom) : undefined,
+    dateTo: range.dateTo ? new Date(range.dateTo) : undefined
+  };
+}
+
 function conversationDateMatch(dateRange?: UsageDateRange): Record<string, unknown> {
   if (!dateRange?.dateFrom && !dateRange?.dateTo) return {};
   const createdAt: Record<string, Date> = {};

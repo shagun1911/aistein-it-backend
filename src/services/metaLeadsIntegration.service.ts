@@ -105,7 +105,8 @@ export async function fetchLeadgenFormFromMeta(params: {
   try {
     const res = await axios.get(`${base}/${formIdStr}`, {
       params: {
-        fields: 'id,name,questions{key,label,type}',
+        // Same as Graph API Explorer: GET /{form-id}?fields=questions,name
+        fields: 'id,name,questions',
         access_token: token,
       },
       timeout: 15000,
@@ -127,7 +128,7 @@ export async function fetchLeadgenFormFromMeta(params: {
     try {
       let nextUrl: string | undefined = `${base}/${pageIdStr}/leadgen_forms`;
       const listParams = {
-        fields: 'id,name,questions{key,label,type}',
+        fields: 'id,name,questions',
         limit: '100',
         access_token: token,
       };

@@ -11,6 +11,7 @@ router.use(requireAdmin);
 
 // Dashboard
 router.get('/dashboard/metrics', adminController.getDashboardMetrics);
+router.get('/dashboard/usage', adminController.getDashboardUsage);
 
 // Automations
 router.get('/automations', adminController.getAllAutomations);

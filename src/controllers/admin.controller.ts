@@ -12,12 +12,25 @@ export class AdminController {
   }
 
   /**
-   * Get dashboard metrics
+   * Fast dashboard counts (all indexed countDocuments — returns in <500ms)
    */
   getDashboardMetrics = async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {
-      const metrics = await this.adminService.getDashboardMetrics();
-      res.json(successResponse(metrics));
+      const counts = await this.adminService.getDashboardCounts();
+      res.json(successResponse(counts));
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  /**
+   * Slow dashboard usage totals (call minutes + chat conversations)
+   * Loaded separately so the main dashboard is never blocked by heavy aggregations
+   */
+  getDashboardUsage = async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const usage = await this.adminService.getDashboardUsage();
+      res.json(successResponse(usage));
     } catch (error) {
       next(error);
     }

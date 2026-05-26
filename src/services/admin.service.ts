@@ -14,24 +14,23 @@ import { usageTrackerService, mapWithConcurrency } from './usage/usageTracker.se
 import mongoose from 'mongoose';
 import Plan from '../models/Plan';
 
-const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:metrics:v3';
+const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:counts:v1';
+const ADMIN_USAGE_CACHE_KEY = 'admin:dashboard:usage:v1';
 const ADMIN_DASHBOARD_CACHE_TTL_SEC = 300;
+const ADMIN_USAGE_CACHE_TTL_SEC = 300;
 
 const adminDashboardLocalCache = new Map<string, { value: any; expiresAt: number }>();
 const platformUsageLocalCache = new Map<string, { value: { callMinutes: number; chatConversations: number }; expiresAt: number }>();
 
-function getAdminDashboardFromLocalCache(): any | null {
-  const entry = adminDashboardLocalCache.get(ADMIN_DASHBOARD_CACHE_KEY);
+function getLocalCache(cache: Map<string, { value: any; expiresAt: number }>, key: string): any | null {
+  const entry = cache.get(key);
   if (entry && entry.expiresAt > Date.now()) return entry.value;
-  if (entry) adminDashboardLocalCache.delete(ADMIN_DASHBOARD_CACHE_KEY);
+  if (entry) cache.delete(key);
   return null;
 }
 
-function setAdminDashboardLocalCache(value: any): void {
-  adminDashboardLocalCache.set(ADMIN_DASHBOARD_CACHE_KEY, {
-    value,
-    expiresAt: Date.now() + ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000
-  });
+function setLocalCache(cache: Map<string, { value: any; expiresAt: number }>, key: string, value: any, ttlMs: number): void {
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
 
 function platformUsageCacheKey(dateRange?: { dateFrom?: Date; dateTo?: Date }): string {
@@ -40,9 +39,30 @@ function platformUsageCacheKey(dateRange?: { dateFrom?: Date; dateTo?: Date }): 
   return `admin:platform:usage:${from}:${to}`;
 }
 
+async function redisGet(key: string): Promise<any | null> {
+  try {
+    const { default: redisClient, isRedisAvailable } = await import('../config/redis');
+    if (isRedisAvailable()) {
+      const cached = await redisClient.get(key);
+      if (cached) return JSON.parse(cached);
+    }
+  } catch (_) { /* fall through */ }
+  return null;
+}
+
+async function redisSet(key: string, value: any, ttlSec: number): Promise<void> {
+  try {
+    const { default: redisClient, isRedisAvailable } = await import('../config/redis');
+    if (isRedisAvailable()) {
+      await redisClient.setEx(key, ttlSec, JSON.stringify(value));
+    }
+  } catch (_) { /* best-effort */ }
+}
+
 export class AdminService {
   /**
    * Platform call minutes + completed chat conversations (aggregation-only, no transcript scans).
+   * Cached in Redis + in-process for ADMIN_USAGE_CACHE_TTL_SEC seconds.
    */
   async getPlatformUsageTotals(dateRange?: { dateFrom?: Date; dateTo?: Date }): Promise<{
     callMinutes: number;
@@ -50,26 +70,14 @@ export class AdminService {
   }> {
     const cacheKey = platformUsageCacheKey(dateRange);
 
-    const localHit = platformUsageLocalCache.get(cacheKey);
-    if (localHit && localHit.expiresAt > Date.now()) {
-      return localHit.value;
-    }
-    if (localHit) platformUsageLocalCache.delete(cacheKey);
+    const localHit = getLocalCache(platformUsageLocalCache, cacheKey);
+    if (localHit) return localHit;
 
-    try {
-      const { default: redisClient, isRedisAvailable } = await import('../config/redis');
-      if (isRedisAvailable()) {
-        const cached = await redisClient.get(cacheKey);
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          platformUsageLocalCache.set(cacheKey, {
-            value: parsed,
-            expiresAt: Date.now() + ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000
-          });
-          return parsed;
-        }
-      }
-    } catch (_) { /* fall through */ }
+    const redisHit = await redisGet(cacheKey);
+    if (redisHit) {
+      setLocalCache(platformUsageLocalCache, cacheKey, redisHit, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
+      return redisHit;
+    }
 
     const [callMinutes, chatConversations] = await Promise.all([
       usageTrackerService.calculatePlatformCallMinutes(dateRange),
@@ -77,94 +85,133 @@ export class AdminService {
     ]);
     const result = { callMinutes, chatConversations };
 
-    platformUsageLocalCache.set(cacheKey, {
-      value: result,
-      expiresAt: Date.now() + ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000
-    });
-
-    try {
-      const { default: redisClient, isRedisAvailable } = await import('../config/redis');
-      if (isRedisAvailable()) {
-        await redisClient.setEx(cacheKey, ADMIN_DASHBOARD_CACHE_TTL_SEC, JSON.stringify(result));
-      }
-    } catch (_) { /* best-effort */ }
-
+    setLocalCache(platformUsageLocalCache, cacheKey, result, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
+    await redisSet(cacheKey, result, ADMIN_USAGE_CACHE_TTL_SEC);
     return result;
   }
 
   /**
-   * Get dashboard metrics (platform-wide, all-time)
+   * Fast count metrics — all indexed countDocuments, returns in <500ms.
+   * Does NOT include call minutes / chat conversations (use getDashboardUsage for those).
+   */
+  async getDashboardCounts() {
+    const localHit = getLocalCache(adminDashboardLocalCache, ADMIN_DASHBOARD_CACHE_KEY);
+    if (localHit) return localHit;
+
+    const redisHit = await redisGet(ADMIN_DASHBOARD_CACHE_KEY);
+    if (redisHit) {
+      setLocalCache(adminDashboardLocalCache, ADMIN_DASHBOARD_CACHE_KEY, redisHit, ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000);
+      return redisHit;
+    }
+
+    const [
+      totalOrganizations,
+      activeOrganizations,
+      totalUsers,
+      totalAutomations,
+      activeAutomations,
+      totalExecutions,
+      failedExecutions,
+      googleIntegrations,
+      whatsappIntegrations,
+      instagramIntegrations,
+      facebookIntegrations,
+      ecommerceIntegrations
+    ] = await Promise.all([
+      Organization.countDocuments({ status: { $ne: 'deleted' } }),
+      Organization.countDocuments({ status: 'active' }),
+      User.countDocuments({ status: 'active' }),
+      Automation.countDocuments(),
+      Automation.countDocuments({ isActive: true }),
+      AutomationExecution.countDocuments(),
+      AutomationExecution.countDocuments({ status: 'failed' }),
+      GoogleIntegration.countDocuments({ status: 'active' }),
+      SocialIntegration.countDocuments({ platform: 'whatsapp', status: 'connected' }),
+      SocialIntegration.countDocuments({ platform: 'instagram', status: 'connected' }),
+      SocialIntegration.countDocuments({ platform: 'facebook', status: 'connected' }),
+      Settings.countDocuments({ 'ecommerceIntegration.platform': { $exists: true, $ne: null } })
+    ]);
+
+    const counts = {
+      totalOrganizations,
+      activeOrganizations,
+      totalUsers,
+      totalAutomations,
+      activeAutomations,
+      totalExecutions,
+      failedExecutions,
+      googleIntegrations,
+      whatsappIntegrations,
+      instagramIntegrations,
+      facebookIntegrations,
+      ecommerceIntegrations
+    };
+
+    setLocalCache(adminDashboardLocalCache, ADMIN_DASHBOARD_CACHE_KEY, counts, ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000);
+    await redisSet(ADMIN_DASHBOARD_CACHE_KEY, counts, ADMIN_DASHBOARD_CACHE_TTL_SEC);
+    return counts;
+  }
+
+  /**
+   * Usage totals for dashboard (call minutes + chat conversations).
+   * Separate from counts so the dashboard never blocks on slow aggregations.
+   */
+  async getDashboardUsage() {
+    const localHit = getLocalCache(platformUsageLocalCache, ADMIN_USAGE_CACHE_KEY);
+    if (localHit) return localHit;
+
+    const redisHit = await redisGet(ADMIN_USAGE_CACHE_KEY);
+    if (redisHit) {
+      setLocalCache(platformUsageLocalCache, ADMIN_USAGE_CACHE_KEY, redisHit, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
+      return redisHit;
+    }
+
+    const [callMinutes, chatConversations] = await Promise.all([
+      usageTrackerService.calculatePlatformCallMinutes(),
+      usageTrackerService.calculatePlatformChatConversations()
+    ]);
+    const result = { callMinutes, chatConversations };
+
+    setLocalCache(platformUsageLocalCache, ADMIN_USAGE_CACHE_KEY, result, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
+    await redisSet(ADMIN_USAGE_CACHE_KEY, result, ADMIN_USAGE_CACHE_TTL_SEC);
+    return result;
+  }
+
+  /**
+   * Warm the dashboard usage cache in the background (call on server start).
+   * Never throws — errors are logged and swallowed.
+   */
+  async warmDashboardUsageCache(): Promise<void> {
+    try {
+      const cached = await redisGet(ADMIN_USAGE_CACHE_KEY);
+      if (cached) {
+        logger.info('[AdminService] Dashboard usage cache already warm, skipping pre-computation');
+        setLocalCache(platformUsageLocalCache, ADMIN_USAGE_CACHE_KEY, cached, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
+        return;
+      }
+      logger.info('[AdminService] Pre-warming dashboard usage cache...');
+      await this.getDashboardUsage();
+      logger.info('[AdminService] Dashboard usage cache warmed successfully');
+    } catch (err: any) {
+      logger.warn('[AdminService] Dashboard usage cache warm failed (non-fatal):', err.message);
+    }
+  }
+
+  /**
+   * @deprecated — kept for backward compat. Returns counts + usage together.
+   * Prefer getDashboardCounts() + getDashboardUsage() in separate requests.
    */
   async getDashboardMetrics() {
     try {
-      try {
-        const { default: redisClient, isRedisAvailable } = await import('../config/redis');
-        if (isRedisAvailable()) {
-          const cached = await redisClient.get(ADMIN_DASHBOARD_CACHE_KEY);
-          if (cached) return JSON.parse(cached);
-        }
-      } catch (_) { /* fall through to compute */ }
-
-      const localHit = getAdminDashboardFromLocalCache();
-      if (localHit) return localHit;
-
-      const [
-        totalOrganizations,
-        activeOrganizations,
-        totalUsers,
-        totalAutomations,
-        activeAutomations,
-        totalExecutions,
-        failedExecutions,
-        googleIntegrations,
-        whatsappIntegrations,
-        instagramIntegrations,
-        facebookIntegrations,
-        ecommerceIntegrations,
-        platformUsage
-      ] = await Promise.all([
-        Organization.countDocuments({ status: { $ne: 'deleted' } }),
-        Organization.countDocuments({ status: 'active' }),
-        User.countDocuments({ status: 'active' }),
-        Automation.countDocuments(),
-        Automation.countDocuments({ isActive: true }),
-        AutomationExecution.countDocuments(),
-        AutomationExecution.countDocuments({ status: 'failed' }),
-        GoogleIntegration.countDocuments({ status: 'active' }),
-        SocialIntegration.countDocuments({ platform: 'whatsapp', status: 'connected' }),
-        SocialIntegration.countDocuments({ platform: 'instagram', status: 'connected' }),
-        SocialIntegration.countDocuments({ platform: 'facebook', status: 'connected' }),
-        Settings.countDocuments({ 'ecommerceIntegration.platform': { $exists: true, $ne: null } }),
-        this.getPlatformUsageTotals()
+      const [counts, usage] = await Promise.all([
+        this.getDashboardCounts(),
+        this.getDashboardUsage()
       ]);
-
-      const metrics = {
-        totalOrganizations,
-        activeOrganizations,
-        totalUsers,
-        totalAutomations,
-        activeAutomations,
-        totalExecutions,
-        failedExecutions,
-        googleIntegrations,
-        whatsappIntegrations,
-        instagramIntegrations,
-        facebookIntegrations,
-        ecommerceIntegrations,
-        totalCallMinutes: platformUsage.callMinutes,
-        totalChatConversations: platformUsage.chatConversations
+      return {
+        ...counts,
+        totalCallMinutes: usage.callMinutes,
+        totalChatConversations: usage.chatConversations
       };
-
-      setAdminDashboardLocalCache(metrics);
-
-      try {
-        const { default: redisClient, isRedisAvailable } = await import('../config/redis');
-        if (isRedisAvailable()) {
-          await redisClient.setEx(ADMIN_DASHBOARD_CACHE_KEY, ADMIN_DASHBOARD_CACHE_TTL_SEC, JSON.stringify(metrics));
-        }
-      } catch (_) { /* cache write is best-effort */ }
-
-      return metrics;
     } catch (error: any) {
       logger.error('Failed to get dashboard metrics', { error: error.message });
       throw error;

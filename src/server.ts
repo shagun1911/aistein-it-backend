@@ -466,6 +466,16 @@ const startServer = async () => {
       logger.warn('⚠️  Could not perform startup agent sync:', error.message);
       // Don't block server startup if sync fails
     }
+
+    // Pre-warm admin dashboard usage cache in the background so the first admin
+    // page load never has to wait for the heavy platform aggregations.
+    setImmediate(async () => {
+      try {
+        const { AdminService } = await import('./services/admin.service');
+        const adminService = new AdminService();
+        await adminService.warmDashboardUsageCache();
+      } catch (_) { /* non-fatal */ }
+    });
     
     // Start server with Socket.io
     httpServer.listen(PORT_NUMBER, () => {

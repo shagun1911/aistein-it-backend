@@ -11,6 +11,8 @@ router.use(requireAdmin);
 
 // Dashboard
 router.get('/dashboard/metrics', adminController.getDashboardMetrics);
+router.get('/dashboard/usage/call-minutes', adminController.getDashboardCallMinutes);
+router.get('/dashboard/usage/chat-conversations', adminController.getDashboardChatConversations);
 router.get('/dashboard/usage', adminController.getDashboardUsage);
 
 // Automations

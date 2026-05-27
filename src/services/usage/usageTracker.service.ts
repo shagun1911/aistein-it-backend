@@ -53,6 +53,14 @@ function messageTimestampMatch(dateRange?: UsageDateRange): Record<string, unkno
   return { timestamp };
 }
 
+/** Completed voice calls: transcript present (matches platform billing source of truth). */
+function voiceCallDurationMatch(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    transcript: { $ne: null, $exists: true },
+    ...extra
+  };
+}
+
 /** Run async work over items with bounded concurrency. */
 export async function mapWithConcurrency<T, R>(
   items: T[],
@@ -88,49 +96,22 @@ function localCacheSet(key: string, value: any): void {
 
 export class UsageTrackerService {
   /**
-   * Calculate call minutes from actual phone conversations.
-   *
-   * Uses the denormalized `callDurationSeconds` field when present (set at call-end),
-   * falling back to a createdAt→updatedAt difference for conversations that don't have it.
-   * Never loads transcript data into Node memory.
+   * Calculate call minutes from completed voice calls (non-null transcript).
+   * Sums metadata.duration_seconds in MongoDB — no transcript blobs loaded into Node.
    */
   async calculateCallMinutes(organizationId: string, dateRange?: UsageDateRange): Promise<number> {
     try {
       const result = await Conversation.aggregate([
         {
-          $match: {
+          $match: voiceCallDurationMatch({
             organizationId: new mongoose.Types.ObjectId(organizationId),
-            channel: 'phone',
             ...conversationDateMatch(dateRange)
-          }
-        },
-        {
-          $project: {
-            // Prefer explicit stored duration; fall back to updatedAt-createdAt diff capped at 2 h
-            durationSeconds: {
-              $cond: {
-                if: { $and: [{ $gt: ['$callDurationSeconds', 0] }, { $lte: ['$callDurationSeconds', 7200] }] },
-                then: '$callDurationSeconds',
-                else: {
-                  $cond: {
-                    if: {
-                      $and: [
-                        { $gt: [{ $subtract: ['$updatedAt', '$createdAt'] }, 0] },
-                        { $lte: [{ $subtract: ['$updatedAt', '$createdAt'] }, 7200000] }
-                      ]
-                    },
-                    then: { $divide: [{ $subtract: ['$updatedAt', '$createdAt'] }, 1000] },
-                    else: 0
-                  }
-                }
-              }
-            }
-          }
+          })
         },
         {
           $group: {
             _id: null,
-            totalSeconds: { $sum: '$durationSeconds' },
+            totalSeconds: { $sum: { $ifNull: ['$metadata.duration_seconds', 0] } },
             count: { $sum: 1 }
           }
         }
@@ -138,8 +119,8 @@ export class UsageTrackerService {
 
       if (!result.length) return 0;
 
-      const totalMinutes = Math.ceil(result[0].totalSeconds / 60);
-      logger.info(`[Usage Tracker] Org ${organizationId}: ${totalMinutes} call minutes from ${result[0].count} phone conversations`);
+      const totalMinutes = Math.round(result[0].totalSeconds / 60);
+      logger.info(`[Usage Tracker] Org ${organizationId}: ${totalMinutes} call minutes from ${result[0].count} voice conversations`);
       return totalMinutes;
 
     } catch (error: any) {
@@ -561,44 +542,22 @@ export class UsageTrackerService {
 
   /**
    * Platform-wide call minutes for admin dashboard.
-   * Uses MongoDB aggregation only — never loads transcript blobs into Node memory.
+   * Sums metadata.duration_seconds for conversations with a transcript (aggregation-only).
    */
   async calculatePlatformCallMinutes(dateRange?: UsageDateRange): Promise<number> {
     try {
       const result = await Conversation.aggregate([
-        { $match: { channel: 'phone', ...conversationDateMatch(dateRange) } },
-        {
-          $project: {
-            durationSeconds: {
-              $cond: {
-                if: { $and: [{ $gt: ['$callDurationSeconds', 0] }, { $lte: ['$callDurationSeconds', 7200] }] },
-                then: '$callDurationSeconds',
-                else: {
-                  $cond: {
-                    if: {
-                      $and: [
-                        { $gt: [{ $subtract: ['$updatedAt', '$createdAt'] }, 0] },
-                        { $lte: [{ $subtract: ['$updatedAt', '$createdAt'] }, 7200000] }
-                      ]
-                    },
-                    then: { $divide: [{ $subtract: ['$updatedAt', '$createdAt'] }, 1000] },
-                    else: 0
-                  }
-                }
-              }
-            }
-          }
-        },
+        { $match: voiceCallDurationMatch(conversationDateMatch(dateRange)) },
         {
           $group: {
             _id: null,
-            totalSeconds: { $sum: '$durationSeconds' }
+            totalSeconds: { $sum: { $ifNull: ['$metadata.duration_seconds', 0] } }
           }
         }
       ]);
 
       if (!result.length) return 0;
-      return Math.ceil(result[0].totalSeconds / 60);
+      return Math.round(result[0].totalSeconds / 60);
     } catch (error: any) {
       logger.error('[Usage Tracker] Error calculating platform call minutes:', error.message);
       return 0;
@@ -663,39 +622,18 @@ export class UsageTrackerService {
     }
   }
 
+  /**
+   * Platform-wide chat conversations for admin dashboard.
+   * Uses indexed countDocuments on conversations (non-phone with activity) — avoids
+   * scanning the entire messages collection which times out on large datasets.
+   */
   async calculatePlatformChatConversations(dateRange?: UsageDateRange): Promise<number> {
     try {
-      const result = await Message.aggregate([
-        {
-          $match: {
-            type: 'message',
-            sender: { $in: ['customer', 'ai'] },
-            ...messageTimestampMatch(dateRange)
-          }
-        },
-        {
-          $group: {
-            _id: '$conversationId',
-            hasCustomer: { $max: { $cond: [{ $eq: ['$sender', 'customer'] }, 1, 0] } },
-            hasAi: { $max: { $cond: [{ $eq: ['$sender', 'ai'] }, 1, 0] } }
-          }
-        },
-        { $match: { hasCustomer: 1, hasAi: 1 } },
-        {
-          $lookup: {
-            from: 'conversations',
-            localField: '_id',
-            foreignField: '_id',
-            as: 'conv',
-            pipeline: [{ $project: { channel: 1 } }]
-          }
-        },
-        { $unwind: '$conv' },
-        { $match: { 'conv.channel': { $ne: 'phone' } } },
-        { $count: 'total' }
-      ]);
-
-      return result[0]?.total || 0;
+      return await Conversation.countDocuments({
+        channel: { $ne: 'phone' },
+        'lastMessage.timestamp': { $exists: true },
+        ...conversationDateMatch(dateRange)
+      });
     } catch (error: any) {
       logger.error('[Usage Tracker] Error calculating platform chat conversations:', error.message);
       return 0;

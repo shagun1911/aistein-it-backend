@@ -23,9 +23,29 @@ export class AdminController {
     }
   };
 
+  /** Call minutes only — fast, cached independently from chat count */
+  getDashboardCallMinutes = async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const callMinutes = await this.adminService.getDashboardCallMinutes();
+      res.json(successResponse({ callMinutes }));
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  /** Chat conversations only — cached independently from call minutes */
+  getDashboardChatConversations = async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const chatConversations = await this.adminService.getDashboardChatConversations();
+      res.json(successResponse({ chatConversations }));
+    } catch (error) {
+      next(error);
+    }
+  };
+
   /**
-   * Slow dashboard usage totals (call minutes + chat conversations)
-   * Loaded separately so the main dashboard is never blocked by heavy aggregations
+   * Combined usage totals (call minutes + chat conversations)
+   * @deprecated Prefer separate /call-minutes and /chat-conversations endpoints
    */
   getDashboardUsage = async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {

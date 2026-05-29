@@ -364,30 +364,13 @@ export class AnalyticsService {
       { $sort: { _id: 1 } }
     ]);
 
-    // Call minutes trend — use stored callDurationSeconds field, no transcript loading
+    // Call minutes trend — sum metadata.duration_seconds for completed voice calls
     const callMinutesRaw = await Conversation.aggregate([
-      { $match: { ...dateQuery, channel: 'phone' } },
+      { $match: { ...dateQuery, transcript: { $ne: null, $exists: true } } },
       {
         $project: {
           period: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          durationSeconds: {
-            $cond: {
-              if: { $and: [{ $gt: ['$callDurationSeconds', 0] }, { $lte: ['$callDurationSeconds', 7200] }] },
-              then: '$callDurationSeconds',
-              else: {
-                $cond: {
-                  if: {
-                    $and: [
-                      { $gt: [{ $subtract: ['$updatedAt', '$createdAt'] }, 0] },
-                      { $lte: [{ $subtract: ['$updatedAt', '$createdAt'] }, 7200000] }
-                    ]
-                  },
-                  then: { $divide: [{ $subtract: ['$updatedAt', '$createdAt'] }, 1000] },
-                  else: 0
-                }
-              }
-            }
-          }
+          durationSeconds: { $ifNull: ['$metadata.duration_seconds', 0] }
         }
       },
       {

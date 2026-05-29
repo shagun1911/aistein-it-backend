@@ -1005,7 +1005,7 @@ export class AutomationService {
 
   /**
    * Extract via Python service POST /api/v1/automation/extract-data (multilingual, tested).
-   * Falls back to local extractConversationData on failure.
+   * Appointment and dynamic schema extraction must use this path only (no Node.js LLM fallback).
    */
   async extractConversationDataViaPythonApi(
     conversationId: string,
@@ -1067,17 +1067,17 @@ export class AutomationService {
         error.response?.data?.message ||
         error.message ||
         'Python extract-data request failed';
-      console.warn('[Automation Service] Python extract-data failed, using local fallback:', msg);
+      console.error('[Automation Service] Python extract-data failed:', msg);
       throw error;
     }
   }
 
   /**
-   * Appointment extraction: Python API first, then local LLM fallback.
+   * Appointment / dynamic schema extraction — Python service only (no Node.js OpenAI fallback).
    */
   async extractAppointmentForAutomation(
     conversationId: string,
-    organizationId: string,
+    _organizationId: string,
     options?: { extraction_prompt?: string; json_example?: Record<string, any>; extraction_type?: string }
   ): Promise<ExtractConversationResult> {
     const extractionType = options?.extraction_type || 'appointment';
@@ -1095,45 +1095,10 @@ export class AutomationService {
       );
     }
 
-    try {
-      const result = await this.extractConversationDataViaPythonApi(conversationId, extractionType, {
-        extraction_prompt: prompt,
-        json_example: jsonExample
-      });
-
-      const nameKeys = ['name', 'customer_name', 'full_name'] as const;
-      const wantsName = nameKeys.some((k) => k in jsonExample);
-      const hasName = isMeaningfulExtractedValue(resolveExtractedPersonName(result.extracted_data));
-      if (wantsName && !hasName && result.success !== false) {
-        console.warn(
-          '[Automation Service] Python extract-data omitted name — supplementing via local LLM',
-          { conversationId }
-        );
-        try {
-          const local = await this.extractConversationData(conversationId, extractionType, organizationId, {
-            extraction_prompt: prompt,
-            json_example: jsonExample
-          });
-          if (local.success && local.extracted_data) {
-            result.extracted_data = { ...(result.extracted_data || {}), ...local.extracted_data };
-            for (const k of nameKeys) {
-              if (isMeaningfulExtractedValue(local.extracted_data[k])) {
-                result.extracted_data[k] = local.extracted_data[k];
-              }
-            }
-          }
-        } catch (supplementErr: any) {
-          console.warn('[Automation Service] Local name supplement failed:', supplementErr?.message);
-        }
-      }
-
-      return result;
-    } catch {
-      return this.extractConversationData(conversationId, extractionType, organizationId, {
-        extraction_prompt: prompt,
-        json_example: jsonExample
-      });
-    }
+    return this.extractConversationDataViaPythonApi(conversationId, extractionType, {
+      extraction_prompt: prompt,
+      json_example: jsonExample
+    });
   }
 
   /**

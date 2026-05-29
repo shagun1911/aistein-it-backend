@@ -122,4 +122,15 @@ ConversationSchema.index({ organizationId: 1, status: 1, updatedAt: -1 });
 ConversationSchema.index({ organizationId: 1, channel: 1, updatedAt: -1 });
 ConversationSchema.index({ organizationId: 1, assignedOperatorId: 1, updatedAt: -1 });
 
+// Batch calling / ElevenLabs webhook hot paths — previously causing full collection scans.
+// batchCalling.service + batchCalling.controller + elevenlabsWebhook.controller all query
+// { organizationId, channel: 'phone', 'metadata.batch_call_id': jobId } at high frequency.
+ConversationSchema.index({ organizationId: 1, channel: 1, 'metadata.batch_call_id': 1 });
+// ElevenLabs findOne({ organizationId, 'metadata.conversation_id' }) in automation +
+// elevenlabsWebhook; also covers the findOne without organizationId via the sparse path.
+ConversationSchema.index({ organizationId: 1, 'metadata.conversation_id': 1 });
+ConversationSchema.index({ 'metadata.conversation_id': 1 }, { sparse: true });
+// Webhook findOne({ customerId, channel }) — WhatsApp / Meta / Instagram webhooks.
+ConversationSchema.index({ customerId: 1, channel: 1 });
+
 export default mongoose.model<IConversation>('Conversation', ConversationSchema);

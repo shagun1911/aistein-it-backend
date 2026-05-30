@@ -5,6 +5,8 @@ export interface MetaOAuthConfig {
   appId: string;
   appSecret: string;
   redirectUri: string;
+  /** e.g. v25.0 — defaults to v21.0 for Messenger/Instagram/WhatsApp */
+  graphApiVersion?: string;
 }
 
 export interface MetaAccessTokenResponse {
@@ -44,12 +46,15 @@ export class MetaOAuthService {
   private appId: string;
   private appSecret: string;
   private redirectUri: string;
-  private baseUrl = 'https://graph.facebook.com/v21.0';
+  private baseUrl: string;
 
   constructor(config: MetaOAuthConfig) {
     this.appId = config.appId;
     this.appSecret = config.appSecret;
     this.redirectUri = config.redirectUri;
+    const rawVersion = (config.graphApiVersion || 'v21.0').trim();
+    const version = rawVersion.startsWith('v') ? rawVersion : `v${rawVersion}`;
+    this.baseUrl = `https://graph.facebook.com/${version}`;
   }
 
   /**

@@ -2,6 +2,11 @@ import axios from 'axios';
 import { AppError } from '../middleware/error.middleware';
 import { MetaOAuthService } from './metaOAuth.service';
 import { getMetaLeadsGraphApiVersion } from '../config/metaLeads.config';
+import {
+  getMetaLeadsOAuthRedirectUri,
+  getPublicBackendBaseFromEnv,
+  normalizePublicBackendBase,
+} from '../utils/publicUrl.util';
 
 /** OAuth scopes for Meta Lead Ads only (not Messenger / WhatsApp). */
 export const META_LEADS_OAUTH_SCOPES = [
@@ -31,24 +36,23 @@ export function getMetaLeadsAppCredentials(): { appId: string; appSecret: string
   return { appId, appSecret };
 }
 
-export function getMetaLeadsOAuthRedirectUri(backendUrl: string): string {
-  const base = backendUrl.replace(/\/$/, '');
-  return `${base}/api/v1/social-integrations/meta-leads/oauth/callback`;
-}
+export { getMetaLeadsOAuthRedirectUri } from '../utils/publicUrl.util';
 
-export function createMetaLeadsOAuthService(backendUrl: string): MetaOAuthService {
+export function createMetaLeadsOAuthService(backendUrl?: string): MetaOAuthService {
   const { appId, appSecret } = getMetaLeadsAppCredentials();
+  const base = normalizePublicBackendBase(backendUrl || getPublicBackendBaseFromEnv());
   return new MetaOAuthService({
     appId,
     appSecret,
-    redirectUri: getMetaLeadsOAuthRedirectUri(backendUrl),
+    redirectUri: getMetaLeadsOAuthRedirectUri(base),
+    graphApiVersion: getMetaLeadsGraphApiVersion(),
   });
 }
 
 /**
  * Build Facebook OAuth URL with Lead Ads scopes only.
  */
-export function getMetaLeadsAuthorizationUrl(state: string, backendUrl: string): string {
+export function getMetaLeadsAuthorizationUrl(state: string, backendUrl?: string): string {
   const { appId } = getMetaLeadsAppCredentials();
   const redirectUri = getMetaLeadsOAuthRedirectUri(backendUrl);
   const scopeString = META_LEADS_OAUTH_SCOPES.join(',');
@@ -88,11 +92,11 @@ export async function subscribeMetaLeadsPageToWebhooks(
   }
 }
 
-export function getMetaLeadsWebhookInfo(backendUrl: string): {
+export function getMetaLeadsWebhookInfo(backendUrl?: string): {
   callbackUrl: string;
   verifyTokenEnv: string;
 } {
-  const base = backendUrl.replace(/\/$/, '');
+  const base = normalizePublicBackendBase(backendUrl || getPublicBackendBaseFromEnv());
   return {
     callbackUrl: `${base}/api/v1/social-integrations/meta-leads/webhook`,
     verifyTokenEnv: 'META_LEADS_VERIFY_TOKEN',

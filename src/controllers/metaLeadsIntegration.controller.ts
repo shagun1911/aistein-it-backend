@@ -12,6 +12,14 @@ import {
   META_LEADS_OAUTH_SCOPES,
   subscribeMetaLeadsPageToWebhooks,
 } from '../services/metaLeadsOAuth.service';
+import {
+  appendSocialsQuery,
+  getMetaLeadsOAuthRedirectUri,
+  getPublicBackendBaseFromEnv,
+  oauthSocialsReturnUrl,
+  resolveOAuthReturnBase,
+  resolveOAuthStateReturnUrl,
+} from '../utils/publicUrl.util';
 import { metaLeadsConfig } from '../config/metaLeads.config';
 import redisClient, { isRedisAvailable } from '../config/redis';
 import { findMetaLeadsIntegrationByOrganization } from '../services/metaLeadsIntegration.service';
@@ -34,7 +42,7 @@ export class MetaLeadsIntegrationController {
         return;
       }
 
-      const backendUrl = process.env.BACKEND_URL || 'http://localhost:5001';
+      const backendUrl = getPublicBackendBaseFromEnv() || 'http://localhost:5001';
       const webhook = getMetaLeadsWebhookInfo(backendUrl);
 
       res.json(
@@ -71,25 +79,30 @@ export class MetaLeadsIntegrationController {
       if (!req.user?._id) throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
 
       const organizationId = req.user.organizationId || req.user._id;
-      const backendUrl = process.env.BACKEND_URL;
-      const frontendUrl = process.env.FRONTEND_URL;
-      if (!backendUrl || !frontendUrl) {
-        throw new AppError(500, 'CONFIGURATION_ERROR', 'BACKEND_URL and FRONTEND_URL are required');
+      const backendUrl = getPublicBackendBaseFromEnv();
+      if (!backendUrl) {
+        throw new AppError(500, 'CONFIGURATION_ERROR', 'BACKEND_URL is required');
       }
 
       getMetaLeadsAppCredentials();
+
+      const returnOrigin =
+        typeof req.body?.returnOrigin === 'string' ? req.body.returnOrigin : undefined;
+      const redirectUrl = oauthSocialsReturnUrl(resolveOAuthReturnBase(returnOrigin));
 
       const state = Buffer.from(
         JSON.stringify({
           userId: req.user._id.toString(),
           organizationId: organizationId.toString(),
           platform: 'meta_leads',
-          redirectUrl: `${frontendUrl}/settings/socials`,
+          redirectUrl,
         })
       ).toString('base64');
 
       const authUrl = getMetaLeadsAuthorizationUrl(state, backendUrl);
-      console.log('[Meta Leads OAuth] Initiate — redirect URI:', `${backendUrl.replace(/\/$/, '')}/api/v1/social-integrations/meta-leads/oauth/callback`);
+      const oauthRedirectUri = getMetaLeadsOAuthRedirectUri(backendUrl);
+      console.log('[Meta Leads OAuth] Initiate — return URL:', redirectUrl);
+      console.log('[Meta Leads OAuth] Initiate — redirect URI:', oauthRedirectUri);
 
       res.json(successResponse({ authUrl }, 'Meta Lead Ads OAuth URL generated'));
     } catch (error) {
@@ -101,31 +114,43 @@ export class MetaLeadsIntegrationController {
    * GET|POST /api/v1/social-integrations/meta-leads/oauth/callback
    */
   async oauthCallback(req: Request, res: Response) {
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const defaultReturnUrl = oauthSocialsReturnUrl(resolveOAuthReturnBase());
     try {
       const code = (req.query.code as string) || (req.body?.code as string);
       const stateRaw = (req.query.state as string) || (req.body?.state as string);
       const errorParam = req.query.error as string;
 
+      let state: { userId?: string; organizationId?: string; redirectUrl?: string } = {};
+      if (stateRaw) {
+        try {
+          state = JSON.parse(Buffer.from(stateRaw, 'base64').toString('utf8'));
+        } catch {
+          state = {};
+        }
+      }
+      const returnUrl = resolveOAuthStateReturnUrl(state.redirectUrl) || defaultReturnUrl;
+
       if (errorParam) {
         return res.redirect(
-          `${frontendUrl}/settings/socials?error=${encodeURIComponent(errorParam)}&platform=meta_leads`
+          appendSocialsQuery(returnUrl, { error: errorParam, platform: 'meta_leads' })
         );
       }
 
       if (!code || !stateRaw) {
         return res.redirect(
-          `${frontendUrl}/settings/socials?error=${encodeURIComponent('Missing OAuth code')}&platform=meta_leads`
+          appendSocialsQuery(returnUrl, {
+            error: 'Missing OAuth code',
+            platform: 'meta_leads',
+          })
         );
       }
 
-      const state = JSON.parse(Buffer.from(stateRaw, 'base64').toString('utf8'));
       const { userId, organizationId } = state;
       if (!userId || !organizationId) {
         throw new Error('Invalid OAuth state');
       }
 
-      const backendUrl = process.env.BACKEND_URL || 'http://localhost:5001';
+      const backendUrl = getPublicBackendBaseFromEnv() || 'http://localhost:5001';
       const { appId } = getMetaLeadsAppCredentials();
       const metaOAuth = createMetaLeadsOAuthService(backendUrl);
 
@@ -145,7 +170,10 @@ export class MetaLeadsIntegrationController {
       const pages = await metaOAuth.getUserPages(accessToken);
       if (pages.length === 0) {
         return res.redirect(
-          `${frontendUrl}/settings/socials?error=${encodeURIComponent('No Facebook Pages found')}&platform=meta_leads`
+          appendSocialsQuery(returnUrl, {
+            error: 'No Facebook Pages found',
+            platform: 'meta_leads',
+          })
         );
       }
 
@@ -171,7 +199,11 @@ export class MetaLeadsIntegrationController {
           })
         );
         return res.redirect(
-          `${frontendUrl}/settings/socials?select_page=true&platform=meta_leads&session=${sessionKey}`
+          appendSocialsQuery(returnUrl, {
+            select_page: 'true',
+            platform: 'meta_leads',
+            session: sessionKey,
+          })
         );
       }
 
@@ -186,11 +218,18 @@ export class MetaLeadsIntegrationController {
         userName,
       });
 
-      return res.redirect(`${frontendUrl}/settings/socials?success=true&platform=meta_leads`);
+      return res.redirect(
+        appendSocialsQuery(returnUrl, { success: 'true', platform: 'meta_leads' })
+      );
     } catch (err: any) {
       console.error('[Meta Leads OAuth] Callback error:', err?.message || err);
+      const message = err?.message || 'OAuth failed';
+      console.error('[Meta Leads OAuth] redirect_uri used:', getMetaLeadsOAuthRedirectUri());
       return res.redirect(
-        `${frontendUrl}/settings/socials?error=${encodeURIComponent(err?.message || 'OAuth failed')}&platform=meta_leads`
+        appendSocialsQuery(defaultReturnUrl, {
+          error: message,
+          platform: 'meta_leads',
+        })
       );
     }
   }
@@ -267,7 +306,7 @@ export class MetaLeadsIntegrationController {
 
       await redisClient.del(`oauth_pending_pages:${sessionKey}`);
 
-      const backendUrl = process.env.BACKEND_URL || 'http://localhost:5001';
+      const backendUrl = getPublicBackendBaseFromEnv() || 'http://localhost:5001';
       const webhook = getMetaLeadsWebhookInfo(backendUrl);
 
       res.json(

@@ -11,7 +11,268 @@ import { callMetricsService } from './analytics/callMetrics.service';
 import { chatMetricsService } from './analytics/chatMetrics.service';
 import { logger } from '../utils/logger.util';
 
+import { usageTrackerService, UsageDateRange } from './usage/usageTracker.service';
+
+type GroupBy = 'hour' | 'day' | 'week' | 'month';
+
+function buildOrgDateQuery(
+  organizationId: string,
+  dateFrom?: string,
+  dateTo?: string,
+  channel?: string
+): Record<string, unknown> {
+  const orgId = new mongoose.Types.ObjectId(organizationId);
+  const dateQuery: Record<string, unknown> = { organizationId: orgId };
+  if (dateFrom || dateTo) {
+    const createdAt: Record<string, Date> = {};
+    if (dateFrom) createdAt.$gte = new Date(dateFrom);
+    if (dateTo) createdAt.$lte = new Date(dateTo);
+    dateQuery.createdAt = createdAt;
+  }
+  if (channel && channel !== 'all') {
+    if (channel === 'instagram' || channel === 'facebook') {
+      dateQuery.channel = 'social';
+      dateQuery['metadata.platform'] = channel;
+    } else if (channel === 'telegram') {
+      dateQuery.channel = 'social';
+      dateQuery['metadata.platform'] = 'telegram';
+    } else {
+      dateQuery.channel = channel;
+    }
+  }
+  return dateQuery;
+}
+
+function toUsageRange(dateFrom?: string, dateTo?: string): UsageDateRange | undefined {
+  if (!dateFrom && !dateTo) return undefined;
+  return {
+    dateFrom: dateFrom ? new Date(dateFrom) : undefined,
+    dateTo: dateTo ? new Date(dateTo) : undefined
+  };
+}
+
+function getPreviousPeriod(dateFrom?: string, dateTo?: string): UsageDateRange | undefined {
+  if (!dateFrom || !dateTo) return undefined;
+  const from = new Date(dateFrom);
+  const to = new Date(dateTo);
+  const durationMs = to.getTime() - from.getTime();
+  const prevTo = new Date(from.getTime() - 1);
+  const prevFrom = new Date(prevTo.getTime() - durationMs);
+  return { dateFrom: prevFrom, dateTo: prevTo };
+}
+
+function pctChange(current: number, previous: number): number {
+  if (previous === 0) return current > 0 ? 100 : 0;
+  return Math.round(((current - previous) / previous) * 100);
+}
+
+function buildPeriodList(
+  groupBy: GroupBy,
+  dateFrom?: string,
+  dateTo?: string
+): string[] {
+  const fromDate = new Date(dateFrom || Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const toDate = new Date(dateTo || Date.now());
+  const periods: string[] = [];
+
+  if (groupBy === 'hour') {
+    const current = new Date(fromDate);
+    current.setMinutes(0, 0, 0);
+    const end = new Date(toDate);
+    end.setMinutes(59, 59, 999);
+    while (current <= end) {
+      const y = current.getFullYear();
+      const m = String(current.getMonth() + 1).padStart(2, '0');
+      const d = String(current.getDate()).padStart(2, '0');
+      const h = String(current.getHours()).padStart(2, '0');
+      periods.push(`${y}-${m}-${d} ${h}:00`);
+      current.setHours(current.getHours() + 1);
+    }
+    return periods;
+  }
+
+  const current = new Date(fromDate);
+  current.setHours(12, 0, 0, 0);
+  const end = new Date(toDate);
+  end.setHours(12, 0, 0, 0);
+
+  while (current <= end) {
+    if (groupBy === 'day') {
+      periods.push(current.toISOString().split('T')[0]);
+      current.setDate(current.getDate() + 1);
+    } else if (groupBy === 'week') {
+      const oneJan = new Date(current.getFullYear(), 0, 1);
+      const week = Math.ceil(
+        ((current.getTime() - oneJan.getTime()) / 86400000 + oneJan.getDay() + 1) / 7
+      );
+      periods.push(`${current.getFullYear()}-W${String(week).padStart(2, '0')}`);
+      current.setDate(current.getDate() + 7);
+    } else {
+      periods.push(`${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}`);
+      current.setMonth(current.getMonth() + 1);
+    }
+  }
+
+  return periods.length ? periods : [toDate.toISOString().split('T')[0]];
+}
+
+function formatTrendSeries(
+  data: Array<{ _id: string; [key: string]: unknown }>,
+  allPeriods: string[],
+  valueKey: string,
+  aggregateKey = 'count'
+) {
+  return allPeriods.map((period) => {
+    const entry = data.find((d) => d._id === period);
+    let value = 0;
+    if (entry) {
+      if (entry[aggregateKey] !== undefined) value = Number(entry[aggregateKey]) || 0;
+      else if (entry.count !== undefined) value = Number(entry.count) || 0;
+    }
+    return { period, [valueKey]: value };
+  });
+}
+
 export class AnalyticsService {
+  /** Fast org-scoped summary — same pattern as admin usage reports (<1s). */
+  async getSummaryMetrics(
+    organizationId: string,
+    dateFrom?: string,
+    dateTo?: string,
+    channel?: string,
+    comparePrevious = true
+  ) {
+    const cacheKey = `analytics_summary:${organizationId}:${dateFrom}:${dateTo}:${channel}:${comparePrevious}`;
+    if (isRedisAvailable()) {
+      try {
+        const cached = await redisClient.get(cacheKey);
+        if (cached) return JSON.parse(cached);
+      } catch (_) { /* fall through */ }
+    }
+
+    const range = toUsageRange(dateFrom, dateTo);
+    const dateQuery = buildOrgDateQuery(organizationId, dateFrom, dateTo, channel);
+
+    const fetchCurrent = async () => {
+      const [callStats, totalChatConversations, totalConversations, channelRows] =
+        await Promise.all([
+          usageTrackerService.calculateCallMinutesStats(organizationId, range, channel),
+          usageTrackerService.calculateOrganizationChatConversations(organizationId, range),
+          Conversation.countDocuments(dateQuery),
+          Conversation.aggregate([
+            { $match: dateQuery },
+            {
+              $project: {
+                ch: {
+                  $cond: {
+                    if: { $eq: ['$channel', 'social'] },
+                    then: {
+                      $cond: {
+                        if: { $eq: ['$metadata.platform', 'instagram'] },
+                        then: 'instagram',
+                        else: {
+                          $cond: {
+                            if: { $eq: ['$metadata.platform', 'facebook'] },
+                            then: 'facebook',
+                            else: {
+                              $cond: {
+                                if: { $eq: ['$metadata.platform', 'telegram'] },
+                                then: 'telegram',
+                                else: 'social'
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    else: '$channel'
+                  }
+                }
+              }
+            },
+            { $group: { _id: '$ch', count: { $sum: 1 } } }
+          ])
+        ]);
+
+      const conversationsByChannel = (channelRows as Array<{ _id: string; count: number }>).reduce(
+        (acc, row) => {
+          acc[row._id] = row.count;
+          return acc;
+        },
+        {} as Record<string, number>
+      );
+
+      const activeChannels = Object.values(conversationsByChannel).filter((c) => c > 0).length;
+      const avgCallDurationMinutes =
+        callStats.callCount > 0
+          ? Math.round((callStats.minutes / callStats.callCount) * 10) / 10
+          : 0;
+
+      return {
+        totalCallMinutes: callStats.minutes,
+        totalCallCount: callStats.callCount,
+        avgCallDurationMinutes,
+        totalChatConversations,
+        totalConversations,
+        conversationsByChannel,
+        activeChannels
+      };
+    };
+
+    const current = await fetchCurrent();
+
+    let previous: typeof current | null = null;
+    let changePercent: Record<string, number> | null = null;
+
+    if (comparePrevious && dateFrom && dateTo) {
+      const prevRange = getPreviousPeriod(dateFrom, dateTo);
+      if (prevRange?.dateFrom && prevRange?.dateTo) {
+        const prevFrom = prevRange.dateFrom.toISOString();
+        const prevTo = prevRange.dateTo.toISOString();
+        previous = await (async () => {
+          const prevUsageRange = toUsageRange(prevFrom, prevTo);
+          const prevDateQuery = buildOrgDateQuery(organizationId, prevFrom, prevTo, channel);
+          const [callStats, totalChatConversations, totalConversations] = await Promise.all([
+            usageTrackerService.calculateCallMinutesStats(organizationId, prevUsageRange, channel),
+            usageTrackerService.calculateOrganizationChatConversations(organizationId, prevUsageRange),
+            Conversation.countDocuments(prevDateQuery)
+          ]);
+          return {
+            totalCallMinutes: callStats.minutes,
+            totalCallCount: callStats.callCount,
+            avgCallDurationMinutes:
+              callStats.callCount > 0
+                ? Math.round((callStats.minutes / callStats.callCount) * 10) / 10
+                : 0,
+            totalChatConversations,
+            totalConversations,
+            conversationsByChannel: {},
+            activeChannels: 0
+          };
+        })();
+
+        changePercent = {
+          totalCallMinutes: pctChange(current.totalCallMinutes, previous.totalCallMinutes),
+          totalConversations: pctChange(current.totalConversations, previous.totalConversations),
+          totalChatConversations: pctChange(
+            current.totalChatConversations,
+            previous.totalChatConversations
+          )
+        };
+      }
+    }
+
+    const result = { current, previous, changePercent };
+
+    if (isRedisAvailable()) {
+      try {
+        await redisClient.setEx(cacheKey, 300, JSON.stringify(result));
+      } catch (_) { /* ignore */ }
+    }
+
+    return result;
+  }
+
   // Dashboard Metrics
   async getDashboardMetrics(organizationId: string, dateFrom?: string, dateTo?: string, channel?: string) {
     const cacheKey = `dashboard_metrics:${organizationId}:${dateFrom}:${dateTo}:${channel}`;
@@ -215,33 +476,24 @@ export class AnalyticsService {
     return metrics;
   }
 
-  // Conversation Trends
+  // Conversation Trends (slim — chart metrics only, cached)
   async getConversationTrends(
     organizationId: string,
-    groupBy: 'hour' | 'day' | 'week' | 'month' = 'day',
+    groupBy: GroupBy = 'day',
     dateFrom?: string,
     dateTo?: string,
     channel?: string
   ) {
-    const orgId = new mongoose.Types.ObjectId(organizationId);
-    const dateQuery: any = { organizationId: orgId };
-    if (dateFrom || dateTo) {
-      dateQuery.createdAt = {};
-      if (dateFrom) dateQuery.createdAt.$gte = new Date(dateFrom);
-      if (dateTo) dateQuery.createdAt.$lte = new Date(dateTo);
+    const cacheKey = `analytics_trends:${organizationId}:${dateFrom}:${dateTo}:${channel}:${groupBy}`;
+    if (isRedisAvailable()) {
+      try {
+        const cached = await redisClient.get(cacheKey);
+        if (cached) return JSON.parse(cached);
+      } catch (_) { /* fall through */ }
     }
 
-    // Apply channel filter
-    if (channel && channel !== 'all') {
-      if (channel === 'instagram' || channel === 'facebook') {
-        dateQuery.channel = 'social';
-        dateQuery['metadata.platform'] = channel;
-      } else {
-        dateQuery.channel = channel;
-      }
-    }
-
-    // Format string for date grouping
+    const dateQuery = buildOrgDateQuery(organizationId, dateFrom, dateTo, channel);
+    const range = toUsageRange(dateFrom, dateTo);
     const dateFormat: Record<string, string> = {
       hour: '%Y-%m-%d %H:00',
       day: '%Y-%m-%d',
@@ -249,192 +501,155 @@ export class AnalyticsService {
       month: '%Y-%m'
     };
 
-    // New conversations over time
-    const newConversations = await Conversation.aggregate([
-      { $match: dateQuery },
-      {
-        $group: {
-          _id: { $dateToString: { format: dateFormat[groupBy], date: '$createdAt' } },
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { _id: 1 } }
+    const [newConversations, chatConversations, callMinutesByPeriod] = await Promise.all([
+      Conversation.aggregate([
+        { $match: dateQuery },
+        {
+          $group: {
+            _id: { $dateToString: { format: dateFormat[groupBy], date: '$createdAt' } },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+      Conversation.aggregate([
+        {
+          $match: {
+            ...dateQuery,
+            channel: { $ne: 'phone' }
+          }
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: dateFormat[groupBy], date: '$createdAt' } },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+      usageTrackerService.calculateCallMinutesByPeriod(organizationId, range, groupBy, channel)
     ]);
 
-    // Messages sent over time — query Message directly using organizationId (no conv-ID $in)
-    const msgDateFilter: any = { organizationId: orgId };
-    if (dateFrom || dateTo) {
-      msgDateFilter.timestamp = {};
-      if (dateFrom) msgDateFilter.timestamp.$gte = new Date(dateFrom);
-      if (dateTo) msgDateFilter.timestamp.$lte = new Date(dateTo);
+    const allPeriods = buildPeriodList(groupBy, dateFrom, dateTo);
+
+    const callMinutesTrend = callMinutesByPeriod.map((r) => ({
+      _id: r.period,
+      minutes: r.minutes,
+      callCount: r.callCount
+    }));
+
+    const result = {
+      newConversations: formatTrendSeries(newConversations, allPeriods, 'count'),
+      chatConversations: formatTrendSeries(chatConversations, allPeriods, 'count'),
+      callMinutes: formatTrendSeries(callMinutesTrend, allPeriods, 'minutes', 'minutes'),
+      callCounts: allPeriods.map((period) => {
+        const entry = callMinutesByPeriod.find((r) => r.period === period);
+        return { period, count: entry?.callCount ?? 0 };
+      })
+    };
+
+    if (isRedisAvailable()) {
+      try {
+        await redisClient.setEx(cacheKey, 300, JSON.stringify(result));
+      } catch (_) { /* ignore */ }
     }
 
-    const messagesSent = await Message.aggregate([
-      { $match: msgDateFilter },
-      {
-        $group: {
-          _id: { $dateToString: { format: dateFormat[groupBy], date: '$timestamp' } },
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { _id: 1 } }
-    ]);
+    return result;
+  }
 
-    // Chat conversations over time (excluding phone)
-    const chatConversations = await Conversation.aggregate([
-      {
-        $match: {
-          ...dateQuery,
-          channel: { $ne: 'phone' }
-        }
-      },
-      {
-        $group: {
-          _id: { $dateToString: { format: dateFormat[groupBy], date: '$createdAt' } },
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { _id: 1 } }
-    ]);
+  /** Lazy-loaded quality trends for insights row (response time + resolution rate). */
+  async getQualityTrends(
+    organizationId: string,
+    groupBy: GroupBy = 'day',
+    dateFrom?: string,
+    dateTo?: string,
+    channel?: string
+  ) {
+    const cacheKey = `analytics_quality:${organizationId}:${dateFrom}:${dateTo}:${channel}:${groupBy}`;
+    if (isRedisAvailable()) {
+      try {
+        const cached = await redisClient.get(cacheKey);
+        if (cached) return JSON.parse(cached);
+      } catch (_) { /* fall through */ }
+    }
 
-    // Response times over time (ensure numeric for $divide)
-    const responseTimes = await Conversation.aggregate([
-      {
-        $match: {
-          ...dateQuery,
-          firstResponseAt: { $exists: true, $ne: null },
-          createdAt: { $exists: true, $ne: null }
-        }
-      },
-      {
-        $project: {
-          period: { $dateToString: { format: dateFormat[groupBy], date: '$createdAt' } },
-          responseTime: {
-            $cond: {
-              if: { $and: [{ $gte: [{ $subtract: ['$firstResponseAt', '$createdAt'] }, 0] }] },
-              then: { $divide: [{ $subtract: ['$firstResponseAt', '$createdAt'] }, 60000] },
-              else: 0
+    const dateQuery = buildOrgDateQuery(organizationId, dateFrom, dateTo, channel);
+    const dateFormat: Record<string, string> = {
+      hour: '%Y-%m-%d %H:00',
+      day: '%Y-%m-%d',
+      week: '%Y-W%V',
+      month: '%Y-%m'
+    };
+
+    const [responseTimes, resolutionRates] = await Promise.all([
+      Conversation.aggregate([
+        {
+          $match: {
+            ...dateQuery,
+            firstResponseAt: { $exists: true, $ne: null }
+          }
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: dateFormat[groupBy], date: '$createdAt' } },
+            avgResponseTime: {
+              $avg: {
+                $divide: [{ $subtract: ['$firstResponseAt', '$createdAt'] }, 60000]
+              }
             }
           }
-        }
-      },
-      {
-        $group: {
-          _id: '$period',
-          avgResponseTime: { $avg: '$responseTime' }
-        }
-      },
-      { $sort: { _id: 1 } }
-    ]);
-
-    // Resolution rates over time
-    const resolutionRates = await Conversation.aggregate([
-      { $match: dateQuery },
-      {
-        $group: {
-          _id: { $dateToString: { format: dateFormat[groupBy], date: '$createdAt' } },
-          total: { $sum: 1 },
-          resolved: {
-            $sum: { $cond: [{ $eq: ['$status', 'closed'] }, 1, 0] }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+      Conversation.aggregate([
+        { $match: dateQuery },
+        {
+          $group: {
+            _id: { $dateToString: { format: dateFormat[groupBy], date: '$createdAt' } },
+            total: { $sum: 1 },
+            resolved: { $sum: { $cond: [{ $eq: ['$status', 'closed'] }, 1, 0] } }
           }
-        }
-      },
-      {
-        $project: {
-          _id: 1,
-          resolutionRate: {
-            $multiply: [
-              {
-                $cond: {
-                  if: { $eq: ['$total', 0] },
-                  then: 0,
-                  else: {
-                    $divide: [
-                      { $convert: { input: '$resolved', to: 'double', onError: 0, onNull: 0 } },
-                      { $convert: { input: '$total', to: 'double', onError: 1, onNull: 1 } }
-                    ]
-                  }
+        },
+        {
+          $project: {
+            resolutionRate: {
+              $cond: {
+                if: { $eq: ['$total', 0] },
+                then: 0,
+                else: {
+                  $multiply: [{ $divide: ['$resolved', '$total'] }, 100]
                 }
-              },
-              100
-            ]
+              }
+            }
           }
-        }
-      },
-      { $sort: { _id: 1 } }
+        },
+        { $sort: { _id: 1 } }
+      ])
     ]);
 
-    // Call minutes trend — sum metadata.duration_seconds for completed voice calls
-    const callMinutesRaw = await Conversation.aggregate([
-      { $match: { ...dateQuery, transcript: { $ne: null, $exists: true } } },
-      {
-        $project: {
-          period: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          durationSeconds: { $ifNull: ['$metadata.duration_seconds', 0] }
-        }
-      },
-      {
-        $group: {
-          _id: '$period',
-          minutes: { $sum: { $ceil: { $divide: ['$durationSeconds', 60] } } }
-        }
-      },
-      { $sort: { _id: 1 } }
-    ]);
-
-    const callMinutesTrend = callMinutesRaw.map(r => ({ _id: r._id, minutes: r.minutes }));
-
-    // Generate ALL periods in requested range to ensure continuous graphs
-    const allPeriods: string[] = [];
-    const fromDate = new Date(dateFrom || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000));
-    const toDate = new Date(dateTo || Date.now());
-
-    // Normalize to noon to avoid DST issues
-    const current = new Date(fromDate);
-    current.setHours(12, 0, 0, 0);
-    const end = new Date(toDate);
-    end.setHours(12, 0, 0, 0);
-
-    while (current <= end) {
-      allPeriods.push(current.toISOString().split('T')[0]);
-      current.setDate(current.getDate() + 1);
-    }
-
-    if (allPeriods.length === 0) {
-      // Emergency fallback
-      const now = new Date();
-      for (let i = 6; i >= 0; i--) {
-        const d = new Date();
-        d.setDate(now.getDate() - i);
-        allPeriods.push(d.toISOString().split('T')[0]);
-      }
-    }
-
-    const formatTrend = (data: any[], key: string, aggregateKey: string = 'count') => {
-      return allPeriods.map(period => {
-        const entry = data.find(d => d._id === period);
-        if (!entry) return { period, [key]: 0 };
-
-        let value = 0;
-        if (entry[aggregateKey] !== undefined) value = entry[aggregateKey];
-        else if (entry.count !== undefined) value = entry.count;
-        else if (entry.value !== undefined) value = entry.value;
-
-        return {
-          period,
-          [key]: value
-        };
-      });
+    const allPeriods = buildPeriodList(groupBy, dateFrom, dateTo);
+    const result = {
+      responseTimes: formatTrendSeries(responseTimes, allPeriods, 'avgResponseTime', 'avgResponseTime').map(
+        (row) => ({
+          period: row.period,
+          avgResponseTime: Math.round((row.avgResponseTime as number) || 0)
+        })
+      ),
+      resolutionRates: formatTrendSeries(resolutionRates, allPeriods, 'resolutionRate', 'resolutionRate').map(
+        (row) => ({
+          period: row.period,
+          resolutionRate: Math.round((row.resolutionRate as number) || 0)
+        })
+      )
     };
 
-    return {
-      newConversations: formatTrend(newConversations, 'count'),
-      messagesSent: formatTrend(messagesSent, 'count'),
-      chatConversations: formatTrend(chatConversations, 'count'),
-      responseTimes: formatTrend(responseTimes, 'avgResponseTime', 'avgResponseTime'),
-      resolutionRates: formatTrend(resolutionRates, 'resolutionRate', 'resolutionRate'),
-      callMinutes: formatTrend(callMinutesTrend, 'minutes', 'minutes')
-    };
+    if (isRedisAvailable()) {
+      try {
+        await redisClient.setEx(cacheKey, 300, JSON.stringify(result));
+      } catch (_) { /* ignore */ }
+    }
+
+    return result;
   }
 
   // Performance Metrics
@@ -456,33 +671,51 @@ export class AnalyticsService {
       conversationQuery.assignedOperatorId = operatorId;
     }
 
-    // Average first response time
-    const firstResponseTimes = await Conversation.find({
-      ...conversationQuery,
-      firstResponseAt: { $exists: true }
-    }).select('createdAt firstResponseAt').lean();
+    const orgObjectId = new mongoose.Types.ObjectId(organizationId);
 
-    let avgFirstResponseTime = 0;
-    if (firstResponseTimes.length > 0) {
-      const totalTime = firstResponseTimes.reduce((sum, conv) => {
-        return sum + (conv.firstResponseAt!.getTime() - conv.createdAt.getTime()) / 1000 / 60;
-      }, 0);
-      avgFirstResponseTime = totalTime / firstResponseTimes.length;
-    }
+    const [firstResponseAgg, resolutionAgg] = await Promise.all([
+      Conversation.aggregate([
+        {
+          $match: {
+            ...conversationQuery,
+            organizationId: orgObjectId,
+            firstResponseAt: { $exists: true, $ne: null }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            avg: {
+              $avg: {
+                $divide: [{ $subtract: ['$firstResponseAt', '$createdAt'] }, 60000]
+              }
+            }
+          }
+        }
+      ]),
+      Conversation.aggregate([
+        {
+          $match: {
+            ...conversationQuery,
+            organizationId: orgObjectId,
+            resolvedAt: { $exists: true, $ne: null }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            avg: {
+              $avg: {
+                $divide: [{ $subtract: ['$resolvedAt', '$createdAt'] }, 60000]
+              }
+            }
+          }
+        }
+      ])
+    ]);
 
-    // Average resolution time
-    const resolutionTimes = await Conversation.find({
-      ...conversationQuery,
-      resolvedAt: { $exists: true }
-    }).select('createdAt resolvedAt').lean();
-
-    let avgResolutionTime = 0;
-    if (resolutionTimes.length > 0) {
-      const totalTime = resolutionTimes.reduce((sum, conv) => {
-        return sum + (conv.resolvedAt!.getTime() - conv.createdAt.getTime()) / 1000 / 60;
-      }, 0);
-      avgResolutionTime = totalTime / resolutionTimes.length;
-    }
+    const avgFirstResponseTime = Math.round(firstResponseAgg[0]?.avg ?? 0);
+    const avgResolutionTime = Math.round(resolutionAgg[0]?.avg ?? 0);
 
     // Conversations per operator
     const conversationsPerOperator = await Conversation.aggregate([
@@ -589,8 +822,8 @@ export class AnalyticsService {
     const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
     return {
-      avgFirstResponseTime: Math.round(avgFirstResponseTime),
-      avgResolutionTime: Math.round(avgResolutionTime),
+      avgFirstResponseTime,
+      avgResolutionTime,
       conversationsPerOperator,
       aiVsHuman: {
         ai: {

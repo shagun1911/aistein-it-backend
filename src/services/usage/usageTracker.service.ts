@@ -129,6 +129,98 @@ export class UsageTrackerService {
     }
   }
 
+  /** Call minutes + completed voice call count (same fast aggregation as calculateCallMinutes). */
+  async calculateCallMinutesStats(
+    organizationId: string,
+    dateRange?: UsageDateRange,
+    channel?: string
+  ): Promise<{ minutes: number; callCount: number }> {
+    try {
+      const match = voiceCallDurationMatch({
+        organizationId: new mongoose.Types.ObjectId(organizationId),
+        ...conversationDateMatch(dateRange),
+        ...this.channelConversationMatch(channel)
+      });
+
+      const result = await Conversation.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: null,
+            totalSeconds: { $sum: { $ifNull: ['$metadata.duration_seconds', 0] } },
+            count: { $sum: 1 }
+          }
+        }
+      ]);
+
+      if (!result.length) return { minutes: 0, callCount: 0 };
+      return {
+        minutes: Math.round(result[0].totalSeconds / 60),
+        callCount: result[0].count ?? 0
+      };
+    } catch (error: any) {
+      logger.error('[Usage Tracker] Error calculating call minutes stats:', error.message);
+      return { minutes: 0, callCount: 0 };
+    }
+  }
+
+  /** Time-bucketed call minutes for analytics charts (admin-speed aggregation). */
+  async calculateCallMinutesByPeriod(
+    organizationId: string,
+    dateRange: UsageDateRange | undefined,
+    groupBy: 'hour' | 'day' | 'week' | 'month' = 'day',
+    channel?: string
+  ): Promise<Array<{ period: string; minutes: number; callCount: number }>> {
+    const dateFormat: Record<string, string> = {
+      hour: '%Y-%m-%d %H:00',
+      day: '%Y-%m-%d',
+      week: '%Y-W%V',
+      month: '%Y-%m'
+    };
+
+    try {
+      const match = voiceCallDurationMatch({
+        organizationId: new mongoose.Types.ObjectId(organizationId),
+        ...conversationDateMatch(dateRange),
+        ...this.channelConversationMatch(channel)
+      });
+
+      const rows = await Conversation.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: {
+              $dateToString: { format: dateFormat[groupBy], date: '$createdAt' }
+            },
+            totalSeconds: { $sum: { $ifNull: ['$metadata.duration_seconds', 0] } },
+            callCount: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]);
+
+      return rows.map((r) => ({
+        period: r._id as string,
+        minutes: Math.round((r.totalSeconds ?? 0) / 60),
+        callCount: r.callCount ?? 0
+      }));
+    } catch (error: any) {
+      logger.error('[Usage Tracker] Error calculating call minutes by period:', error.message);
+      return [];
+    }
+  }
+
+  private channelConversationMatch(channel?: string): Record<string, unknown> {
+    if (!channel || channel === 'all') return {};
+    if (channel === 'instagram' || channel === 'facebook') {
+      return { channel: 'social', 'metadata.platform': channel };
+    }
+    if (channel === 'telegram') {
+      return { channel: 'social', 'metadata.platform': 'telegram' };
+    }
+    return { channel };
+  }
+
   /**
    * Calculate total chat messages sent + received (non-phone channels).
    *

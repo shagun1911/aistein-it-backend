@@ -1,4 +1,5 @@
 import { Response, NextFunction } from 'express';
+import mongoose from 'mongoose';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { AnalyticsService } from '../services/analytics.service';
 import { TopicService } from '../services/topic.service';
@@ -15,6 +16,27 @@ export class AnalyticsController {
     this.analyticsService = new AnalyticsService();
     this.topicService = new TopicService();
   }
+
+  // Fast summary metrics (admin-speed usageTracker path)
+  getSummary = async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const organizationId = req.user?.organizationId || req.user?._id;
+      if (!organizationId) {
+        throw new AppError(401, 'UNAUTHORIZED', 'Organization ID not found');
+      }
+      const { dateFrom, dateTo, channel, comparePrevious } = req.query;
+      const summary = await this.analyticsService.getSummaryMetrics(
+        organizationId.toString(),
+        dateFrom as string,
+        dateTo as string,
+        channel as string,
+        comparePrevious !== 'false'
+      );
+      res.json(successResponse(summary));
+    } catch (error) {
+      next(error);
+    }
+  };
 
   // Dashboard Metrics
   getDashboard = async (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -47,6 +69,27 @@ export class AnalyticsController {
       }
       const { groupBy = 'day', dateFrom, dateTo, channel } = req.query;
       const trends = await this.analyticsService.getConversationTrends(
+        organizationId.toString(),
+        groupBy as 'hour' | 'day' | 'week' | 'month',
+        dateFrom as string,
+        dateTo as string,
+        channel as string
+      );
+      res.json(successResponse(trends));
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  // Quality trends (lazy insights row)
+  getQualityTrends = async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const organizationId = req.user?.organizationId || req.user?._id;
+      if (!organizationId) {
+        throw new AppError(401, 'UNAUTHORIZED', 'Organization ID not found');
+      }
+      const { groupBy = 'day', dateFrom, dateTo, channel } = req.query;
+      const trends = await this.analyticsService.getQualityTrends(
         organizationId.toString(),
         groupBy as 'hour' | 'day' | 'week' | 'month',
         dateFrom as string,
@@ -190,50 +233,61 @@ export class AnalyticsController {
       if (!organizationId) {
         throw new AppError(401, 'UNAUTHORIZED', 'Organization ID not found');
       }
-      const { dateFrom, dateTo, limit = 10 } = req.query;
+      const { dateFrom, dateTo, limit = 10, channel } = req.query;
+      const orgObjectId = new mongoose.Types.ObjectId(organizationId.toString());
 
-      // Get conversations in date range
-      const dateQuery: any = { organizationId };
+      const msgMatch: Record<string, unknown> = {
+        organizationId: orgObjectId,
+        topics: { $exists: true, $ne: [] }
+      };
+
       if (dateFrom || dateTo) {
-        dateQuery.createdAt = {};
-        if (dateFrom) dateQuery.createdAt.$gte = new Date(dateFrom as string);
-        if (dateTo) dateQuery.createdAt.$lte = new Date(dateTo as string);
+        const timestamp: Record<string, Date> = {};
+        if (dateFrom) timestamp.$gte = new Date(dateFrom as string);
+        if (dateTo) timestamp.$lte = new Date(dateTo as string);
+        msgMatch.timestamp = timestamp;
       }
 
-      // Apply channel filter
-      const { channel } = req.query;
+      const convPipelineMatch: Record<string, unknown> = {
+        organizationId: orgObjectId
+      };
+      if (dateFrom || dateTo) {
+        const createdAt: Record<string, Date> = {};
+        if (dateFrom) createdAt.$gte = new Date(dateFrom as string);
+        if (dateTo) createdAt.$lte = new Date(dateTo as string);
+        convPipelineMatch.createdAt = createdAt;
+      }
       if (channel && channel !== 'all') {
         if (channel === 'instagram' || channel === 'facebook') {
-          dateQuery.channel = 'social';
-          dateQuery['metadata.platform'] = channel;
+          convPipelineMatch.channel = 'social';
+          convPipelineMatch['metadata.platform'] = channel;
+        } else if (channel === 'telegram') {
+          convPipelineMatch.channel = 'social';
+          convPipelineMatch['metadata.platform'] = 'telegram';
         } else {
-          dateQuery.channel = channel;
+          convPipelineMatch.channel = channel;
         }
       }
 
-      const conversations = await Conversation.find(dateQuery).select('_id').lean();
-      const conversationIds = conversations.map(c => c._id);
-
-      // Aggregate topics from messages
       const topics = await Message.aggregate([
+        { $match: msgMatch },
         {
-          $match: {
-            conversationId: { $in: conversationIds },
-            topics: { $exists: true, $ne: [] }
+          $lookup: {
+            from: 'conversations',
+            localField: 'conversationId',
+            foreignField: '_id',
+            as: 'conv',
+            pipeline: [{ $match: convPipelineMatch }, { $project: { _id: 1 } }]
           }
         },
+        { $match: { 'conv.0': { $exists: true } } },
         { $unwind: '$topics' },
-        {
-          $group: {
-            _id: '$topics',
-            count: { $sum: 1 }
-          }
-        },
+        { $group: { _id: '$topics', count: { $sum: 1 } } },
         { $sort: { count: -1 } },
-        { $limit: parseInt(limit as string) }
+        { $limit: parseInt(limit as string, 10) }
       ]);
 
-      const topTopics = topics.map((item: any) => ({
+      const topTopics = topics.map((item: { _id: string; count: number }) => ({
         topic: item._id,
         count: item.count
       }));

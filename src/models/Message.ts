@@ -94,6 +94,7 @@ MessageSchema.index({ organizationId: 1, timestamp: -1 });
 MessageSchema.index({ organizationId: 1, type: 1, timestamp: -1 });
 // Covers platform-wide chat-conversation aggregation: match { type, sender }, group by conversationId
 MessageSchema.index({ type: 1, sender: 1, conversationId: 1 });
+MessageSchema.index({ organizationId: 1, topics: 1, timestamp: -1 });
 MessageSchema.index({ text: 'text' });
 MessageSchema.index({ messageId: 1 }); // Index for status updates lookup
 

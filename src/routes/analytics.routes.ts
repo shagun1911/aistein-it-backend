@@ -8,8 +8,10 @@ const controller = new AnalyticsController();
 router.use(authenticate);
 
 // Dashboard & Analytics
+router.get('/summary', controller.getSummary);
 router.get('/dashboard', controller.getDashboard);
 router.get('/trends', controller.getTrends);
+router.get('/quality-trends', controller.getQualityTrends);
 router.get('/performance', controller.getPerformance);
 router.get('/export', controller.exportData);
 

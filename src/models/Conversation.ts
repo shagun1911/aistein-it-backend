@@ -121,5 +121,8 @@ ConversationSchema.index({ organizationId: 1, updatedAt: -1 });
 ConversationSchema.index({ organizationId: 1, status: 1, updatedAt: -1 });
 ConversationSchema.index({ organizationId: 1, channel: 1, updatedAt: -1 });
 ConversationSchema.index({ organizationId: 1, assignedOperatorId: 1, updatedAt: -1 });
+ConversationSchema.index({ organizationId: 1, createdAt: -1 });
+ConversationSchema.index({ organizationId: 1, channel: 1, createdAt: -1 });
+ConversationSchema.index({ organizationId: 1, transcript: 1, createdAt: -1 });
 
 export default mongoose.model<IConversation>('Conversation', ConversationSchema);

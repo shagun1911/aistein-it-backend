@@ -2,6 +2,7 @@ import passport from 'passport';
 import { Strategy as GoogleStrategy, Profile as GoogleProfile } from 'passport-google-oauth20';
 import User, { IUser } from '../models/User';
 import Organization from '../models/Organization';
+import { emailService } from '../services/email.service';
 
 // Configure Google OAuth Strategy
 passport.use(
@@ -82,6 +83,13 @@ passport.use(
         // Update organization owner
         organization.ownerId = user._id as any;
         await organization.save();
+
+        void emailService.sendAdminNewUserNotification(user, {
+          signupMethod: 'google',
+          organizationName: organization.name,
+          organizationSlug: organization.slug,
+          organizationPlan: organization.plan
+        });
 
         return done(null, user);
       } catch (error) {

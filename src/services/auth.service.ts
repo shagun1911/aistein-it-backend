@@ -40,6 +40,7 @@ import InboundNumber from '../models/InboundNumber';
 import { getPlanLimits } from '../config/planLimits';
 import { verifyCaptchaToken } from '../utils/captcha.util';
 import { logger } from '../utils/logger.util';
+import { emailService } from './email.service';
 
 /** Mongoose user document shape used when building API profile payloads */
 type UserDoc = IUser & { _id: mongoose.Types.ObjectId; save(): Promise<unknown> };
@@ -146,6 +147,11 @@ export class AuthService {
     await user.save();
 
     console.log('7 - signup success');
+
+    void emailService.sendAdminNewUserNotification(user, {
+      signupMethod: 'local',
+      remoteIp
+    });
 
     const profile = await this.buildUserProfileResponse(user as UserDoc);
 

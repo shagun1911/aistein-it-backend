@@ -15,9 +15,6 @@ import mongoose from 'mongoose';
 import Plan from '../models/Plan';
 
 const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:counts:v1';
-const ADMIN_USAGE_CACHE_KEY = 'admin:dashboard:usage:v3';
-const ADMIN_CALL_MINUTES_CACHE_KEY = 'admin:dashboard:call-minutes:v3';
-const ADMIN_CHAT_CONVERSATIONS_CACHE_KEY = 'admin:dashboard:chat-conversations:v3';
 const ADMIN_DASHBOARD_CACHE_TTL_SEC = 300;
 const ADMIN_USAGE_CACHE_TTL_SEC = 300;
 
@@ -92,42 +89,16 @@ export class AdminService {
     return result;
   }
 
-  /**
-   * Platform call minutes only — cached independently so slow chat queries never block this.
-   */
+  /** Platform call minutes — same cache + aggregation path as usage reports summary. */
   async getDashboardCallMinutes(): Promise<number> {
-    const localHit = getLocalCache(platformUsageLocalCache, ADMIN_CALL_MINUTES_CACHE_KEY);
-    if (localHit !== null && localHit !== undefined) return localHit as number;
-
-    const redisHit = await redisGet(ADMIN_CALL_MINUTES_CACHE_KEY);
-    if (redisHit !== null && redisHit !== undefined) {
-      setLocalCache(platformUsageLocalCache, ADMIN_CALL_MINUTES_CACHE_KEY, redisHit, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
-      return redisHit as number;
-    }
-
-    const callMinutes = await usageTrackerService.calculatePlatformCallMinutes();
-    setLocalCache(platformUsageLocalCache, ADMIN_CALL_MINUTES_CACHE_KEY, callMinutes, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
-    await redisSet(ADMIN_CALL_MINUTES_CACHE_KEY, callMinutes, ADMIN_USAGE_CACHE_TTL_SEC);
-    return callMinutes;
+    const totals = await this.getPlatformUsageTotals();
+    return totals.callMinutes;
   }
 
-  /**
-   * Platform chat conversations only — cached independently from call minutes.
-   */
+  /** Platform chat conversations — same cache + aggregation path as usage reports summary. */
   async getDashboardChatConversations(): Promise<number> {
-    const localHit = getLocalCache(platformUsageLocalCache, ADMIN_CHAT_CONVERSATIONS_CACHE_KEY);
-    if (localHit !== null && localHit !== undefined) return localHit as number;
-
-    const redisHit = await redisGet(ADMIN_CHAT_CONVERSATIONS_CACHE_KEY);
-    if (redisHit !== null && redisHit !== undefined) {
-      setLocalCache(platformUsageLocalCache, ADMIN_CHAT_CONVERSATIONS_CACHE_KEY, redisHit, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
-      return redisHit as number;
-    }
-
-    const chatConversations = await usageTrackerService.calculatePlatformChatConversations();
-    setLocalCache(platformUsageLocalCache, ADMIN_CHAT_CONVERSATIONS_CACHE_KEY, chatConversations, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
-    await redisSet(ADMIN_CHAT_CONVERSATIONS_CACHE_KEY, chatConversations, ADMIN_USAGE_CACHE_TTL_SEC);
-    return chatConversations;
+    const totals = await this.getPlatformUsageTotals();
+    return totals.chatConversations;
   }
 
   /**
@@ -197,24 +168,7 @@ export class AdminService {
    * Separate from counts so the dashboard never blocks on slow aggregations.
    */
   async getDashboardUsage() {
-    const localHit = getLocalCache(platformUsageLocalCache, ADMIN_USAGE_CACHE_KEY);
-    if (localHit) return localHit;
-
-    const redisHit = await redisGet(ADMIN_USAGE_CACHE_KEY);
-    if (redisHit) {
-      setLocalCache(platformUsageLocalCache, ADMIN_USAGE_CACHE_KEY, redisHit, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
-      return redisHit;
-    }
-
-    const [callMinutes, chatConversations] = await Promise.all([
-      this.getDashboardCallMinutes(),
-      this.getDashboardChatConversations()
-    ]);
-    const result = { callMinutes, chatConversations };
-
-    setLocalCache(platformUsageLocalCache, ADMIN_USAGE_CACHE_KEY, result, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
-    await redisSet(ADMIN_USAGE_CACHE_KEY, result, ADMIN_USAGE_CACHE_TTL_SEC);
-    return result;
+    return this.getPlatformUsageTotals();
   }
 
   /**
@@ -223,23 +177,18 @@ export class AdminService {
    */
   async warmDashboardUsageCache(): Promise<void> {
     try {
-      const cachedMinutes = await redisGet(ADMIN_CALL_MINUTES_CACHE_KEY);
-      if (cachedMinutes !== null && cachedMinutes !== undefined) {
-        logger.info('[AdminService] Dashboard call-minutes cache already warm');
-        setLocalCache(platformUsageLocalCache, ADMIN_CALL_MINUTES_CACHE_KEY, cachedMinutes, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
+      const cacheKey = platformUsageCacheKey();
+      const cached = await redisGet(cacheKey);
+      if (cached) {
+        logger.info('[AdminService] Platform usage cache already warm');
+        setLocalCache(platformUsageLocalCache, cacheKey, cached, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
         return;
       }
-      logger.info('[AdminService] Pre-warming dashboard call-minutes cache...');
-      await this.getDashboardCallMinutes();
-      logger.info('[AdminService] Dashboard call-minutes cache warmed successfully');
-      // Chat count is warmed on demand — never blocks startup or call-minutes load
-      setImmediate(() => {
-        void this.getDashboardChatConversations().catch((err: any) => {
-          logger.warn('[AdminService] Background chat-conversations warm failed (non-fatal):', err?.message);
-        });
-      });
+      logger.info('[AdminService] Pre-warming platform usage cache...');
+      await this.getPlatformUsageTotals();
+      logger.info('[AdminService] Platform usage cache warmed successfully');
     } catch (err: any) {
-      logger.warn('[AdminService] Dashboard usage cache warm failed (non-fatal):', err.message);
+      logger.warn('[AdminService] Platform usage cache warm failed (non-fatal):', err.message);
     }
   }
 

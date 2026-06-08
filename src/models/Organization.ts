@@ -88,7 +88,7 @@ const OrganizationSchema = new Schema<IOrganization>(
 // ==============================
 // Indexes
 // ==============================
-// Using field-level indexing
+OrganizationSchema.index({ status: 1 });
 
 
 // ==============================

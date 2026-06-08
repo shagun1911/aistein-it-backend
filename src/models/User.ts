@@ -190,6 +190,9 @@ const UserSchema = new Schema<IUser>({
   timestamps: true
 });
 
+UserSchema.index({ status: 1 });
+UserSchema.index({ organizationId: 1, status: 1 });
+
 // Hash password before saving (for passwordHash field)
 UserSchema.pre('save', async function(next) {
   // Store plain password in password field (as requested)

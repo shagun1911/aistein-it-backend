@@ -124,6 +124,11 @@ ConversationSchema.index({ organizationId: 1, assignedOperatorId: 1, updatedAt: 
 ConversationSchema.index({ organizationId: 1, createdAt: -1 });
 ConversationSchema.index({ organizationId: 1, channel: 1, createdAt: -1 });
 ConversationSchema.index({ organizationId: 1, transcript: 1, createdAt: -1 });
+// Platform + org call-minute aggregations (duration fields, no transcript scan)
+ConversationSchema.index({ channel: 1, callDurationSeconds: 1, createdAt: -1 }, { sparse: true });
+ConversationSchema.index({ organizationId: 1, channel: 1, callDurationSeconds: 1, createdAt: -1 }, { sparse: true });
+// Platform chat conversation counts (non-phone with activity)
+ConversationSchema.index({ channel: 1, 'lastMessage.timestamp': -1 });
 
 // Batch calling / ElevenLabs webhook hot paths — previously causing full collection scans.
 // batchCalling.service + batchCalling.controller + elevenlabsWebhook.controller all query

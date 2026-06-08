@@ -53,11 +53,26 @@ function messageTimestampMatch(dateRange?: UsageDateRange): Record<string, unkno
   return { timestamp };
 }
 
-/** Completed voice calls: transcript present (matches platform billing source of truth). */
+/** Completed voice calls with stored duration (indexed path — no transcript blob scan). */
 function voiceCallDurationMatch(extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    transcript: { $ne: null, $exists: true },
+    channel: 'phone',
+    $or: [
+      { callDurationSeconds: { $gt: 0 } },
+      { 'metadata.duration_seconds': { $gt: 0 } }
+    ],
     ...extra
+  };
+}
+
+/** Seconds to bill for one conversation — prefers denormalized top-level field. */
+function callDurationSecondsExpr(): Record<string, unknown> {
+  return {
+    $cond: [
+      { $gt: [{ $ifNull: ['$callDurationSeconds', 0] }, 0] },
+      '$callDurationSeconds',
+      { $ifNull: ['$metadata.duration_seconds', 0] }
+    ]
   };
 }
 
@@ -111,7 +126,7 @@ export class UsageTrackerService {
         {
           $group: {
             _id: null,
-            totalSeconds: { $sum: { $ifNull: ['$metadata.duration_seconds', 0] } },
+            totalSeconds: { $sum: callDurationSecondsExpr() },
             count: { $sum: 1 }
           }
         }
@@ -120,7 +135,7 @@ export class UsageTrackerService {
       if (!result.length) return 0;
 
       const totalMinutes = Math.round(result[0].totalSeconds / 60);
-      logger.info(`[Usage Tracker] Org ${organizationId}: ${totalMinutes} call minutes from ${result[0].count} voice conversations`);
+      logger.info(`[Usage Tracker] Org ${organizationId}: ${totalMinutes} call minutes from ${result[0].count} phone conversations`);
       return totalMinutes;
 
     } catch (error: any) {
@@ -147,7 +162,7 @@ export class UsageTrackerService {
         {
           $group: {
             _id: null,
-            totalSeconds: { $sum: { $ifNull: ['$metadata.duration_seconds', 0] } },
+            totalSeconds: { $sum: callDurationSecondsExpr() },
             count: { $sum: 1 }
           }
         }
@@ -192,7 +207,7 @@ export class UsageTrackerService {
             _id: {
               $dateToString: { format: dateFormat[groupBy], date: '$createdAt' }
             },
-            totalSeconds: { $sum: { $ifNull: ['$metadata.duration_seconds', 0] } },
+            totalSeconds: { $sum: callDurationSecondsExpr() },
             callCount: { $sum: 1 }
           }
         },
@@ -634,7 +649,7 @@ export class UsageTrackerService {
 
   /**
    * Platform-wide call minutes for admin dashboard.
-   * Sums metadata.duration_seconds for conversations with a transcript (aggregation-only).
+   * Uses callDurationSeconds / metadata.duration_seconds — no transcript scan.
    */
   async calculatePlatformCallMinutes(dateRange?: UsageDateRange): Promise<number> {
     try {
@@ -643,7 +658,7 @@ export class UsageTrackerService {
         {
           $group: {
             _id: null,
-            totalSeconds: { $sum: { $ifNull: ['$metadata.duration_seconds', 0] } }
+            totalSeconds: { $sum: callDurationSecondsExpr() }
           }
         }
       ]);
@@ -722,7 +737,7 @@ export class UsageTrackerService {
   async calculatePlatformChatConversations(dateRange?: UsageDateRange): Promise<number> {
     try {
       return await Conversation.countDocuments({
-        channel: { $ne: 'phone' },
+        channel: { $in: ['whatsapp', 'website', 'email', 'social'] },
         'lastMessage.timestamp': { $exists: true },
         ...conversationDateMatch(dateRange)
       });

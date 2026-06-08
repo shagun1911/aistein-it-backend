@@ -35,6 +35,7 @@ const AutomationExecutionSchema = new Schema<IAutomationExecution>({
 
 AutomationExecutionSchema.index({ automationId: 1, executedAt: -1 });
 AutomationExecutionSchema.index({ status: 1 });
+AutomationExecutionSchema.index({ executedAt: -1 });
 
 export default mongoose.model<IAutomationExecution>('AutomationExecution', AutomationExecutionSchema);
 

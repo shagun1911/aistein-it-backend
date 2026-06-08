@@ -139,6 +139,10 @@ const SettingsSchema = new Schema<ISettings>({
 }, { timestamps: true });
 
 SettingsSchema.index({ userId: 1 });
+SettingsSchema.index(
+  { 'ecommerceIntegration.platform': 1 },
+  { sparse: true }
+);
 
 export default mongoose.model<ISettings>('Settings', SettingsSchema);
 

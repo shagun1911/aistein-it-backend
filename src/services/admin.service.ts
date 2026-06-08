@@ -15,8 +15,8 @@ import mongoose from 'mongoose';
 import Plan from '../models/Plan';
 
 const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:counts:v1';
-const ADMIN_DASHBOARD_CACHE_TTL_SEC = 300;
-const ADMIN_USAGE_CACHE_TTL_SEC = 300;
+const ADMIN_DASHBOARD_CACHE_TTL_SEC = 900;
+const ADMIN_USAGE_CACHE_TTL_SEC = 900;
 
 const adminDashboardLocalCache = new Map<string, { value: any; expiresAt: number }>();
 const platformUsageLocalCache = new Map<string, { value: { callMinutes: number; chatConversations: number }; expiresAt: number }>();

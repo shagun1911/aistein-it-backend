@@ -114,6 +114,7 @@ SocialIntegrationSchema.index(
 // Indexes for fast lookups (avoid duplicate by not using index: true in field definition)
 SocialIntegrationSchema.index({ userId: 1 });
 SocialIntegrationSchema.index({ organizationId: 1 });
+SocialIntegrationSchema.index({ platform: 1, status: 1 });
 
 // Encrypt USER access token only (apiKey)
 SocialIntegrationSchema.pre('save', function (next) {

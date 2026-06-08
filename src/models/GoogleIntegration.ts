@@ -112,6 +112,7 @@ const GoogleIntegrationSchema = new Schema<IGoogleIntegration>({
 // Indexes for faster queries
 GoogleIntegrationSchema.index({ userId: 1, organizationId: 1 });
 GoogleIntegrationSchema.index({ 'googleProfile.email': 1 });
+GoogleIntegrationSchema.index({ status: 1 });
 
 export default mongoose.model<IGoogleIntegration>('GoogleIntegration', GoogleIntegrationSchema);
 

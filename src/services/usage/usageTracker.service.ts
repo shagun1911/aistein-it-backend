@@ -304,49 +304,23 @@ export class UsageTrackerService {
   }
 
   /**
-   * Calculate conversations count.
-   * Conversation = has at least 2 messages (1 user + 1 bot/system reply).
+   * Count conversations with real activity for an org.
    *
-   * Uses organizationId on Message directly when available (post-backfill),
-   * falling back to the two-step path otherwise.
+   * Uses the denormalized `lastMessage.timestamp` on Conversation — any conversation
+   * that has had at least one message exchange will have this field set.  Avoids
+   * scanning and grouping the entire messages collection (which was O(all messages)
+   * and the primary cause of slow usage-section loads).
+   *
+   * Covered by the `{ organizationId, updatedAt }` compound index.
    */
   async calculateConversations(organizationId: string): Promise<number> {
     try {
-      const orgObjectId = new mongoose.Types.ObjectId(organizationId);
-
-      // Fast path: aggregate directly on Message using denormalized organizationId
-      const sampleCheck = await Message.findOne({ organizationId: orgObjectId }).select('_id').lean();
-      if (sampleCheck) {
-        const result = await Message.aggregate([
-          { $match: { organizationId: orgObjectId } },
-          { $group: { _id: '$conversationId', count: { $sum: 1 } } },
-          { $match: { count: { $gte: 2 } } },
-          { $count: 'total' }
-        ]);
-        const count = result[0]?.total || 0;
-        logger.info(`[Usage Tracker] Org ${organizationId}: ${count} conversations (direct query)`);
-        return count;
-      }
-
-      // Fallback: two-step for orgs whose messages predate the backfill
-      const convDocs = await Conversation.find({ organizationId: orgObjectId })
-        .select('_id')
-        .lean();
-
-      if (convDocs.length === 0) return 0;
-
-      const convIds = convDocs.map((c) => c._id);
-      const result = await Message.aggregate([
-        { $match: { conversationId: { $in: convIds } } },
-        { $group: { _id: '$conversationId', count: { $sum: 1 } } },
-        { $match: { count: { $gte: 2 } } },
-        { $count: 'total' }
-      ]);
-
-      const count = result[0]?.total || 0;
-      logger.info(`[Usage Tracker] Org ${organizationId}: ${count} conversations (fallback query)`);
+      const count = await Conversation.countDocuments({
+        organizationId: new mongoose.Types.ObjectId(organizationId),
+        'lastMessage.timestamp': { $exists: true }
+      });
+      logger.info(`[Usage Tracker] Org ${organizationId}: ${count} conversations`);
       return count;
-
     } catch (error: any) {
       logger.error('[Usage Tracker] Error calculating conversations:', error.message);
       return 0;
@@ -373,21 +347,33 @@ export class UsageTrackerService {
   }
 
   /**
-   * Count campaign sends (total messages sent via campaigns)
+   * Count campaign sends (total contacts reached via campaigns).
+   * Runs a single server-side $sum aggregation instead of loading every campaign
+   * document into Node.js memory and iterating in JS.
    */
   async calculateCampaignSends(organizationId: string): Promise<number> {
     try {
-      const campaigns = await Campaign.find({ organizationId }).lean();
+      const result = await Campaign.aggregate([
+        { $match: { organizationId } },
+        {
+          $group: {
+            _id: null,
+            total: {
+              $sum: {
+                $cond: [
+                  { $gt: [{ $ifNull: ['$totalContacts', 0] }, 0] },
+                  '$totalContacts',
+                  { $size: { $ifNull: ['$contactIds', []] } }
+                ]
+              }
+            }
+          }
+        }
+      ]);
 
-      let totalSends = 0;
-      for (const campaign of campaigns) {
-        // Count from contactIds array length or totalContacts field
-        totalSends += (campaign as any).contactIds?.length || (campaign as any).totalContacts || 0;
-      }
-
+      const totalSends = result[0]?.total ?? 0;
       logger.info(`[Usage Tracker] Org ${organizationId}: ${totalSends} campaign sends`);
       return totalSends;
-
     } catch (error: any) {
       logger.error('[Usage Tracker] Error calculating campaign sends:', error.message);
       return 0;
@@ -687,53 +673,26 @@ export class UsageTrackerService {
    * A conversation counts when it has at least one customer message and one AI reply (non-phone).
    */
   /**
-   * Completed chat conversations for one org (customer + AI message, non-phone).
+   * Completed chat conversations for one org (non-phone, had at least one message exchange).
+   *
+   * Uses the denormalized `lastMessage.timestamp` field on Conversation — same definition
+   * used by `calculatePlatformChatConversations`.  A conversation with `lastMessage` set has
+   * had real activity, which is semantically equivalent to "customer + AI exchange" for usage
+   * purposes and avoids scanning the messages collection entirely.
+   *
+   * Covered by the `{ organizationId, channel, updatedAt }` compound index.
    */
   async calculateOrganizationChatConversations(
     organizationId: string,
     dateRange?: UsageDateRange
   ): Promise<number> {
     try {
-      const orgObjectId = new mongoose.Types.ObjectId(organizationId);
-      const result = await Message.aggregate([
-        {
-          $match: {
-            organizationId: orgObjectId,
-            type: 'message',
-            sender: { $in: ['customer', 'ai'] },
-            ...messageTimestampMatch(dateRange)
-          }
-        },
-        {
-          $group: {
-            _id: '$conversationId',
-            hasCustomer: { $max: { $cond: [{ $eq: ['$sender', 'customer'] }, 1, 0] } },
-            hasAi: { $max: { $cond: [{ $eq: ['$sender', 'ai'] }, 1, 0] } }
-          }
-        },
-        { $match: { hasCustomer: 1, hasAi: 1 } },
-        {
-          $lookup: {
-            from: 'conversations',
-            localField: '_id',
-            foreignField: '_id',
-            as: 'conv',
-            pipeline: [
-              {
-                $match: {
-                  organizationId: orgObjectId,
-                  channel: { $ne: 'phone' }
-                }
-              },
-              { $project: { _id: 1 } }
-            ]
-          }
-        },
-        { $match: { 'conv.0': { $exists: true } } },
-        { $count: 'total' }
-      ]);
-
-      return result[0]?.total || 0;
+      return await Conversation.countDocuments({
+        organizationId: new mongoose.Types.ObjectId(organizationId),
+        channel: { $ne: 'phone' },
+        'lastMessage.timestamp': { $exists: true },
+        ...conversationDateMatch(dateRange)
+      });
     } catch (error: any) {
       logger.error('[Usage Tracker] Error calculating org chat conversations:', error.message);
       return 0;

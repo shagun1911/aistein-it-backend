@@ -72,16 +72,19 @@ function voiceCallDurationMatch(extra: Record<string, unknown> = {}): Record<str
   };
 }
 
-/** Seconds to bill for one conversation — denormalized indexed field, with a
- * metadata fallback retained purely as a defensive safety net. */
-function callDurationSecondsExpr(): Record<string, unknown> {
-  return {
-    $cond: [
-      { $gt: [{ $ifNull: ['$callDurationSeconds', 0] }, 0] },
-      '$callDurationSeconds',
-      { $ifNull: ['$metadata.duration_seconds', 0] }
-    ]
-  };
+/**
+ * Expression for the $group stage when the preceding $match already guarantees
+ * `callDurationSeconds > 0` (i.e. every caller uses `voiceCallDurationMatch`).
+ *
+ * Returning the bare field reference lets MongoDB satisfy the entire aggregation
+ * from the sparse `{ channel, callDurationSeconds, createdAt }` index without
+ * fetching the full document (covered aggregation).  The old `$cond` fallback
+ * to `$metadata.duration_seconds` was dead code in this context — the match
+ * condition is always true — but it forced a FETCH on every matched document
+ * because `metadata` is an unindexed Mixed blob.
+ */
+function callDurationSecondsExpr(): string {
+  return '$callDurationSeconds';
 }
 
 /** Run async work over items with bounded concurrency. */
@@ -669,7 +672,7 @@ export class UsageTrackerService {
             totalSeconds: { $sum: callDurationSecondsExpr() }
           }
         }
-      ]);
+      ]).hint({ channel: 1, callDurationSeconds: 1, createdAt: -1 });
 
       if (!result.length) return 0;
       return Math.round(result[0].totalSeconds / 60);

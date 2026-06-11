@@ -540,7 +540,7 @@ export class AdminService {
         .sort({ createdAt: -1 })
         .lean();
 
-      return await Promise.all(organizations.map(async (org: any) => {
+      return await mapWithConcurrency(organizations as any[], 8, async (org: any) => {
         let usage = { callMinutes: 0, chatMessages: 0, automations: 0 };
         try {
           usage = await usageTrackerService.getOrganizationUsage(org._id.toString());
@@ -551,7 +551,7 @@ export class AdminService {
           usage,
           planDetails: org.planId || { name: org.plan || 'free' }
         };
-      }));
+      });
     } catch (error: any) {
       throw error;
     }

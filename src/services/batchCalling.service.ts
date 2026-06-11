@@ -842,6 +842,7 @@ export class BatchCallingService {
             await Conversation.updateOne({ _id: existing._id }, {
               $set: {
                 transcript,
+                callDurationSeconds: duration,
                 'metadata.duration_seconds': duration,
                 'metadata.call_duration_secs': duration,
                 'metadata.end_reason': endReason,
@@ -902,6 +903,7 @@ export class BatchCallingService {
               transcript,
               isAiManaging: true,
               unread: false,
+              callDurationSeconds: duration,
               metadata: {
                 batch_call_id: jobId,
                 conversation_id: elevenLabsConvId,

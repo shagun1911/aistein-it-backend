@@ -53,19 +53,27 @@ function messageTimestampMatch(dateRange?: UsageDateRange): Record<string, unkno
   return { timestamp };
 }
 
-/** Completed voice calls with stored duration (indexed path — no transcript blob scan). */
+/**
+ * Completed voice calls with stored duration.
+ *
+ * Matches ONLY on the denormalized, indexed `callDurationSeconds` field so the
+ * query is fully served by the sparse `{ channel, callDurationSeconds, createdAt }`
+ * (and org-scoped) indexes — no FETCH-all of phone documents.
+ *
+ * Requires `callDurationSeconds` to be populated by the call-ingestion paths
+ * (ElevenLabs webhook + batch calling) and backfilled for historical docs via
+ * `npm run migrate:backfill-call-duration-seconds`.
+ */
 function voiceCallDurationMatch(extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     channel: 'phone',
-    $or: [
-      { callDurationSeconds: { $gt: 0 } },
-      { 'metadata.duration_seconds': { $gt: 0 } }
-    ],
+    callDurationSeconds: { $gt: 0 },
     ...extra
   };
 }
 
-/** Seconds to bill for one conversation — prefers denormalized top-level field. */
+/** Seconds to bill for one conversation — denormalized indexed field, with a
+ * metadata fallback retained purely as a defensive safety net. */
 function callDurationSecondsExpr(): Record<string, unknown> {
   return {
     $cond: [

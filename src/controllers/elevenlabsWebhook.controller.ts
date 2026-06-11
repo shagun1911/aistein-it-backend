@@ -740,6 +740,7 @@ export class ElevenLabsWebhookController {
           {
             $set: {
               transcript: finalTranscript,
+              callDurationSeconds: duration,
               'metadata.duration_seconds': duration,
               'metadata.call_duration_secs': duration,
               'metadata.end_reason': endReason,
@@ -769,6 +770,7 @@ export class ElevenLabsWebhookController {
           transcript: finalTranscript,
           isAiManaging: true,
           unread: false,
+          callDurationSeconds: duration,
           metadata: {
             batch_call_id: batchId,
             conversation_id: elevenLabsConvId,

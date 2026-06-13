@@ -1,9 +1,9 @@
 /**
- * Verify dashboard_stats stored values match exact live MongoDB queries.
+ * Verify dashboard_stats stored values match the refresh compute path.
  *
  *   npm run verify:dashboard-stats
  *
- * Phase A — service compute vs independent live queries (same moment)
+ * Phase A — refresh compute vs independent queries (estimatedDocumentCount for executions)
  * Phase B — persisted document vs refresh output (storage integrity)
  * Phase C — API read path vs persisted document
  */
@@ -104,8 +104,8 @@ function printTable(title: string, labelA: string, labelB: string, rows: Compare
   return rows.filter((r) => !r.match).length;
 }
 
-/** Independent ground-truth queries — must mirror dashboardStats.service compute logic exactly. */
-async function computeIndependentLiveTruth(): Promise<Record<FieldKey, number>> {
+/** Independent ground-truth for the refresh path — mirrors dashboardStats.service refresh logic. */
+async function computeIndependentRefreshTruth(previousTotalExecutions = 0): Promise<Record<FieldKey, number>> {
   const [
     totalOrganizations,
     activeOrganizations,
@@ -127,7 +127,7 @@ async function computeIndependentLiveTruth(): Promise<Record<FieldKey, number>> 
     User.countDocuments({ status: 'active' }),
     Automation.countDocuments(),
     Automation.countDocuments({ isActive: true }),
-    AutomationExecution.countDocuments(),
+    AutomationExecution.estimatedDocumentCount().catch(() => previousTotalExecutions),
     AutomationExecution.countDocuments({ status: 'failed' }),
     GoogleIntegration.countDocuments({ status: 'active' }),
     SocialIntegration.countDocuments({ platform: 'whatsapp', status: 'connected' }),
@@ -160,18 +160,21 @@ async function main() {
   console.log('='.repeat(72));
   console.log('DASHBOARD STATS ACCURACY VERIFICATION');
   console.log('='.repeat(72));
-  console.log('Uses exact countDocuments() — no estimates.\n');
+  console.log('Uses estimatedDocumentCount() for totalExecutions (fast refresh path).\n');
 
   await connectDatabase();
 
   let failures = 0;
 
-  // Phase A: service compute vs independent live queries at the same time
-  console.log('Phase A: Service compute vs independent exact MongoDB queries...');
+  const existingDoc = await DashboardStats.findOne({ key: PLATFORM_STATS_KEY }).lean();
+  const previousTotalExecutions = existingDoc?.totalExecutions ?? 0;
+
+  // Phase A: refresh compute vs independent refresh mirror at the same time
+  console.log('Phase A: Refresh compute vs independent refresh queries...');
   const phaseAT0 = Date.now();
   const [serviceComputed, independentLive] = await Promise.all([
-    dashboardStatsService.computeExactStats(),
-    computeIndependentLiveTruth()
+    dashboardStatsService.computeRefreshStats(previousTotalExecutions),
+    computeIndependentRefreshTruth(previousTotalExecutions)
   ]);
   console.log(`  Completed in ${Date.now() - phaseAT0}ms\n`);
 
@@ -222,9 +225,9 @@ async function main() {
 
   console.log('='.repeat(72));
   if (failures === 0) {
-    console.log('RESULT: ✅ ALL PHASES PASSED — stats are exact, not estimated.');
-    console.log('Note: counts reflect DB state at refresh time; live platform may add');
-    console.log('      executions/calls between 5-min refreshes (expected SaaS behavior).');
+    console.log('RESULT: ✅ ALL PHASES PASSED — refresh path verified.');
+    console.log('Note: totalExecutions uses estimatedDocumentCount() (~approximate, fast).');
+    console.log('      Other fields are exact; live activity may drift between 5-min refreshes.');
     await mongoose.disconnect();
     process.exit(0);
   }

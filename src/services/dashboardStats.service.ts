@@ -129,23 +129,45 @@ async function resolveStaleSnapshot(): Promise<StatsSnapshot | null> {
   );
 }
 
+/**
+ * Fast execution total for background refresh — reads collection metadata (~ms),
+ * not a full scan of ~1.4M docs. Falls back to the last stored value on failure.
+ */
+async function estimatedTotalExecutionsCount(previousValue = 0): Promise<number> {
+  try {
+    const estimate = await AutomationExecution.estimatedDocumentCount();
+    if (Number.isFinite(estimate) && estimate >= 0) return estimate;
+  } catch (err: any) {
+    logger.warn('[DashboardStats] estimatedDocumentCount failed', { error: err?.message });
+  }
+
+  if (previousValue > 0) {
+    logger.warn('[DashboardStats] Keeping previous totalExecutions after estimate failure', {
+      previousValue
+    });
+    return previousValue;
+  }
+
+  return 0;
+}
+
 async function exactTotalExecutionsCount(): Promise<number> {
   return AutomationExecution.countDocuments();
 }
 
 /**
- * Expensive path — runs all platform aggregations. Called only by the background
- * refresher (every 5 min + startup), never on the admin HTTP hot path.
- * Uses exact countDocuments (not estimates) so stored stats match live truth.
+ * Background refresh path — runs platform aggregations off the admin HTTP hot path.
+ * totalExecutions uses estimatedDocumentCount() to avoid holding a connection for ~30s+
+ * on 1.4M+ documents; failedExecutions stays exact (small filtered set).
  */
-async function computeStatsFromMongo(): Promise<StatsSnapshot> {
+async function computeStatsFromMongo(previousTotalExecutions = 0): Promise<StatsSnapshot> {
   const countJobs: Array<{ key: keyof DashboardCountsSnapshot; run: () => Promise<number> }> = [
     { key: 'totalOrganizations', run: () => Organization.countDocuments({ status: { $ne: 'deleted' } }) },
     { key: 'activeOrganizations', run: () => Organization.countDocuments({ status: 'active' }) },
     { key: 'totalUsers', run: () => User.countDocuments({ status: 'active' }) },
     { key: 'totalAutomations', run: () => Automation.countDocuments() },
     { key: 'activeAutomations', run: () => Automation.countDocuments({ isActive: true }) },
-    { key: 'totalExecutions', run: () => exactTotalExecutionsCount() },
+    { key: 'totalExecutions', run: () => estimatedTotalExecutionsCount(previousTotalExecutions) },
     { key: 'failedExecutions', run: () => AutomationExecution.countDocuments({ status: 'failed' }) },
     { key: 'googleIntegrations', run: () => GoogleIntegration.countDocuments({ status: 'active' }) },
     { key: 'whatsappIntegrations', run: () => SocialIntegration.countDocuments({ platform: 'whatsapp', status: 'connected' }) },
@@ -297,10 +319,54 @@ export class DashboardStatsService {
   }
 
   /**
-   * Exact stats computation (same queries used by refresh). Exposed for verification scripts.
+   * Same queries as the 5-min background refresh (estimatedDocumentCount for executions).
+   */
+  async computeRefreshStats(previousTotalExecutions = 0): Promise<StatsSnapshot> {
+    return computeStatsFromMongo(previousTotalExecutions);
+  }
+
+  /**
+   * Exact stats computation with countDocuments() on executions. Slow (~30s+ at scale).
+   * For verification scripts only — refresh uses estimatedDocumentCount() instead.
    */
   async computeExactStats(): Promise<StatsSnapshot> {
-    return computeStatsFromMongo();
+    const countJobs: Array<{ key: keyof DashboardCountsSnapshot; run: () => Promise<number> }> = [
+      { key: 'totalOrganizations', run: () => Organization.countDocuments({ status: { $ne: 'deleted' } }) },
+      { key: 'activeOrganizations', run: () => Organization.countDocuments({ status: 'active' }) },
+      { key: 'totalUsers', run: () => User.countDocuments({ status: 'active' }) },
+      { key: 'totalAutomations', run: () => Automation.countDocuments() },
+      { key: 'activeAutomations', run: () => Automation.countDocuments({ isActive: true }) },
+      { key: 'totalExecutions', run: () => exactTotalExecutionsCount() },
+      { key: 'failedExecutions', run: () => AutomationExecution.countDocuments({ status: 'failed' }) },
+      { key: 'googleIntegrations', run: () => GoogleIntegration.countDocuments({ status: 'active' }) },
+      { key: 'whatsappIntegrations', run: () => SocialIntegration.countDocuments({ platform: 'whatsapp', status: 'connected' }) },
+      { key: 'instagramIntegrations', run: () => SocialIntegration.countDocuments({ platform: 'instagram', status: 'connected' }) },
+      { key: 'facebookIntegrations', run: () => SocialIntegration.countDocuments({ platform: 'facebook', status: 'connected' }) },
+      {
+        key: 'ecommerceIntegrations',
+        run: () => Settings.countDocuments({ 'ecommerceIntegration.platform': { $exists: true, $ne: null } })
+      }
+    ];
+
+    const [countResults, callMinutes, chatConversations] = await Promise.all([
+      mapWithConcurrency(countJobs, COUNT_CONCURRENCY, async (job) => ({
+        key: job.key,
+        value: await job.run()
+      })),
+      usageTrackerService.calculatePlatformCallMinutes(),
+      usageTrackerService.calculatePlatformChatConversations()
+    ]);
+
+    const counts = countResults.reduce((acc, { key, value }) => {
+      acc[key] = value;
+      return acc;
+    }, {} as DashboardCountsSnapshot);
+
+    return {
+      ...counts,
+      totalCallMinutes: callMinutes,
+      totalChatConversations: chatConversations
+    };
   }
 
   /**
@@ -321,8 +387,9 @@ export class DashboardStatsService {
     refreshInFlight = (async () => {
       const t0 = Date.now();
       try {
-        logger.info('[DashboardStats] Refreshing platform snapshot from MongoDB...');
-        const snapshot = await computeStatsFromMongo();
+        const previous = await readFromMongoSafe();
+        logger.info('[DashboardStats] Refreshing platform snapshot (estimated executions)...');
+        const snapshot = await computeStatsFromMongo(previous?.totalExecutions ?? 0);
         const durationMs = Date.now() - t0;
         await persistSnapshot(snapshot, durationMs);
         persisted = snapshot;
@@ -330,6 +397,7 @@ export class DashboardStatsService {
           computeDurationMs: durationMs,
           totalOrganizations: snapshot.totalOrganizations,
           totalExecutions: snapshot.totalExecutions,
+          totalExecutionsSource: 'estimatedDocumentCount',
           totalCallMinutes: snapshot.totalCallMinutes
         });
       } catch (err: any) {

@@ -6,12 +6,15 @@ import GoogleIntegration from '../models/GoogleIntegration';
 import SocialIntegration from '../models/SocialIntegration';
 import Settings from '../models/Settings';
 import Profile, { IProfile } from '../models/Profile';
-import Conversation from '../models/Conversation';
 import Message from '../models/Message';
 import { profileService } from './profile.service';
 import { logger } from '../utils/logger.util';
 import { usageTrackerService, mapWithConcurrency } from './usage/usageTracker.service';
 import { dashboardStatsService } from './dashboardStats.service';
+import {
+  usageReportStatsService,
+  resolveUsageReportRangeKey
+} from './usageReportStats.service';
 import mongoose from 'mongoose';
 import Plan from '../models/Plan';
 
@@ -671,107 +674,20 @@ export class AdminService {
   }
 
   /**
-   * Usage report summary (platform totals + channel breakdown) — fast path for initial paint.
+   * Usage report summary — reads precomputed usage_report_stats (findOne ~ms).
+   * Background job refreshes all date ranges every 10 minutes.
    */
   async getUsageReportsSummary(dateFrom?: string, dateTo?: string) {
-    const range = (dateFrom || dateTo) ? {
-      dateFrom: dateFrom ? new Date(dateFrom) : undefined,
-      dateTo: dateTo ? new Date(dateTo) : undefined
-    } : undefined;
-
-    const [platformTotals, organizationCount, conversationsByChannel] = await Promise.all([
-      this.getPlatformUsageTotals(range),
-      Organization.countDocuments({ status: { $ne: 'deleted' } }),
-      this.getConversationsByChannel(range)
-    ]);
-
-    return {
-      totalCallMinutes: platformTotals.callMinutes,
-      totalChatConversations: platformTotals.chatConversations,
-      organizationCount,
-      conversationsByChannel
-    };
-  }
-
-  private async getConversationsByChannel(dateRange?: { dateFrom?: Date; dateTo?: Date }) {
-    const match: Record<string, unknown> = {};
-    if (dateRange?.dateFrom || dateRange?.dateTo) {
-      match.createdAt = {};
-      if (dateRange.dateFrom) (match.createdAt as any).$gte = dateRange.dateFrom;
-      if (dateRange.dateTo) (match.createdAt as any).$lte = dateRange.dateTo;
-    }
-
-    const rows = await Conversation.aggregate([
-      ...(Object.keys(match).length ? [{ $match: match }] : []),
-      { $group: { _id: { $ifNull: ['$channel', 'unknown'] }, count: { $sum: 1 } } }
-    ]);
-
-    return rows.reduce((acc: Record<string, number>, row: { _id: string; count: number }) => {
-      acc[row._id || 'unknown'] = row.count;
-      return acc;
-    }, {});
-  }
-
-  private async buildUsageByOrganization(
-    organizations: Array<{ _id: mongoose.Types.ObjectId; name: string }>,
-    range?: { dateFrom?: Date; dateTo?: Date }
-  ) {
-    return mapWithConcurrency(organizations, 8, async (org) => {
-      try {
-        const orgId = org._id.toString();
-        const [totalCallMinutes, totalChatConversations, userCount] = await Promise.all([
-          usageTrackerService.calculateCallMinutes(orgId, range),
-          usageTrackerService.calculateOrganizationChatConversations(orgId, range),
-          User.countDocuments({ organizationId: org._id, status: 'active' })
-        ]);
-        return {
-          _id: orgId,
-          name: org.name,
-          totalCallMinutes,
-          totalChatConversations,
-          userCount
-        };
-      } catch (error) {
-        logger.error(`Failed to get metrics for org ${org._id}:`, error);
-        return {
-          _id: org._id.toString(),
-          name: org.name,
-          totalCallMinutes: 0,
-          totalChatConversations: 0,
-          userCount: 0
-        };
-      }
-    });
+    const rangeKey = resolveUsageReportRangeKey(dateFrom, dateTo);
+    return usageReportStatsService.getSummary(rangeKey);
   }
 
   /**
-   * Get Usage Reports (full — includes per-organization table)
+   * Usage reports (full, includes per-organization table) — same precomputed snapshot.
    */
   async getUsageReports(dateFrom?: string, dateTo?: string) {
-    try {
-      const range = (dateFrom || dateTo) ? {
-        dateFrom: dateFrom ? new Date(dateFrom) : undefined,
-        dateTo: dateTo ? new Date(dateTo) : undefined
-      } : undefined;
-
-      const summary = await this.getUsageReportsSummary(dateFrom, dateTo);
-      const organizations = await Organization.find({ status: { $ne: 'deleted' } })
-        .select('_id name')
-        .lean();
-
-      const usageByOrganization = await this.buildUsageByOrganization(
-        organizations as Array<{ _id: mongoose.Types.ObjectId; name: string }>,
-        range
-      );
-
-      return {
-        ...summary,
-        usageByOrganization
-      };
-    } catch (error: any) {
-      logger.error('Failed to get usage reports', { error: error.message });
-      throw error;
-    }
+    const rangeKey = resolveUsageReportRangeKey(dateFrom, dateTo);
+    return usageReportStatsService.getFullReport(rangeKey);
   }
 
   /**

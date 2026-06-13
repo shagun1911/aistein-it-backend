@@ -18,6 +18,7 @@
     "create:user": "ts-node-dev --transpile-only src/scripts/createUser.ts",
     "create:admin": "ts-node-dev --transpile-only src/scripts/createAdmin.ts",
     "refresh:dashboard-stats": "ts-node-dev --transpile-only src/scripts/refreshDashboardStats.ts",
+    "refresh:usage-report-stats": "ts-node-dev --transpile-only src/scripts/refreshUsageReportStats.ts",
     "verify:dashboard-stats": "ts-node-dev --transpile-only src/scripts/verifyDashboardStats.ts",
     "remove:admin-roles": "ts-node-dev --transpile-only src/scripts/removeAdminRoles.ts",
     "wipe:social-integrations": "npx ts-node scripts/wipe-all-social-integrations.ts",

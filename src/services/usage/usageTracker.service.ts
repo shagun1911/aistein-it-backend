@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import Message from '../../models/Message';
 import Conversation from '../../models/Conversation';
+import User from '../../models/User';
 import Automation from '../../models/Automation';
 import Campaign from '../../models/Campaign';
 import { logger } from '../../utils/logger.util';
@@ -714,6 +715,81 @@ export class UsageTrackerService {
     } catch (error: any) {
       logger.error('[Usage Tracker] Error calculating platform chat conversations:', error.message);
       return 0;
+    }
+  }
+
+  /** All orgs in one aggregation — replaces N per-org call-minute queries on usage reports. */
+  async calculateCallMinutesByOrganization(
+    dateRange?: UsageDateRange
+  ): Promise<Map<string, number>> {
+    try {
+      const rows = await Conversation.aggregate([
+        { $match: voiceCallDurationMatch(conversationDateMatch(dateRange)) },
+        {
+          $group: {
+            _id: '$organizationId',
+            totalSeconds: { $sum: callDurationSecondsExpr() }
+          }
+        }
+      ]).hint({ channel: 1, callDurationSeconds: 1, createdAt: -1 });
+
+      return new Map(
+        rows.map((row: { _id: mongoose.Types.ObjectId; totalSeconds: number }) => [
+          row._id?.toString() ?? '',
+          Math.round((row.totalSeconds ?? 0) / 60)
+        ])
+      );
+    } catch (error: any) {
+      logger.error('[Usage Tracker] Error calculating call minutes by org:', error.message);
+      throw error;
+    }
+  }
+
+  /** All orgs in one aggregation — replaces N per-org chat conversation countDocuments. */
+  async calculateChatConversationsByOrganization(
+    dateRange?: UsageDateRange
+  ): Promise<Map<string, number>> {
+    try {
+      const rows = await Conversation.aggregate([
+        {
+          $match: {
+            channel: { $in: ['whatsapp', 'website', 'email', 'social'] },
+            'lastMessage.timestamp': { $exists: true },
+            ...conversationDateMatch(dateRange)
+          }
+        },
+        { $group: { _id: '$organizationId', count: { $sum: 1 } } }
+      ]);
+
+      return new Map(
+        rows.map((row: { _id: mongoose.Types.ObjectId; count: number }) => [
+          row._id?.toString() ?? '',
+          row.count ?? 0
+        ])
+      );
+    } catch (error: any) {
+      logger.error('[Usage Tracker] Error calculating chat conversations by org:', error.message);
+      throw error;
+    }
+  }
+
+  /** Active users grouped by organization — one query for the usage report table. */
+  async calculateActiveUserCountByOrganization(): Promise<Map<string, number>> {
+    try {
+      const rows = await User.aggregate([
+        { $match: { status: 'active', organizationId: { $exists: true, $ne: null } } },
+        { $group: { _id: '$organizationId', count: { $sum: 1 } } }
+      ]);
+
+      return new Map(
+        rows.map((row: { _id: mongoose.Types.ObjectId; count: number }) => [
+          row._id?.toString() ?? '',
+          row.count ?? 0
+        ])
+      );
+    } catch (error: any) {
+      logger.error('[Usage Tracker] Error calculating user count by org:', error.message);
+      throw error;
     }
   }
 

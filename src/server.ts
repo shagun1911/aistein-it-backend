@@ -476,6 +476,15 @@ const startServer = async () => {
         dashboardStatsService.startScheduler();
       } catch (_) { /* non-fatal */ }
     });
+
+    // Precompute admin usage reports into usage_report_stats (every 10 minutes).
+    setImmediate(async () => {
+      try {
+        const { usageReportStatsService } = await import('./services/usageReportStats.service');
+        await usageReportStatsService.warmOnStartup();
+        usageReportStatsService.startScheduler();
+      } catch (_) { /* non-fatal */ }
+    });
     
     // Start server with Socket.io
     httpServer.listen(PORT_NUMBER, () => {

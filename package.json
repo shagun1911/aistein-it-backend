@@ -17,6 +17,8 @@
     "migrate:backfill-call-duration-seconds": "ts-node-dev --transpile-only src/scripts/backfillCallDurationSeconds.ts",
     "create:user": "ts-node-dev --transpile-only src/scripts/createUser.ts",
     "create:admin": "ts-node-dev --transpile-only src/scripts/createAdmin.ts",
+    "refresh:dashboard-stats": "ts-node-dev --transpile-only src/scripts/refreshDashboardStats.ts",
+    "verify:dashboard-stats": "ts-node-dev --transpile-only src/scripts/verifyDashboardStats.ts",
     "remove:admin-roles": "ts-node-dev --transpile-only src/scripts/removeAdminRoles.ts",
     "wipe:social-integrations": "npx ts-node scripts/wipe-all-social-integrations.ts",
     "redis:clean-old-bull-jobs": "npx ts-node scripts/clean-old-bull-jobs.ts",

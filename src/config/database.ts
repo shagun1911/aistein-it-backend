@@ -1,28 +1,50 @@
 import mongoose from 'mongoose';
 
+const MONGO_OPTIONS = {
+  // Tuned for a 2-vCPU / 8 GB VM serving the dashboard:
+  // - maxPoolSize 30 keeps headroom under Atlas M-tier connection limits when
+  //   multiple replicas or workers are running.
+  // - serverSelectionTimeoutMS 8s fails fast if Mongo is unreachable instead
+  //   of letting requests hang for 30s (the driver default).
+  // - waitQueueTimeoutMS 10s rejects requests when the pool is saturated
+  //   instead of queuing indefinitely (the root cause of "connection N timed out").
+  // - socketTimeoutMS 45s allows large aggregations but still releases stuck sockets.
+  // - heartbeatFrequencyMS keeps dead connections from lingering in the pool.
+  maxPoolSize: 30,
+  minPoolSize: 2,
+  maxIdleTimeMS: 60_000,
+  serverSelectionTimeoutMS: 8_000,
+  waitQueueTimeoutMS: 10_000,
+  socketTimeoutMS: 45_000,
+  heartbeatFrequencyMS: 10_000,
+  retryWrites: true,
+  retryReads: true,
+  autoIndex: true,
+  autoCreate: true,
+} as const;
+
+function attachMongoConnectionHandlers(): void {
+  const db = mongoose.connection;
+
+  db.on('disconnected', () => {
+    console.warn('[DB] MongoDB disconnected — driver will auto-reconnect');
+  });
+
+  db.on('reconnected', () => {
+    console.log('[DB] MongoDB reconnected');
+  });
+
+  db.on('error', (err: Error) => {
+    console.error('[DB] MongoDB connection error:', err.message);
+  });
+}
+
 export const connectDatabase = async () => {
   try {
-    // Tuned for a 2-vCPU / 8 GB VM serving the dashboard:
-    // - maxPoolSize 50 leaves room for parallel dashboard requests + websocket
-    //   ops without exhausting MongoDB connections under burst load.
-    // - serverSelectionTimeoutMS 8s fails fast if Mongo is unreachable instead
-    //   of letting requests hang for 30s (the driver default).
-    // - socketTimeoutMS 30s prevents a single slow query from holding a socket
-    //   forever and starving the pool.
-    // - autoIndex: true ensures schema-declared compound indexes
-    //   ({ organizationId, updatedAt }, etc.) are built on connect. Index
-    //   build for an existing large collection runs in the background; queries
-    //   only become fast once the build completes — check with the
-    //   `verifyIndexes` script if first-load is still slow after deploy.
-    const conn = await mongoose.connect(process.env.MONGODB_URI!, {
-      maxPoolSize: 50,
-      minPoolSize: 5,
-      serverSelectionTimeoutMS: 8_000,
-      socketTimeoutMS: 30_000,
-      autoIndex: true,
-      autoCreate: true,
-    });
-    console.log(`MongoDB Connected: ${conn.connection.host} (pool max ${50})`);
+    attachMongoConnectionHandlers();
+
+    const conn = await mongoose.connect(process.env.MONGODB_URI!, MONGO_OPTIONS);
+    console.log(`MongoDB Connected: ${conn.connection.host} (pool max ${MONGO_OPTIONS.maxPoolSize})`);
 
     // Best-effort: kick off index sync on the hot-path models so the
     // compound indexes the dashboard depends on are guaranteed to exist

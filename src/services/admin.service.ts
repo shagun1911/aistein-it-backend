@@ -11,15 +11,15 @@ import Message from '../models/Message';
 import { profileService } from './profile.service';
 import { logger } from '../utils/logger.util';
 import { usageTrackerService, mapWithConcurrency } from './usage/usageTracker.service';
+import { dashboardStatsService } from './dashboardStats.service';
 import mongoose from 'mongoose';
 import Plan from '../models/Plan';
 
-const ADMIN_DASHBOARD_CACHE_KEY = 'admin:dashboard:counts:v1';
-const ADMIN_DASHBOARD_CACHE_TTL_SEC = 900;
 const ADMIN_USAGE_CACHE_TTL_SEC = 900;
+const ADMIN_USAGE_STALE_TTL_SEC = 7 * 24 * 3600;
 
-const adminDashboardLocalCache = new Map<string, { value: any; expiresAt: number }>();
 const platformUsageLocalCache = new Map<string, { value: { callMinutes: number; chatConversations: number }; expiresAt: number }>();
+const lastGoodPlatformUsage = new Map<string, { callMinutes: number; chatConversations: number }>();
 
 function getLocalCache(cache: Map<string, { value: any; expiresAt: number }>, key: string): any | null {
   const entry = cache.get(key);
@@ -58,6 +58,10 @@ async function redisSet(key: string, value: any, ttlSec: number): Promise<void> 
   } catch (_) { /* best-effort */ }
 }
 
+async function redisGetStale(key: string): Promise<any | null> {
+  return redisGet(key);
+}
+
 export class AdminService {
   /**
    * Platform call minutes + completed chat conversations (aggregation-only, no transcript scans).
@@ -67,6 +71,20 @@ export class AdminService {
     callMinutes: number;
     chatConversations: number;
   }> {
+    // Admin dashboard (no date filter) reads precomputed dashboard_stats — never live aggregation.
+    if (!dateRange?.dateFrom && !dateRange?.dateTo) {
+      try {
+        const usage = await dashboardStatsService.getUsage();
+        return {
+          callMinutes: usage.totalCallMinutes,
+          chatConversations: usage.totalChatConversations
+        };
+      } catch (err: any) {
+        logger.warn('[AdminService] dashboard_stats usage read failed', { error: err.message });
+        throw err;
+      }
+    }
+
     const cacheKey = platformUsageCacheKey(dateRange);
 
     const localHit = getLocalCache(platformUsageLocalCache, cacheKey);
@@ -74,19 +92,38 @@ export class AdminService {
 
     const redisHit = await redisGet(cacheKey);
     if (redisHit) {
+      lastGoodPlatformUsage.set(cacheKey, redisHit);
       setLocalCache(platformUsageLocalCache, cacheKey, redisHit, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
       return redisHit;
     }
 
-    const [callMinutes, chatConversations] = await Promise.all([
-      usageTrackerService.calculatePlatformCallMinutes(dateRange),
-      usageTrackerService.calculatePlatformChatConversations(dateRange)
-    ]);
-    const result = { callMinutes, chatConversations };
+    try {
+      const [callMinutes, chatConversations] = await Promise.all([
+        usageTrackerService.calculatePlatformCallMinutes(dateRange),
+        usageTrackerService.calculatePlatformChatConversations(dateRange)
+      ]);
+      const result = { callMinutes, chatConversations };
 
-    setLocalCache(platformUsageLocalCache, cacheKey, result, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
-    await redisSet(cacheKey, result, ADMIN_USAGE_CACHE_TTL_SEC);
-    return result;
+      lastGoodPlatformUsage.set(cacheKey, result);
+      setLocalCache(platformUsageLocalCache, cacheKey, result, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
+      void redisSet(cacheKey, result, ADMIN_USAGE_CACHE_TTL_SEC);
+      void redisSet(`${cacheKey}:stale`, result, ADMIN_USAGE_STALE_TTL_SEC);
+      return result;
+    } catch (error: any) {
+      const stale =
+        lastGoodPlatformUsage.get(cacheKey) ??
+        (await redisGet(`${cacheKey}:stale`));
+
+      if (stale) {
+        logger.warn('[AdminService] MongoDB unavailable — serving stale platform usage', {
+          error: error.message
+        });
+        setLocalCache(platformUsageLocalCache, cacheKey, stale, 60_000);
+        return stale;
+      }
+
+      throw error;
+    }
   }
 
   /** Platform call minutes — same cache + aggregation path as usage reports summary. */
@@ -102,94 +139,63 @@ export class AdminService {
   }
 
   /**
-   * Fast count metrics — all indexed countDocuments, returns in <500ms.
-   * Does NOT include call minutes / chat conversations (use getDashboardUsage for those).
+   * Fast count metrics — reads precomputed dashboard_stats (findOne ~10–30ms).
+   * Background job refreshes the collection every 5 minutes.
    */
   async getDashboardCounts() {
-    const localHit = getLocalCache(adminDashboardLocalCache, ADMIN_DASHBOARD_CACHE_KEY);
-    if (localHit) return localHit;
+    return dashboardStatsService.getCounts();
+  }
 
-    const redisHit = await redisGet(ADMIN_DASHBOARD_CACHE_KEY);
-    if (redisHit) {
-      setLocalCache(adminDashboardLocalCache, ADMIN_DASHBOARD_CACHE_KEY, redisHit, ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000);
-      return redisHit;
-    }
+  /** @deprecated Use dashboardStatsService.refreshStats() */
+  async warmDashboardCountsCache(): Promise<void> {
+    await dashboardStatsService.warmOnStartup();
+  }
 
-    const [
-      totalOrganizations,
-      activeOrganizations,
-      totalUsers,
-      totalAutomations,
-      activeAutomations,
-      totalExecutions,
-      failedExecutions,
-      googleIntegrations,
-      whatsappIntegrations,
-      instagramIntegrations,
-      facebookIntegrations,
-      ecommerceIntegrations
-    ] = await Promise.all([
-      Organization.countDocuments({ status: { $ne: 'deleted' } }),
-      Organization.countDocuments({ status: 'active' }),
-      User.countDocuments({ status: 'active' }),
-      Automation.countDocuments(),
-      Automation.countDocuments({ isActive: true }),
-      AutomationExecution.countDocuments(),
-      AutomationExecution.countDocuments({ status: 'failed' }),
-      GoogleIntegration.countDocuments({ status: 'active' }),
-      SocialIntegration.countDocuments({ platform: 'whatsapp', status: 'connected' }),
-      SocialIntegration.countDocuments({ platform: 'instagram', status: 'connected' }),
-      SocialIntegration.countDocuments({ platform: 'facebook', status: 'connected' }),
-      Settings.countDocuments({ 'ecommerceIntegration.platform': { $exists: true, $ne: null } })
-    ]);
-
-    const counts = {
-      totalOrganizations,
-      activeOrganizations,
-      totalUsers,
-      totalAutomations,
-      activeAutomations,
-      totalExecutions,
-      failedExecutions,
-      googleIntegrations,
-      whatsappIntegrations,
-      instagramIntegrations,
-      facebookIntegrations,
-      ecommerceIntegrations
-    };
-
-    setLocalCache(adminDashboardLocalCache, ADMIN_DASHBOARD_CACHE_KEY, counts, ADMIN_DASHBOARD_CACHE_TTL_SEC * 1000);
-    await redisSet(ADMIN_DASHBOARD_CACHE_KEY, counts, ADMIN_DASHBOARD_CACHE_TTL_SEC);
-    return counts;
+  /** @deprecated Use dashboardStatsService.refreshStats() */
+  async refreshDashboardCountsCache(): Promise<void> {
+    await dashboardStatsService.refreshStats();
   }
 
   /**
-   * Usage totals for dashboard (call minutes + chat conversations).
-   * Separate from counts so the dashboard never blocks on slow aggregations.
+   * Usage totals for dashboard — reads precomputed dashboard_stats.
    */
   async getDashboardUsage() {
-    return this.getPlatformUsageTotals();
+    const usage = await dashboardStatsService.getUsage();
+    return {
+      callMinutes: usage.totalCallMinutes,
+      chatConversations: usage.totalChatConversations
+    };
   }
 
-  /**
-   * Warm the dashboard usage cache in the background (call on server start).
-   * Never throws — errors are logged and swallowed.
-   */
+  /** Single findOne — counts + usage in one request (admin page). */
+  async getDashboardPayload() {
+    const payload = await dashboardStatsService.getDashboardPayload();
+    return {
+      counts: {
+        totalOrganizations: payload.totalOrganizations,
+        activeOrganizations: payload.activeOrganizations,
+        totalUsers: payload.totalUsers,
+        totalAutomations: payload.totalAutomations,
+        activeAutomations: payload.activeAutomations,
+        totalExecutions: payload.totalExecutions,
+        failedExecutions: payload.failedExecutions,
+        googleIntegrations: payload.googleIntegrations,
+        whatsappIntegrations: payload.whatsappIntegrations,
+        instagramIntegrations: payload.instagramIntegrations,
+        facebookIntegrations: payload.facebookIntegrations,
+        ecommerceIntegrations: payload.ecommerceIntegrations
+      },
+      usage: {
+        callMinutes: payload.totalCallMinutes,
+        chatConversations: payload.totalChatConversations
+      },
+      computedAt: payload.computedAt
+    };
+  }
+
+  /** @deprecated Use dashboardStatsService.warmOnStartup() */
   async warmDashboardUsageCache(): Promise<void> {
-    try {
-      const cacheKey = platformUsageCacheKey();
-      const cached = await redisGet(cacheKey);
-      if (cached) {
-        logger.info('[AdminService] Platform usage cache already warm');
-        setLocalCache(platformUsageLocalCache, cacheKey, cached, ADMIN_USAGE_CACHE_TTL_SEC * 1000);
-        return;
-      }
-      logger.info('[AdminService] Pre-warming platform usage cache...');
-      await this.getPlatformUsageTotals();
-      logger.info('[AdminService] Platform usage cache warmed successfully');
-    } catch (err: any) {
-      logger.warn('[AdminService] Platform usage cache warm failed (non-fatal):', err.message);
-    }
+    await dashboardStatsService.warmOnStartup();
   }
 
   /**

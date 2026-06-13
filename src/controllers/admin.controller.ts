@@ -12,6 +12,18 @@ export class AdminController {
   }
 
   /**
+   * Combined dashboard — one dashboard_stats read (counts + usage).
+   */
+  getDashboard = async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const payload = await this.adminService.getDashboardPayload();
+      res.json(successResponse(payload));
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  /**
    * Fast dashboard counts (all indexed countDocuments — returns in <500ms)
    */
   getDashboardMetrics = async (req: AuthRequest, res: Response, next: NextFunction) => {

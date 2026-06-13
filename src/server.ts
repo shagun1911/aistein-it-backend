@@ -467,13 +467,13 @@ const startServer = async () => {
       // Don't block server startup if sync fails
     }
 
-    // Pre-warm admin dashboard usage cache in the background so the first admin
-    // page load never has to wait for the heavy platform aggregations.
+    // Precompute admin dashboard stats into dashboard_stats collection (SaaS pattern).
+    // HTTP handlers only read findOne(); heavy aggregations run here every 5 minutes.
     setImmediate(async () => {
       try {
-        const { AdminService } = await import('./services/admin.service');
-        const adminService = new AdminService();
-        await adminService.warmDashboardUsageCache();
+        const { dashboardStatsService } = await import('./services/dashboardStats.service');
+        await dashboardStatsService.warmOnStartup();
+        dashboardStatsService.startScheduler();
       } catch (_) { /* non-fatal */ }
     });
     

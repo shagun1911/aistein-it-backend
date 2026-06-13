@@ -5,7 +5,7 @@ import UsageReportStats, {
   UsageByOrganizationRow,
   UsageReportRangeKey
 } from '../models/UsageReportStats';
-import { usageTrackerService, UsageDateRange } from './usage/usageTracker.service';
+import { usageTrackerService, UsageDateRange, mapWithConcurrency } from './usage/usageTracker.service';
 import { dashboardStatsService } from './dashboardStats.service';
 import { logger } from '../utils/logger.util';
 
@@ -179,33 +179,51 @@ async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 2): 
 }
 
 /**
- * Background compute for one date range. Uses batch org aggregations (3 queries) instead
- * of N×3 per-org queries. Queries run sequentially to avoid saturating the Mongo pool.
- * Platform totals for "all" reuse dashboard_stats when available.
+ * Per-org call minutes using the same indexed path as the dashboard's underlying
+ * calculateCallMinutes(orgId). The batch $group across all phone docs times out on
+ * ~1.4M conversations; org-scoped queries are fast and reliable in background refresh.
  */
-async function computeUsageReportSnapshot(rangeKey: UsageReportRangeKey): Promise<
-  Omit<UsageReportSnapshot, 'computedAt' | 'computeDurationMs'>
-> {
+async function computeCallMinutesByOrganizationPerOrg(
+  organizations: Array<{ _id: { toString(): string } }>,
+  dateRange: UsageDateRange | undefined,
+  previousByOrg: Map<string, number>
+): Promise<Map<string, number>> {
+  const pairs = await mapWithConcurrency(organizations, 4, async (org) => {
+    const orgId = org._id.toString();
+    try {
+      const minutes = await usageTrackerService.calculateCallMinutes(orgId, dateRange);
+      return [orgId, minutes] as const;
+    } catch (err: any) {
+      logger.warn('[UsageReportStats] Per-org call minutes failed', { orgId, error: err?.message });
+      return [orgId, previousByOrg.get(orgId) ?? 0] as const;
+    }
+  });
+  return new Map(pairs);
+}
+
+function sumMapValues(map: Map<string, number>): number {
+  let total = 0;
+  for (const v of map.values()) total += v;
+  return total;
+}
+
+/**
+ * Background compute for one date range. Org call minutes use per-org indexed queries
+ * (same engine as dashboard totals). Platform totals for "all" reuse dashboard_stats.
+ */
+async function computeUsageReportSnapshot(
+  rangeKey: UsageReportRangeKey,
+  previousSnapshot: UsageReportSnapshot | null = null
+): Promise<Omit<UsageReportSnapshot, 'computedAt' | 'computeDurationMs'>> {
   const dateRange = dateRangeForKey(rangeKey);
 
   const organizations = await Organization.find({ status: { $ne: 'deleted' } })
     .select('_id name')
     .lean();
 
-  // Sequential — avoids 5 parallel heavy aggregations competing for pool connections.
-  const callMinutesByOrg = await withRetry('callMinutesByOrg', () =>
-    usageTrackerService.calculateCallMinutesByOrganization(dateRange)
+  const previousCallMinutes = new Map(
+    (previousSnapshot?.usageByOrganization ?? []).map((row) => [row._id, row.totalCallMinutes])
   );
-  const chatByOrg = await withRetry('chatByOrg', () =>
-    usageTrackerService.calculateChatConversationsByOrganization(dateRange)
-  );
-  const userCountByOrg = await withRetry('userCountByOrg', () =>
-    usageTrackerService.calculateActiveUserCountByOrganization()
-  );
-  const conversationsByChannel = await withRetry('conversationsByChannel', () =>
-    computeConversationsByChannel(dateRange)
-  );
-  const organizationCount = await Organization.countDocuments({ status: { $ne: 'deleted' } });
 
   let totalCallMinutes: number;
   let totalChatConversations: number;
@@ -227,6 +245,29 @@ async function computeUsageReportSnapshot(rangeKey: UsageReportRangeKey): Promis
       usageTrackerService.calculatePlatformChatConversations(dateRange)
     ]);
   }
+
+  // Platform totals first (dashboard_stats path) — then org breakdown in background-safe per-org queries.
+  let callMinutesByOrg = await computeCallMinutesByOrganizationPerOrg(
+    organizations,
+    dateRange,
+    previousCallMinutes
+  );
+
+  const orgCallMinutesSum = sumMapValues(callMinutesByOrg);
+  if (totalCallMinutes > 0 && orgCallMinutesSum === 0 && previousCallMinutes.size > 0) {
+    logger.warn('[UsageReportStats] Org call minutes sum is 0 but platform total > 0 — keeping previous breakdown', {
+      key: rangeKey,
+      platformTotal: totalCallMinutes
+    });
+    callMinutesByOrg = previousCallMinutes;
+  }
+
+  const [chatByOrg, userCountByOrg, conversationsByChannel, organizationCount] = await Promise.all([
+    withRetry('chatByOrg', () => usageTrackerService.calculateChatConversationsByOrganization(dateRange)),
+    withRetry('userCountByOrg', () => usageTrackerService.calculateActiveUserCountByOrganization()),
+    withRetry('conversationsByChannel', () => computeConversationsByChannel(dateRange)),
+    Organization.countDocuments({ status: { $ne: 'deleted' } })
+  ]);
 
   const usageByOrganization: UsageByOrganizationRow[] = organizations.map((org) => {
     const orgId = org._id.toString();
@@ -346,13 +387,16 @@ export class UsageReportStatsService {
       const t0 = Date.now();
       try {
         logger.info('[UsageReportStats] Refreshing snapshot...', { key: rangeKey });
-        const snapshot = await computeUsageReportSnapshot(rangeKey);
+        const previous = await readFromMongoSafe(rangeKey);
+        const snapshot = await computeUsageReportSnapshot(rangeKey, previous);
         const durationMs = Date.now() - t0;
+        const orgCallSum = snapshot.usageByOrganization.reduce((s, r) => s + r.totalCallMinutes, 0);
         persisted = await persistSnapshot(rangeKey, snapshot, durationMs);
         logger.info('[UsageReportStats] Snapshot refreshed', {
           key: rangeKey,
           computeDurationMs: durationMs,
           totalCallMinutes: persisted.totalCallMinutes,
+          orgCallMinutesSum: orgCallSum,
           orgRows: persisted.usageByOrganization.length
         });
       } catch (err: any) {
@@ -395,7 +439,8 @@ export class UsageReportStatsService {
         });
         if (ageMs < REFRESH_INTERVAL_MS) return;
       }
-      void this.refreshAllRanges();
+      // Seed "all" first so Usage Reports page has org call minutes quickly after deploy.
+      void this.refreshRange('all').then(() => this.refreshAllRanges());
     } catch (err: any) {
       logger.warn('[UsageReportStats] Startup warm failed (non-fatal)', { error: err?.message });
     }
